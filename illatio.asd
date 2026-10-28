@@ -16,8 +16,10 @@
      (:file "half")        ; binary16 <-> single, bit for bit
      (:file "gguf")        ; the container: metadata + tensor directory
      (:file "pool")        ; worker threads, one job at a time
-     (:file "neon-sbcl" :if-feature (:and :sbcl :arm64)) ; SDOT row kernel (a VOP)
+     (:file "neon-sbcl" :if-feature (:and :sbcl :arm64)) ; SDOT kernels (VOPs)
+     (:file "neon-modus" :if-feature :modus)             ; the same kernel on modus's %vi lanes
      (:file "tensor")      ; Q8_0 weights and the quantized matvec
+     (:file "unicode-data") ; letter/number/space ranges, generated from SBCL's tables
      (:file "tokenizer")   ; byte-level BPE
      (:file "model")       ; the forward pass
      (:file "batch")       ; prefill: three tokens per multiply

@@ -22,7 +22,8 @@
 
 (defun default-thread-count ()
   "The machine's core count, which is what a CPU-bound matvec wants."
-  (or (ignore-errors
+  (or #+sbcl
+      (ignore-errors
        (let ((s (with-output-to-string (o)
                   (sb-ext:run-program "/usr/sbin/sysctl" '("-n" "hw.perflevel0.physicalcpu")
                                       :output o :error nil))))

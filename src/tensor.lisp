@@ -10,9 +10,36 @@
 (in-package #:illatio)
 
 (deftype f32vec () '(simple-array single-float (*)))
-(deftype i8vec () '(simple-array (signed-byte 8) (*)))
 
-(defun f32vec (n) (make-array n :element-type 'single-float :initial-element 0f0))
+;;; int8 data.  On SBCL it is (signed-byte 8).  On modus a signed-byte 8 array
+;;; is a generic vector (8 bytes an element), so it is (unsigned-byte 8)
+;;; holding the two's-complement byte: I8-REF reads the signed value, I8-BYTE
+;;; is what to store.  SDOT reads bytes as signed either way, so the NEON
+;;; kernels see the same data.  Weights are :STATIC -- on modus outside the
+;;; copying heap (modus:make-static-vector), which could neither hold 650 MB
+;;; nor afford to copy it every collection.
+#-modus (deftype i8vec () '(simple-array (signed-byte 8) (*)))
+#+modus (deftype i8vec () '(simple-array (unsigned-byte 8) (*)))
+
+(declaim (inline i8-ref i8-byte))
+(defun i8-ref (v i)
+  #-modus (aref v i)
+  #+modus (let ((b (aref v i))) (if (> b 127) (- b 256) b)))
+(defun i8-byte (x)
+  #-modus x
+  #+modus (logand x 255))
+
+(defun make-i8vec (n &key static)
+  #+modus (if static
+              (modus:make-static-vector n)
+              (make-array n :element-type '(unsigned-byte 8) :initial-element 0))
+  #-modus (progn static (make-array n :element-type '(signed-byte 8) :initial-element 0)))
+
+(defun f32vec (n &key static)
+  #+modus (if static
+              (modus:make-static-vector n :element-type 'single-float)
+              (make-array n :element-type 'single-float :initial-element 0f0))
+  #-modus (progn static (make-array n :element-type 'single-float :initial-element 0f0)))
 
 ;;; A Q8_0 matrix: ROWS rows of COLS weights, row-major, each row COLS/32
 ;;; blocks.  QUANTS holds the int8s, SCALES the per-block fp16 scales already
@@ -20,7 +47,7 @@
 (defstruct (q8mat (:constructor %make-q8mat))
   (rows 0 :type fixnum)
   (cols 0 :type fixnum)
-  (quants (make-array 0 :element-type '(signed-byte 8)) :type i8vec)
+  (quants (make-i8vec 0) :type i8vec)
   (scales (f32vec 0) :type f32vec)
   ;; the same scales regrouped four rows at a time, for the NEON kernel:
   ;; row 4g+k's scale for block b is at (g*blocks + b)*4 + k
@@ -29,7 +56,7 @@
 (defun regroup-scales (d rows nb)
   "D's per-row block scales, regrouped so a block's four row scales are adjacent."
   (declare (type f32vec d) (type fixnum rows nb))
-  (let ((out (f32vec (* rows nb))))
+  (let ((out (f32vec (* rows nb) :static t)))
     (dotimes (g (floor rows 4) out)
       (dotimes (b nb)
         (dotimes (k 4)
@@ -60,7 +87,7 @@
       (:q8_0 (let ((m (load-q8mat g name)))
                (dotimes (i n)
                  (setf (aref v i) (* (aref (q8mat-scales m) (floor i 32))
-                                     (aref (q8mat-quants m) i)))))))
+                                     (i8-ref (q8mat-quants m) i)))))))
     v))
 
 (defun load-q8mat (g name)
@@ -69,8 +96,8 @@
          (cols (first dims))
          (rows (reduce #'* (rest dims)))
          (n (* rows cols))
-         (q (make-array n :element-type '(signed-byte 8)))
-         (d (f32vec (floor n 32))))
+         (q (make-i8vec n :static t))
+         (d (f32vec (floor n 32) :static t)))
     (unless (eq (tensor-info-type ti) :q8_0)
       (error "~A is ~A; only Q8_0 matrices are supported so far" name (tensor-info-type ti)))
     ;; 34-byte blocks: fp16 scale, then 32 int8.  The chunk size is a whole
@@ -85,7 +112,7 @@
              do (setf (aref d b) (half-to-single (logior (aref buf off) (ash (aref buf (1+ off)) 8))))
                 (loop for j of-type fixnum from 0 below 32
                       for x = (aref buf (+ off 2 j))
-                      do (setf (aref q (+ (* b 32) j)) (if (> x 127) (- x 256) x)))))
+                      do (setf (aref q (+ (* b 32) j)) (i8-byte (if (> x 127) (- x 256) x))))))
      :chunk (* 34 32768))
     (%make-q8mat :rows rows :cols cols :quants q :scales d
                  :scales4 (if (zerop (mod rows 4)) (regroup-scales d rows (floor cols 32)) (f32vec 0)))))
@@ -94,11 +121,11 @@
 
 ;;; A vector quantized for a product: what ggml's quantize_row_q8_0 makes.
 (defstruct (q8vec (:constructor %make-q8vec))
-  (quants (make-array 0 :element-type '(signed-byte 8)) :type i8vec)
+  (quants (make-i8vec 0) :type i8vec)
   (scales (f32vec 0) :type f32vec))
 
 (defun make-q8vec (n)
-  (%make-q8vec :quants (make-array n :element-type '(signed-byte 8))
+  (%make-q8vec :quants (make-i8vec n)
                :scales (f32vec (floor n 32))))
 
 (defun quantize-q8! (x out &optional (xo 0) (n (length x)) (qo 0) (so 0))
@@ -117,7 +144,7 @@
         (declare (type single-float amax d id) (type fixnum base qbase))
         (setf (aref s (+ so b)) (half-to-single (single-to-half d)))
         (loop for j of-type fixnum from 0 below 32
-              do (setf (aref q (+ qbase j)) (the (signed-byte 8) (round (* (aref x (+ base j)) id)))))))
+              do (setf (aref q (+ qbase j)) (i8-byte (the (signed-byte 8) (round (* (aref x (+ base j)) id))))))))
     out))
 
 ;;; --- the product ------------------------------------------------------------
@@ -131,7 +158,8 @@
 (declaim (inline neon-active-p))
 (defun neon-active-p ()
   #+(and sbcl arm64) (neon-dot-p)
-  #-(and sbcl arm64) nil)
+  #+modus t                             ; %vi-sdot: SDOT on aarch64, the interpreter arm elsewhere
+  #-(or (and sbcl arm64) modus) nil)
 
 (defmacro with-dot-rows ((dot-rows w xq xs out) &body body)
   "Run BODY with (DOT-ROWS g xo xso oo) bound, for matrix W against the
@@ -146,7 +174,13 @@
                               (q8-row-dot-at wq ws (+ (* 4 g) k) cols ,xq ,xs xo xso)))))
                (declare (inline ,dot-rows))
                ,@body))))
-    #-(and sbcl arm64) portable
+    #+modus
+    `(let* ((wq (q8mat-quants ,w)) (ws4 (q8mat-scales4 ,w)) (cols (q8mat-cols ,w))
+            (nb (floor cols 32)))
+       (flet ((,dot-rows (g xo xso oo)
+                (%modus-q8-dot-4rows wq ws4 ,xq ,xs cols nb g xo xso ,out oo)))
+         ,@body))
+    #-(or modus (and sbcl arm64)) portable
     #+(and sbcl arm64)
     `(if (neon-active-p)
          (let ((wq (q8mat-quants ,w)) (ws4 (q8mat-scales4 ,w)) (cols (q8mat-cols ,w)))
@@ -184,7 +218,7 @@
             (xb (+ xo (* b 32))))
         (declare (type (signed-byte 32) acc) (type fixnum wo xb))
         (dotimes (j 32)
-          (setf acc (+ acc (the (signed-byte 16) (* (aref wq (+ wo j)) (aref xq (+ xb j)))))))
+          (setf acc (+ acc (the (signed-byte 16) (* (i8-ref wq (+ wo j)) (i8-ref xq (+ xb j)))))))
         (incf sum (* (float acc 1f0) (* (aref ws (+ sbase b)) (aref xs (+ xso b)))))))))
 
 (defun matvec! (pool w xv out &optional bias)
@@ -210,7 +244,7 @@
          (q (q8mat-quants w)) (s (q8mat-scales w))
          (base (* row cols)))
     (dotimes (j cols out)
-      (setf (aref out j) (* (aref s (floor (+ base j) 32)) (aref q (+ base j)))))))
+      (setf (aref out j) (* (aref s (floor (+ base j) 32)) (i8-ref q (+ base j)))))))
 
 ;;; --- float kernels for attention --------------------------------------------
 ;;; F32-DOT16 defines the order a dot product is summed in: sixteen strided

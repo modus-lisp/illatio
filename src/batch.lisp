@@ -33,7 +33,7 @@
 
 (defun make-q8batch (max-n cols)
   (%make-q8batch :cols cols
-                 :qv (%make-q8vec :quants (make-array (* max-n cols) :element-type '(signed-byte 8))
+                 :qv (%make-q8vec :quants (make-i8vec (* max-n cols))
                                   :scales (f32vec (* max-n (floor cols 32))))
                  :words (make-array (* (ceiling max-n 3) cols) :element-type '(signed-byte 64))))
 
@@ -60,7 +60,7 @@
             (dotimes (j cols)
               (setf (aref words (+ base j))
                     (the (signed-byte 64) (+ (aref words (+ base j))
-                                             (the (signed-byte 50) (ash (aref q (+ qo j)) shift))))))))))
+                                             (the (signed-byte 50) (ash (i8-ref q (+ qo j)) shift))))))))))
     out))
 
 (defmacro sext21 (v)
@@ -121,7 +121,7 @@
                   (dotimes (j 32)
                     (setf acc (the (signed-byte 64)
                                    (+ acc (the (signed-byte 58)
-                                               (* (aref wq (+ wo j))
+                                               (* (i8-ref wq (+ wo j))
                                                   (the (signed-byte 50) (aref words (+ xo j)))))))))
                   (with-lanes ((a0 a1 a2) acc)
                     (let ((wd (aref ws (+ sbase b))))

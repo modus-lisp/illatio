@@ -113,10 +113,31 @@
 ;;; but with \p{N}{1,3}; DIGITS is that bound.  Written out by hand, the way
 ;;; llama.cpp's own unicode_regex_split_custom_llama3 does it.
 
-(declaim (inline letterp numberp* spacep newlinep))
-(defun letterp (c) (and c (member (sb-unicode:general-category c) '(:lu :ll :lt :lm :lo))))
-(defun numberp* (c) (and c (member (sb-unicode:general-category c) '(:nd :nl :no))))
-(defun spacep (c) (and c (sb-unicode:whitespace-p c)))
+;;; \p{L}, \p{N} and \s come from illatio's own tables (unicode-data.lisp,
+;;; generated from SBCL's), not from the implementation: an implementation's
+;;; character predicates are allowed to know only ASCII, and the tokens must
+;;; not depend on which Lisp is running.
+
+(defun in-ranges-p (cp ranges)
+  "CP inside one of RANGES' inclusive [lo, hi] pairs (ascending): a binary search."
+  (let ((lo 0) (hi (1- (floor (length ranges) 2))))
+    (loop
+      (when (> lo hi) (return nil))
+      (let* ((mid (floor (+ lo hi) 2))
+             (a (aref ranges (* 2 mid)))
+             (b (aref ranges (1+ (* 2 mid)))))
+        (cond ((< cp a) (setq hi (1- mid)))
+              ((> cp b) (setq lo (1+ mid)))
+              (t (return t)))))))
+
+(defun letterp (c)
+  (and c (let ((cp (char-code c)))
+           (if (< cp 128) (alpha-char-p c) (in-ranges-p cp +letter-ranges+)))))
+(defun numberp* (c)
+  (and c (let ((cp (char-code c)))
+           (if (< cp 128) (char<= #\0 c #\9) (in-ranges-p cp +number-ranges+)))))
+(defun spacep (c) (and c (in-ranges-p (char-code c) +space-ranges+)))
+(declaim (inline newlinep))
 (defun newlinep (c) (and c (or (char= c #\Return) (char= c #\Newline))))
 
 (defun split-words (text &key (digits 1))
