@@ -153,29 +153,55 @@
     (dotimes (i n out)
       (setf (aref out (+ xo i)) (* (* (aref x (+ xo i)) scale) (aref w i))))))
 
-(defun rope! (x n-heads head-dim pos base neox &optional (xo 0))
-  "Rotate each head of X for position POS.  theta is advanced by repeated
+(defun rope-table (head-dim pos base)
+  "(VALUES cos sin) for position POS: theta is advanced by repeated
    multiplication, as ggml_rope_cache_init does, not by a fresh pow per
-   pair: the two differ in the last bits and those bits reach the logits."
-  (declare (type f32vec x) (type fixnum n-heads head-dim pos xo) (type single-float base)
-           (optimize speed (safety 0)))
+   pair: the two differ in the last bits and those bits reach the logits.
+   The same for every head, Q's and K's."
+  (declare (type fixnum head-dim pos) (type single-float base))
   (let* ((half (floor head-dim 2))
          (cos (f32vec half)) (sin (f32vec half))
          (theta-scale (expt base (/ -2f0 head-dim)))
          (theta (coerce pos 'single-float)))
     (declare (type single-float theta theta-scale))
-    (dotimes (i half)
+    (dotimes (i half (values cos sin))
       (setf (aref cos i) (cos theta) (aref sin i) (sin theta)
-            theta (* theta theta-scale)))
+            theta (* theta theta-scale)))))
+
+(defun rope-head! (x o head-dim neox cos sin)
+  "Rotate the head of X at O by the table COS / SIN."
+  (declare (type f32vec x cos sin) (type fixnum o head-dim) (optimize speed (safety 0)))
+  (let ((half (floor head-dim 2)))
+    (dotimes (i half x)
+      (multiple-value-bind (a b) (if neox
+                                     (values (+ o i) (+ o i half))
+                                     (values (+ o (* 2 i)) (+ o (* 2 i) 1)))
+        (let ((x0 (aref x a)) (x1 (aref x b)) (c (aref cos i)) (s (aref sin i)))
+          (setf (aref x a) (- (* x0 c) (* x1 s))
+                (aref x b) (+ (* x0 s) (* x1 c))))))))
+
+(defun rope! (x n-heads head-dim pos base neox &optional (xo 0))
+  "Rotate each head of X for position POS (see ROPE-TABLE)."
+  (multiple-value-bind (cos sin) (rope-table head-dim pos base)
     (dotimes (h n-heads x)
-      (let ((o (+ xo (* h head-dim))))
-        (dotimes (i half)
-          (multiple-value-bind (a b) (if neox
-                                         (values (+ o i) (+ o i half))
-                                         (values (+ o (* 2 i)) (+ o (* 2 i) 1)))
-            (let ((x0 (aref x a)) (x1 (aref x b)) (c (aref cos i)) (s (aref sin i)))
-              (setf (aref x a) (- (* x0 c) (* x1 s))
-                    (aref x b) (+ (* x0 s) (* x1 c))))))))))
+      (rope-head! x (+ xo (* h head-dim)) head-dim neox cos sin))))
+
+(defun qk-prep! (pool m l q k pos &optional (qo 0) (ko 0))
+  "HEAD-NORMS! then ROPE! of Q (at QO) and K (at KO) for position POS, a head
+   per unit of work across POOL: each head's arithmetic is the serial
+   code's, so any number of threads gives its bits."
+  (let* ((hd (model-head-dim m)) (nh (model-n-head m)) (nkv (model-n-kv-head m))
+         (eps (model-eps m)) (neox (model-rope-neox m))
+         (qn (layer-q-norm l)) (kn (layer-k-norm l)))
+    (multiple-value-bind (cos sin) (rope-table hd pos (model-rope-base m))
+      (parallel-for (u (+ nh nkv) pool)
+        (if (< u nh)
+            (let ((o (+ qo (* u hd))))
+              (when qn (rmsnorm! q qn q eps o))
+              (rope-head! q o hd neox cos sin))
+            (let ((o (+ ko (* (- u nh) hd))))
+              (when kn (rmsnorm! k kn k eps o))
+              (rope-head! k o hd neox cos sin)))))))
 
 (defmacro with-attention-kernels ((dot axpy) (kc vc q out) &body body)
   "Run BODY with (DOT k-offset q-offset hd) and (AXPY w v-offset out-offset hd)
@@ -267,16 +293,24 @@
   (declare (type f32vec x y) (type fixnum end) (optimize speed (safety 0)))
   (dotimes (i end x) (incf (aref x i) (aref y i))))
 
-(defun swiglu! (a b &optional (end (length a)))
+(defun swiglu-par! (pool a b &optional (end (length a)))
+  "SWIGLU! across POOL, a range of elements each (elementwise: the same bits)."
+  (pool-run pool (lambda (i n)
+                   (multiple-value-bind (s e) (share end i n)
+                     (swiglu! a b e s)))))
+
+(defun swiglu! (a b &optional (end (length a)) (start 0))
   "A = silu(A) * B, silu(x) = x/(1+e^-x).  A gate below about -88.7 makes
    e^-x overflow; C's expf gives infinity and silu -0.0, which is ggml's
    answer, so SBCL's overflow trap is masked here (modus gives infinity as
    it is).  Qwen3-4B reaches such gates on long prompts."
   (declare (type f32vec a b) (type fixnum end) (optimize speed (safety 0)))
+  (declare (type fixnum start))
   (flet ((run ()
-           (dotimes (i end a)
-             (let ((x (aref a i)))
-               (setf (aref a i) (* (/ x (+ 1f0 (exp (- x)))) (aref b i)))))))
+           (loop for i of-type fixnum from start below end
+                 do (let ((x (aref a i)))
+                      (setf (aref a i) (* (/ x (+ 1f0 (exp (- x)))) (aref b i)))))
+           a))
     (declare (inline run))
     #+sbcl (sb-int:with-float-traps-masked (:overflow :inexact) (run))
     #-sbcl (run)))
@@ -308,37 +342,35 @@
           for l = (svref (model-layers m) li)
           do (rmsnorm! x (layer-attn-norm l) h (model-eps m))
              (traced (format nil "attn_norm-~D" li) h)
-             (quantize-act! h xq)
+             (quantize-act-par! pool h xq)
              (qmatvec! pool (layer-wq l) xq (context-q ctx) (layer-bq l))
              (qmatvec! pool (layer-wk l) xq (context-k ctx) (layer-bk l))
              (qmatvec! pool (layer-wv l) xq (context-v ctx) (layer-bv l))
              (traced (format nil "Qcur-~D" li) (context-q ctx))
              (traced (format nil "Kcur-~D" li) (context-k ctx))
              (traced (format nil "Vcur-~D" li) (context-v ctx))
-             (head-norms! l (context-q ctx) (context-k ctx) m)
-             (rope! (context-q ctx) (model-n-head m) hd pos (model-rope-base m) (model-rope-neox m))
-             (rope! (context-k ctx) (model-n-kv-head m) hd pos (model-rope-base m) (model-rope-neox m))
+             (qk-prep! pool m l (context-q ctx) (context-k ctx) pos)
              (replace (svref (context-k-cache ctx) li) (context-k ctx) :start1 (* pos kvd))
              (replace (svref (context-v-cache ctx) li) (context-v ctx) :start1 (* pos kvd))
              (traced (format nil "Qrope-~D" li) (context-q ctx))
              (traced (format nil "Krope-~D" li) (context-k ctx))
              (attention! ctx li)
              (traced (format nil "kqv_out-~D" li) (context-att ctx))
-             (quantize-act! (context-att ctx) xq)
+             (quantize-act-par! pool (context-att ctx) xq)
              (qmatvec! pool (layer-wo l) xq h)
              (traced (format nil "attn_out-~D" li) h)
              (add! x h)
              (traced (format nil "ffn_inp-~D" li) x)
              (rmsnorm! x (layer-ffn-norm l) h (model-eps m))
              (traced (format nil "ffn_norm-~D" li) h)
-             (quantize-act! h xq)
+             (quantize-act-par! pool h xq)
              (qmatvec! pool (layer-wgate l) xq (context-ffn-a ctx))
              (qmatvec! pool (layer-wup l) xq (context-ffn-b ctx))
              (traced (format nil "ffn_gate-~D" li) (context-ffn-a ctx))
              (traced (format nil "ffn_up-~D" li) (context-ffn-b ctx))
-             (swiglu! (context-ffn-a ctx) (context-ffn-b ctx))
+             (swiglu-par! pool (context-ffn-a ctx) (context-ffn-b ctx))
              (traced (format nil "ffn_swiglu-~D" li) (context-ffn-a ctx))
-             (quantize-act! (context-ffn-a ctx) hq)
+             (quantize-act-par! pool (context-ffn-a ctx) hq)
              (qmatvec! pool (layer-wdown l) hq h)
              (traced (format nil "ffn_out-~D" li) h)
              (add! x h)
@@ -346,7 +378,7 @@
     (incf (context-pos ctx))
     (when logits
       (rmsnorm! x (model-output-norm m) h (model-eps m))
-      (quantize-act! h xq)
+      (quantize-act-par! pool h xq)
       (qmatvec! pool (model-output m) xq (context-logits ctx)))
     ctx))
 

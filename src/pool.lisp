@@ -8,6 +8,18 @@
 
 (in-package #:illatio)
 
+;;; Between two steps of a token the workers SPIN on the job generation (an
+;;; atomic word) rather than sleep on the condition variable: a wake through
+;;; the kernel and a join cost ~38 us a step, which at ~290 steps a token was
+;;; 43% of a Qwen3-4B decode on ten threads.  A worker that has spun +SPIN+
+;;; rounds with nothing new -- between tokens, while a user types -- parks on
+;;; the condition variable as before.  The caller spins for the stragglers.
+;;; (modus's thread shim has no atomic words; there the pool parks always.)
+
+(defconstant +spin+ 200000
+  "Spin rounds before a worker parks: a few hundred microseconds, longer
+   than any gap between two steps of a token.")
+
 (defstruct (pool (:constructor %make-pool))
   (threads '())
   (size 1 :type fixnum)                 ; participants, caller included
@@ -15,8 +27,9 @@
   (wake (sb-thread:make-waitqueue))
   (idle (sb-thread:make-waitqueue))
   (job nil)
-  (generation 0 :type fixnum)
-  (pending 0 :type fixnum)
+  (generation 0 :type #+sbcl sb-ext:word #-sbcl fixnum)
+  (pending 0 :type #+sbcl sb-ext:word #-sbcl fixnum)
+  (sleepers 0 :type #+sbcl sb-ext:word #-sbcl fixnum) ; workers parked on WAKE
   (failure nil)
   (stop nil))
 
@@ -44,6 +57,40 @@
                                                  :name (format nil "illatio worker ~D" i)))))
     p))
 
+(defun run-job (p job index)
+  "JOB's share INDEX; an error is kept for the caller, not raised here."
+  (let ((err (handler-case (progn (funcall job index (pool-size p)) nil)
+               (error (e) e))))
+    (when err
+      (sb-thread:with-mutex ((pool-lock p))
+        (unless (pool-failure p) (setf (pool-failure p) err))))))
+
+#+sbcl
+(defun pool-worker (p index)
+  (let ((seen (pool-generation p)))
+    (loop
+      ;; spin for the next generation; park if it is long in coming
+      (let ((n 0))
+        (declare (type fixnum n))
+        (loop until (or (/= (pool-generation p) seen) (pool-stop p) (> (incf n) +spin+))
+              do (sb-ext:spin-loop-hint)))
+      (when (and (= (pool-generation p) seen) (not (pool-stop p)))
+        (sb-thread:with-mutex ((pool-lock p))
+          ;; counted BEFORE the generation is read again: either the caller
+          ;; sees a sleeper and broadcasts, or this read sees its new generation
+          (sb-ext:atomic-incf (pool-sleepers p))
+          (sb-thread:barrier (:memory))
+          (loop while (and (= (pool-generation p) seen) (not (pool-stop p)))
+                do (sb-thread:condition-wait (pool-wake p) (pool-lock p)))
+          (sb-ext:atomic-decf (pool-sleepers p))))
+      (when (pool-stop p) (return))
+      (setf seen (pool-generation p))
+      (sb-thread:barrier (:read))
+      (run-job p (pool-job p) index)
+      (sb-thread:barrier (:write))
+      (sb-ext:atomic-decf (pool-pending p)))))
+
+#-sbcl
 (defun pool-worker (p index)
   (let ((seen 0))
     (loop
@@ -54,31 +101,44 @@
           (when (pool-stop p) (return))
           (setf seen (pool-generation p)
                 job (pool-job p)))
-        (let ((err (handler-case (progn (funcall job index (pool-size p)) nil)
-                     (error (e) e))))
-          (sb-thread:with-mutex ((pool-lock p))
-            (when (and err (not (pool-failure p))) (setf (pool-failure p) err))
-            (when (zerop (decf (pool-pending p)))
-              (sb-thread:condition-broadcast (pool-idle p)))))))))
+        (run-job p job index)
+        (sb-thread:with-mutex ((pool-lock p))
+          (when (zerop (decf (pool-pending p)))
+            (sb-thread:condition-broadcast (pool-idle p))))))))
 
 (defun pool-run (p fn)
   "Run (FN INDEX COUNT) on every participant of P and return when all are done."
   (declare (type function fn))
-  (if (= (pool-size p) 1)
-      (funcall fn 0 1)
-      (progn
-        (sb-thread:with-mutex ((pool-lock p))
-          (setf (pool-job p) fn
-                (pool-failure p) nil
-                (pool-pending p) (1- (pool-size p)))
-          (incf (pool-generation p))
-          (sb-thread:condition-broadcast (pool-wake p)))
-        (funcall fn 0 (pool-size p))
-        (sb-thread:with-mutex ((pool-lock p))
-          (loop until (zerop (pool-pending p))
-                do (sb-thread:condition-wait (pool-idle p) (pool-lock p)))
-          (let ((e (pool-failure p)))
-            (when e (error e)))))))
+  (when (= (pool-size p) 1)
+    (return-from pool-run (funcall fn 0 1)))
+  #+sbcl
+  (progn
+    (setf (pool-job p) fn
+          (pool-failure p) nil
+          (pool-pending p) (1- (pool-size p)))
+    (sb-thread:barrier (:write))
+    (sb-ext:atomic-incf (pool-generation p))
+    (sb-thread:barrier (:memory))
+    (when (plusp (pool-sleepers p))
+      (sb-thread:with-mutex ((pool-lock p))
+        (sb-thread:condition-broadcast (pool-wake p))))
+    (funcall fn 0 (pool-size p))
+    (loop until (zerop (pool-pending p)) do (sb-ext:spin-loop-hint))
+    (sb-thread:barrier (:read)))
+  #-sbcl
+  (progn
+    (sb-thread:with-mutex ((pool-lock p))
+      (setf (pool-job p) fn
+            (pool-failure p) nil
+            (pool-pending p) (1- (pool-size p)))
+      (incf (pool-generation p))
+      (sb-thread:condition-broadcast (pool-wake p)))
+    (funcall fn 0 (pool-size p))
+    (sb-thread:with-mutex ((pool-lock p))
+      (loop until (zerop (pool-pending p))
+            do (sb-thread:condition-wait (pool-idle p) (pool-lock p)))))
+  (let ((e (pool-failure p)))
+    (when e (error e))))
 
 (defun pool-stop! (p)
   (sb-thread:with-mutex ((pool-lock p))

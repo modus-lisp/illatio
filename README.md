@@ -37,8 +37,8 @@ SIMD lanes):
 |---|---|---|---|
 | decode, 1 thread | 10.0 | 4.4 | 17.4 |
 | prefill, 1 thread | 18.3 | 6.7 | 36.4 |
-| decode, 8–10 threads | 28.1 | 13.0 | 43.2 |
-| prefill, 8–10 threads | 93.5 | 16.7 | 294 |
+| decode, 8–10 threads | 38.7 | 13.0 | 43.2 |
+| prefill, 8–10 threads | 149.5 | 16.7 | 294 |
 
 Qwen3-4B in Q4_K_M (2.5 GB):
 
@@ -46,8 +46,8 @@ Qwen3-4B in Q4_K_M (2.5 GB):
 |---|---|---|---|
 | decode, 1 thread | 10.6 | 0.8 | 9.3 |
 | prefill, 1 thread | 12.1 | 1.1 | 14.7 |
-| decode, 8–10 threads | 36.7 | 3.0 | 61.2 |
-| prefill, 8–10 threads | 66.7 | 3.7 | 114 |
+| decode, 8–10 threads | 65.6 | 3.0 | 61.2 |
+| prefill, 8–10 threads | 86.6 | 3.7 | 114 |
 
 Other checks:
 

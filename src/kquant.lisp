@@ -321,6 +321,22 @@
   (when (qact-q8k act) (quantize-q8k! x (qact-q8k act)))
   act)
 
+(defun quantize-act-par! (pool x act)
+  "QUANTIZE-ACT! across POOL, a range of blocks each: a block is quantized
+   on its own, so the bits are the serial ones."
+  (let ((n (length x)))
+    (pool-run pool
+              (lambda (i c)
+                (when (qact-q8 act)
+                  (multiple-value-bind (s e) (share (floor n 32) i c)
+                    (when (< s e)
+                      (quantize-q8! x (qact-q8 act) (* s 32) (* (- e s) 32) (* s 32) s))))
+                (when (qact-q8k act)
+                  (multiple-value-bind (s e) (share (floor n +qk-k+) i c)
+                    (when (< s e)
+                      (quantize-q8k! x (qact-q8k act) (* s +qk-k+) (* (- e s) +qk-k+) (* s +qk-k+)))))))
+    act))
+
 (defun matrix-act-kind (w)
   (if (kmat-p w) :q8k :q8))
 
