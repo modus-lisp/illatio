@@ -17,8 +17,9 @@ operandi --illatio "task"             # or no server at all: the model in operan
 ## Status
 
 Two models run, both checked against llama.cpp: Qwen2.5-0.5B-Instruct and
-Qwen3-4B-Instruct-2507, in Q8_0 (the `qwen2` and `qwen3` architectures;
-`llama` shares the code path).  On an Apple M-series laptop, against
+Qwen3-4B-Instruct-2507 (the `qwen2` and `qwen3` architectures; `llama`
+shares the code path), in Q8_0 and, for Qwen3-4B, Q4_K_M (Q4_K and Q6_K
+weights).  On an Apple M-series laptop, against
 llama.cpp's CPU backend on the same file.  Qwen2.5-0.5B:
 
 | tok/s | illatio, NEON | illatio, portable | llama.cpp CPU |
@@ -38,6 +39,15 @@ SIMD lanes):
 | prefill, 1 thread | 18.3 | 6.7 | 36.4 |
 | decode, 8–10 threads | 28.1 | 13.0 | 43.2 |
 | prefill, 8–10 threads | 93.5 | 16.7 | 294 |
+
+Qwen3-4B in Q4_K_M (2.5 GB):
+
+| tok/s | illatio, SBCL | illatio, modus | llama.cpp |
+|---|---|---|---|
+| decode, 1 thread | 10.6 | 0.8 | 9.3 |
+| prefill, 1 thread | 12.1 | 1.1 | 14.7 |
+| decode, 8–10 threads | 36.7 | 3.0 | 61.2 |
+| prefill, 8–10 threads | 66.7 | 3.7 | 114 |
 
 Other checks:
 
@@ -69,6 +79,8 @@ Qwen3-4B (4.3 GB):
 curl -L -o ~/models/qwen3-4b-instruct-2507-q8_0.gguf \
   https://huggingface.co/unsloth/Qwen3-4B-Instruct-2507-GGUF/resolve/main/Qwen3-4B-Instruct-2507-Q8_0.gguf
 ```
+
+or the same model in Q4_K_M (2.5 GB): `.../Qwen3-4B-Instruct-2507-Q4_K_M.gguf`.
 
 ## Use
 
@@ -109,7 +121,14 @@ folds them straight into its stream state.
 - **GGUF.** Header, metadata and tensor directory are read through a stream.
   Each tensor is read from disk once, straight into its own arrays
   (`src/gguf.lisp`).
-- **Q8_0 everywhere.** Weights stay int8 with per-32-block scales.
+- **K-quants.** Q4_K and Q6_K weights stay 4.5 / 6.6 bits a weight in
+  memory and are multiplied against Q8_K activations, as ggml does: the
+  integer sums exact, the floats combined in the order of its NEON kernels
+  (`src/kquant.lisp`; `%Q4K-DOT` / `%Q6K-DOT` in `src/neon-sbcl.lisp` give
+  the portable dots' bits).  Their noise floor against llama.cpp is about
+  2.5 times Q8_0's, measured the same way, and vectors-test's bounds for
+  them follow it.
+- **Q8_0.** Weights stay int8 with per-32-block scales.
   Activations are quantized to Q8_0 the way ggml's ARM path does it
   (amax/127, the scale rounded to fp16, ties-to-even with the unrounded
   1/d), so every product is an integer dot product per block
@@ -188,8 +207,8 @@ inspect/collect-vectors.py http://localhost:18931 inspect/vectors/qwen2.5-0.5b-q
 - **modus.** The three kernels have `#+modus` arms (`src/neon-modus.lisp`)
   with the portable kernels' bits.  What is left is modus's thread scaling
   (8 threads give 3x) and the serial per-layer ops between the products.
-- **More formats.** K-quants (Q4_K, Q6_K): a 4B model in 2.5 GB instead of
-  4.3, and the larger models that need them.
+- **More formats.** Q5_K (Q5_K_M files) and Q8_0-with-K-quant mixes; Q4_K
+  prefill through I8MM.
 - **ds4f.** DeepSeek V4 Flash, ported from ds4's CPU reference path, with
   SSD streaming of routed experts for machines with less RAM than the model.
 
