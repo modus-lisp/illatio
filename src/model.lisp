@@ -17,6 +17,7 @@
 
 (defstruct layer
   attn-norm wq wk wv wo bq bk bv
+  q-norm k-norm                         ; qwen3: per-head RMSNorm of q and k
   ffn-norm wgate wup wdown)
 
 (defstruct (model (:constructor %make-model))
@@ -26,6 +27,8 @@
   (n-head 0 :type fixnum)
   (n-kv-head 0 :type fixnum)
   (head-dim 0 :type fixnum)
+  (q-dim 0 :type fixnum)         ; n-head * head-dim: d, except where a model
+                                 ; declares a wider head (qwen3: 32 x 128 > 2560)
   (ffn 0 :type fixnum)
   (n-vocab 0 :type fixnum)
   (context-length 0 :type fixnum)
@@ -46,8 +49,8 @@
          (d (arch-key g arch "embedding_length"))
          (n-head (arch-key g arch "attention.head_count"))
          (vocab (make-vocab-from-gguf g)))
-    (unless (member arch '("qwen2" "llama") :test #'equal)
-      (error "architecture ~S is not supported (qwen2 and llama are)" arch))
+    (unless (member arch '("qwen2" "qwen3" "llama") :test #'equal)
+      (error "architecture ~S is not supported (qwen2, qwen3 and llama are)" arch))
     (flet ((q8 (name) (load-q8mat g name))
            (f32 (name) (load-f32 g name))
            (opt (name f) (and (gguf-tensor g name nil) (funcall f name))))
@@ -55,7 +58,10 @@
        :gguf g :vocab vocab :arch arch :name (meta g "general.name" arch)
        :n-layer n-layer :d d :n-head n-head
        :n-kv-head (arch-key g arch "attention.head_count_kv")
-       :head-dim (floor d n-head)
+       ;; attention.key_length when the model has one (qwen3's heads are 128
+       ;; wide on a 2560 embedding), else the embedding split evenly
+       :head-dim (or (arch-key g arch "attention.key_length") (floor d n-head))
+       :q-dim (* n-head (or (arch-key g arch "attention.key_length") (floor d n-head)))
        :ffn (arch-key g arch "feed_forward_length")
        :n-vocab (length (vocab-pieces vocab))
        :context-length (arch-key g arch "context_length")
@@ -63,7 +69,7 @@
        :rope-base (coerce (or (arch-key g arch "rope.freq_base") 10000) 'single-float)
        ;; llama.cpp's rope type per architecture: qwen2 rotates (i, i+d/2)
        ;; pairs (NEOX), llama rotates adjacent (2i, 2i+1) pairs.
-       :rope-neox (equal arch "qwen2")
+       :rope-neox (member arch '("qwen2" "qwen3") :test #'equal)
        :token-embd (q8 "token_embd.weight")
        :output-norm (f32 "output_norm.weight")
        ;; Without an output matrix the head is tied to the embedding.
@@ -78,6 +84,8 @@
                                  :bq (opt (n "attn_q.bias") #'f32)
                                  :bk (opt (n "attn_k.bias") #'f32)
                                  :bv (opt (n "attn_v.bias") #'f32)
+                                 :q-norm (opt (n "attn_q_norm.weight") #'f32)
+                                 :k-norm (opt (n "attn_k_norm.weight") #'f32)
                                  :ffn-norm (f32 (n "ffn_norm.weight"))
                                  :wgate (q8 (n "ffn_gate.weight"))
                                  :wup (q8 (n "ffn_up.weight"))
@@ -98,15 +106,18 @@
 
 (defun make-context (model &key (n-ctx (min 4096 (model-context-length model))))
   (let* ((d (model-d model))
+         (qd (model-q-dim model))
          (kv (* (model-n-kv-head model) (model-head-dim model)))
          (f (model-ffn model)))
     (%make-context
      :model model :n-ctx n-ctx
-     :k-cache (coerce (loop repeat (model-n-layer model) collect (f32vec (* n-ctx kv))) 'simple-vector)
-     :v-cache (coerce (loop repeat (model-n-layer model) collect (f32vec (* n-ctx kv))) 'simple-vector)
-     :x (f32vec d) :h (f32vec d) :q (f32vec d) :k (f32vec kv) :v (f32vec kv)
-     :att (f32vec d) :ffn-a (f32vec f) :ffn-b (f32vec f)
-     :xq (make-q8vec d) :hq (make-q8vec f)
+     ;; static on modus: a 4B model's cache at 4096 tokens is 1.2 GB, more
+     ;; than its copying heap's semispace; FREE-CONTEXT gives it back
+     :k-cache (coerce (loop repeat (model-n-layer model) collect (f32vec (* n-ctx kv) :static t)) 'simple-vector)
+     :v-cache (coerce (loop repeat (model-n-layer model) collect (f32vec (* n-ctx kv) :static t)) 'simple-vector)
+     :x (f32vec d) :h (f32vec d) :q (f32vec qd) :k (f32vec kv) :v (f32vec kv)
+     :att (f32vec qd) :ffn-a (f32vec f) :ffn-b (f32vec f)
+     :xq (make-q8vec (max d qd)) :hq (make-q8vec f)
      :logits (f32vec (model-n-vocab model)))))
 
 ;;; --- ops --------------------------------------------------------------------
@@ -223,6 +234,17 @@
     (parallel-for (h (model-n-head m) (model-pool m))
       (attend-head! ctx layer-index (context-q ctx) (* h hd) (context-att ctx) n h))))
 
+(defun head-norms! (l q k m &optional (qo 0) (ko 0))
+  "qwen3's Q and K norms: each head of Q at QO and of K at KO RMS-normalized
+   and weighted, before RoPE (llama.cpp's attn_q_norm / attn_k_norm).  A
+   no-op for a model without them."
+  (when (layer-q-norm l)
+    (let ((hd (model-head-dim m)) (eps (model-eps m)))
+      (dotimes (h (model-n-head m))
+        (rmsnorm! q (layer-q-norm l) q eps (+ qo (* h hd))))
+      (dotimes (h (model-n-kv-head m))
+        (rmsnorm! k (layer-k-norm l) k eps (+ ko (* h hd)))))))
+
 (defun add! (x y &optional (end (length x)))
   (declare (type f32vec x y) (type fixnum end) (optimize speed (safety 0)))
   (dotimes (i end x) (incf (aref x i) (aref y i))))
@@ -268,6 +290,7 @@
              (traced (format nil "Qcur-~D" li) (context-q ctx))
              (traced (format nil "Kcur-~D" li) (context-k ctx))
              (traced (format nil "Vcur-~D" li) (context-v ctx))
+             (head-norms! l (context-q ctx) (context-k ctx) m)
              (rope! (context-q ctx) (model-n-head m) hd pos (model-rope-base m) (model-rope-neox m))
              (rope! (context-k ctx) (model-n-kv-head m) hd pos (model-rope-base m) (model-rope-neox m))
              (replace (svref (context-k-cache ctx) li) (context-k ctx) :start1 (* pos kvd))
@@ -314,14 +337,27 @@
 (defun detokenize (model ids)
   (detokenize-with (model-vocab model) ids))
 
-(defun greedy (model prompt n &key (ctx (make-context model)))
+(defun free-context (ctx)
+  "Release CTX's KV cache now (on modus it is outside the heap, so the
+   collector would never reclaim it); CTX is unusable afterwards.  Harmless
+   to call twice, and on SBCL it only drops the references."
+  #+modus (dolist (caches (list (context-k-cache ctx) (context-v-cache ctx)))
+            (when caches (loop for c across caches do (modus:free-static-vector c))))
+  (setf (context-k-cache ctx) nil (context-v-cache ctx) nil)
+  ctx)
+
+(defun greedy (model prompt n &key (ctx nil ctx-p))
   "The N tokens greedy decoding produces after PROMPT (a string or ids)."
-  (let ((ids (if (stringp prompt) (tokenize model prompt) prompt)))
-    (eval-tokens ctx ids)
-    (loop repeat n
-          for tok = (argmax (context-logits ctx))
-          collect tok
-          do (forward ctx tok))))
+  (let ((ctx (if ctx-p ctx (make-context model)))
+        (ids (if (stringp prompt) (tokenize model prompt) prompt)))
+    (unwind-protect
+         (progn
+           (eval-tokens ctx ids)
+           (loop repeat n
+                 for tok = (argmax (context-logits ctx))
+                 collect tok
+                 do (forward ctx tok)))
+      (unless ctx-p (free-context ctx)))))
 
 (defun top-logprobs (logits k)
   "The K most likely tokens as (id . logprob), most likely first.  The

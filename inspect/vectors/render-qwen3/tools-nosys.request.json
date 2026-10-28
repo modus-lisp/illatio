@@ -1,0 +1,29 @@
+{
+ "messages": [
+  {
+   "role": "user",
+   "content": "Read a.txt"
+  }
+ ],
+ "tools": [
+  {
+   "type": "function",
+   "function": {
+    "name": "read_file",
+    "description": "Read a file",
+    "parameters": {
+     "type": "object",
+     "properties": {
+      "path": {
+       "type": "string",
+       "description": "Path"
+      }
+     },
+     "required": [
+      "path"
+     ]
+    }
+   }
+  }
+ ]
+}

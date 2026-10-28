@@ -126,9 +126,113 @@
         (when add-generation-prompt
           (emit "<|im_start|>assistant" (string #\Newline)))))))
 
+;;; --- qwen3's template ---------------------------------------------------------
+;;; Qwen2.5's, less the default system prompt, plus <think> handling: an
+;;; assistant turn after the last real user query is written with a <think>
+;;; block when it is the final message or has reasoning_content.  A tool
+;;; call's arguments that arrive as a JSON string are written as they are.
+
+(defun strip-newlines (string &key (left t) (right t))
+  "STRING without leading (LEFT) and trailing (RIGHT) newlines: Python's
+   lstrip / rstrip / strip with '\\n'."
+  (let ((start 0) (end (length string)))
+    (when left (loop while (and (< start end) (char= (char string start) #\Newline)) do (incf start)))
+    (when right (loop while (and (> end start) (char= (char string (1- end)) #\Newline)) do (decf end)))
+    (subseq string start end)))
+
+(defun split-reasoning (content)
+  "(VALUES reasoning content) as the template splits a turn at </think>."
+  (let ((close (search "</think>" content)))
+    (if (null close)
+        (values "" content)
+        (let* ((before (strip-newlines (subseq content 0 close) :left nil))
+               (open (search "<think>" before :from-end t))
+               (reasoning (strip-newlines (if open (subseq before (+ open 7)) before) :right nil))
+               (last-close (search "</think>" content :from-end t)))
+          (values reasoning (strip-newlines (subseq content (+ last-close 8)) :right nil))))))
+
+(defun render-qwen3-chat (messages tools
+                          &key (add-generation-prompt
+                                (let ((l (and (plusp (length messages))
+                                              (elt messages (1- (length messages))))))
+                                  (not (and l (equal (jget l "role") "assistant"))))))
+  "MESSAGES and TOOLS rendered as Qwen3's chat template renders them."
+  (let* ((msgs (coerce messages 'list))
+         (n (length msgs))
+         ;; the last user message that is not a wrapped tool response
+         (last-query
+           (or (loop for i from (1- n) downto 0
+                     for m = (nth i msgs)
+                     for c = (jget m "content")
+                     when (and (equal (jget m "role") "user") (stringp c)
+                               (not (and (eql 0 (search "<tool_response>" c))
+                                         (let ((e (search "</tool_response>" c :from-end t)))
+                                           (and e (= (+ e 16) (length c)))))))
+                       return i)
+               (1- n))))
+    (with-output-to-string (s)
+      (flet ((emit (&rest strings) (dolist (x strings) (write-string x s))))
+        (let ((sys (and msgs (equal (jget (first msgs) "role") "system")
+                        (content-string (jget (first msgs) "content")))))
+          (if (and tools (plusp (length tools)))
+              (progn
+                (emit "<|im_start|>system" (string #\Newline))
+                (when sys (emit sys (format nil "~%~%")))
+                (emit (format nil "# Tools~%~%You may call one or more functions to assist with the user query.~%~%You are provided with function signatures within <tools></tools> XML tags:~%<tools>"))
+                (loop for tool across tools do (emit (string #\Newline) (pyjson tool)))
+                (emit (format nil "~%</tools>~%~%For each function call, return a json object with function name and arguments within <tool_call></tool_call> XML tags:~%<tool_call>~%{\"name\": <function-name>, \"arguments\": <args-json-object>}~%</tool_call><|im_end|>~%")))
+              (when sys
+                (emit "<|im_start|>system" (string #\Newline) sys "<|im_end|>" (string #\Newline)))))
+        (loop for (m . rest) on msgs
+              for prev = nil then role
+              for role = (jget m "role")
+              for i from 0
+              for raw = (jget m "content")
+              for content = (if (stringp raw) raw "")
+              for calls = (let ((c (jget m "tool_calls"))) (and (vectorp c) (plusp (length c)) c))
+              do (cond
+                   ((or (equal role "user") (and (equal role "system") (plusp i)))
+                    (emit "<|im_start|>" role (string #\Newline) content "<|im_end|>" (string #\Newline)))
+                   ((equal role "assistant")
+                    ;; llama-server splits reasoning out of earlier turns, not
+                    ;; out of a final (prefill) one, which it leaves as sent
+                    (multiple-value-bind (reasoning body)
+                        (let ((rc (jget m "reasoning_content")))
+                          (cond ((stringp rc) (values rc content))
+                                ((null rest) (values "" content))
+                                (t (split-reasoning content))))
+                      (if (and (> i last-query) (or (null rest) (plusp (length reasoning))))
+                          (emit "<|im_start|>assistant" (format nil "~%<think>~%")
+                                (strip-newlines reasoning) (format nil "~%</think>~%~%")
+                                (strip-newlines body :right nil))
+                          (emit "<|im_start|>assistant" (string #\Newline) body))
+                      (when calls
+                        (loop for call across calls for first = t then nil
+                              do (when (or (not first) (plusp (length body))) (emit (string #\Newline)))
+                                 (progn
+                                   (emit (format nil "<tool_call>~%{\"name\": \"")
+                                         (or (jget call "function" "name") (jget call "name") "")
+                                         "\", \"arguments\": "
+                                         ;; a JSON string is written re-serialized,
+                                         ;; as llama-server passes it to the template
+                                         (pyjson (tool-call-arguments call))
+                                         (format nil "}~%</tool_call>")))))
+                      ;; a final assistant message is a prefill: left open
+                      (when rest (emit "<|im_end|>" (string #\Newline)))))
+                   ((equal role "tool")
+                    (unless (equal prev "tool") (emit "<|im_start|>user"))
+                    (emit (format nil "~%<tool_response>~%") content (format nil "~%</tool_response>"))
+                    (unless (and rest (equal (jget (first rest) "role") "tool"))
+                      (emit "<|im_end|>" (string #\Newline))))))
+        (when add-generation-prompt
+          (emit "<|im_start|>assistant" (string #\Newline)))))))
+
 (defun render-chat (model messages &optional tools)
   (let ((template (meta (model-gguf model) "tokenizer.chat_template" "")))
-    (cond ((and (search "<|im_start|>" template) (search "<tool_call>" template))
+    (cond ((and (search "<|im_start|>" template) (search "<tool_call>" template)
+                (search "</think>" template))
+           (render-qwen3-chat messages tools))
+          ((and (search "<|im_start|>" template) (search "<tool_call>" template))
            (render-qwen-chat messages tools))
           (t (error "no renderer for ~A's chat template yet" (model-name model))))))
 

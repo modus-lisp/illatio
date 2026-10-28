@@ -7,7 +7,7 @@
    #:read-gguf #:gguf #:meta
    ;; a model, and a sequence's state on it
    #:load-model #:model #:model-name #:model-context-length
-   #:make-context #:context #:context-n-ctx #:context-pos #:context-logits
+   #:make-context #:free-context #:context #:context-n-ctx #:context-pos #:context-logits
    ;; text <-> tokens
    #:tokenize #:detokenize
    ;; running it

@@ -16,9 +16,10 @@ operandi --illatio "task"             # or no server at all: the model in operan
 
 ## Status
 
-The first model runs, and it is checked against llama.cpp. Qwen2.5-0.5B-Instruct
-in Q8_0 (the `qwen2` architecture; `llama` shares the code path), on an Apple
-M-series laptop, against llama.cpp's CPU backend on the same file:
+Two models run, both checked against llama.cpp: Qwen2.5-0.5B-Instruct and
+Qwen3-4B-Instruct-2507, in Q8_0 (the `qwen2` and `qwen3` architectures;
+`llama` shares the code path).  On an Apple M-series laptop, against
+llama.cpp's CPU backend on the same file.  Qwen2.5-0.5B:
 
 | tok/s | illatio, NEON | illatio, portable | llama.cpp CPU |
 |---|---|---|---|
@@ -27,13 +28,25 @@ M-series laptop, against llama.cpp's CPU backend on the same file:
 | decode, 10 threads | 99 | 32 | 280–315 |
 | prefill, 10 threads | 511 | 72 | 1,892 |
 
+Qwen3-4B (`llama-bench -ngl 0`; its prefill still uses BLAS), and illatio in
+modus, the Lisp it is also written for (`#+modus` kernels on modus's own
+SIMD lanes):
+
+| tok/s | illatio, SBCL | illatio, modus | llama.cpp |
+|---|---|---|---|
+| decode, 1 thread | 10.0 | 4.4 | 17.4 |
+| prefill, 1 thread | 18.3 | 6.7 | 36.4 |
+| decode, 8–10 threads | 28.1 | 13.0 | 43.2 |
+| prefill, 8–10 threads | 93.5 | 16.7 | 294 |
+
 Other checks:
 
 - **Load time.** 2.8 s.
 - **Tokenizer.** llama.cpp's ids on every test prompt.
 - **Chat template.** Byte-identical to llama-server's `/apply-template`, with
   and without tools.
-- **Logits.** At llama.cpp's noise floor (see Testing).
+- **Logits.** At llama.cpp's noise floor (see Testing), for both models; on
+  Qwen3-4B every one of the 213 test steps picks llama.cpp's token.
 - **First turn under operandi.** `operandi --illatio` answers its first turn
   in 30 s, prefill of its 6,328-token system prompt included.
 
@@ -49,7 +62,13 @@ mkdir -p ~/models && curl -L -o ~/models/qwen2.5-0.5b-instruct-q8_0.gguf \
   https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct-GGUF/resolve/main/qwen2.5-0.5b-instruct-q8_0.gguf
 ```
 
-That path is the default. `-m PATH` or `$ILLATIO_MODEL` picks another.
+That path is the default. `-m PATH` or `$ILLATIO_MODEL` picks another, e.g.
+Qwen3-4B (4.3 GB):
+
+```
+curl -L -o ~/models/qwen3-4b-instruct-2507-q8_0.gguf \
+  https://huggingface.co/unsloth/Qwen3-4B-Instruct-2507-GGUF/resolve/main/Qwen3-4B-Instruct-2507-Q8_0.gguf
+```
 
 ## Use
 
@@ -129,7 +148,11 @@ sbcl --dynamic-space-size 4096 --non-interactive --load inspect/consistency-test
 sbcl --non-interactive --load inspect/render-test.lisp
 ```
 
-Each exits 0 if it passes and 2 if the model file is missing.
+Each exits 0 if it passes and 2 if the model file is missing.  They test
+Qwen2.5-0.5B; for another model set `ILLATIO_TEST_MODEL` (and, for
+vectors-test, `ILLATIO_TEST_VECTORS`, e.g.
+`inspect/vectors/qwen3-4b-instruct-2507-q8_0.sexp`).  render-test also
+checks Qwen3's template when that model is in `~/models`.
 
 - **vectors-test** runs illatio against llama.cpp's own logprobs on five
   prompts, teacher-forced. Exact token-for-token agreement can't be the bar.
@@ -162,11 +185,11 @@ inspect/collect-vectors.py http://localhost:18931 inspect/vectors/qwen2.5-0.5b-q
   - Decode is now near what one core can pull from memory.
   - Disk KV checkpoints for a prompt prefix that never changes (ds4 does
     this) would remove most of operandi's first-turn cost.
-- **modus.** Modus has integer NEON lanes (its Layer 2b, `%vi-*`) but no
-  SDOT yet. The kernels are behind three names (`%q8-dot-4rows`,
-  `%f32-dot16`, `%f32-axpy4`) with portable twins, so a `#+modus` arm is
-  those three.
-- **More formats.** K-quants (Q4_K, Q6_K) and more architectures.
+- **modus.** The three kernels have `#+modus` arms (`src/neon-modus.lisp`)
+  with the portable kernels' bits.  What is left is modus's thread scaling
+  (8 threads give 3x) and the serial per-layer ops between the products.
+- **More formats.** K-quants (Q4_K, Q6_K): a 4B model in 2.5 GB instead of
+  4.3, and the larger models that need them.
 - **ds4f.** DeepSeek V4 Flash, ported from ds4's CPU reference path, with
   SSD streaming of routed experts for machines with less RAM than the model.
 

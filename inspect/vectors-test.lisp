@@ -22,7 +22,8 @@
 ;;;   - our argmax is llama.cpp's, except where llama.cpp's own top two are
 ;;;     within +NEAR-TIE+ (either is then a faithful answer).
 ;;; Exits 0 iff all hold.  Needs the model: $ILLATIO_TEST_MODEL, or
-;;; ~/models/qwen2.5-0.5b-instruct-q8_0.gguf.
+;;; ~/models/qwen2.5-0.5b-instruct-q8_0.gguf; and its vectors:
+;;; $ILLATIO_TEST_VECTORS, or vectors/qwen2.5-0.5b-q8_0.sexp.
 
 (require :asdf)
 (asdf:load-asd (merge-pathnames "../illatio.asd" (or *load-truename* *default-pathname-defaults*)))
@@ -81,8 +82,9 @@
     (format t "no model at ~A; see README (Testing)~%" path)
     (uiop:quit 2))
   (let ((m (load-model path)))
-    (dolist (c (read-vectors (merge-pathnames "vectors/qwen2.5-0.5b-q8_0.sexp"
-                                              (or *load-truename* *default-pathname-defaults*))))
+    (dolist (c (read-vectors (or (uiop:getenv "ILLATIO_TEST_VECTORS")
+                                 (merge-pathnames "vectors/qwen2.5-0.5b-q8_0.sexp"
+                                                  (or *load-truename* *default-pathname-defaults*)))))
       (run-case m c))
     (loop for (key p bound) in +bounds+
           for q = (quantile (getf *deltas* key) p)

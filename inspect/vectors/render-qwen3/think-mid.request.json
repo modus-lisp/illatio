@@ -1,0 +1,16 @@
+{
+ "messages": [
+  {
+   "role": "user",
+   "content": "Q1"
+  },
+  {
+   "role": "assistant",
+   "content": "<think>\nhmm\n</think>\n\nA1"
+  },
+  {
+   "role": "user",
+   "content": "Q2"
+  }
+ ]
+}

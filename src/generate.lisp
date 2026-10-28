@@ -159,4 +159,6 @@
 (defun complete (model prompt &rest keys &key (n-ctx 4096) &allow-other-keys)
   "One-shot: a fresh context, PROMPT continued.  See GENERATE for KEYS."
   (remf keys :n-ctx)
-  (apply #'generate (make-context model :n-ctx n-ctx) prompt keys))
+  (let ((ctx (make-context model :n-ctx n-ctx)))
+    (unwind-protect (apply #'generate ctx prompt keys)
+      (free-context ctx))))
