@@ -18,4 +18,12 @@
      (:file "pool")        ; worker threads, one job at a time
      (:file "tensor")      ; Q8_0 weights and the quantized matvec
      (:file "tokenizer")   ; byte-level BPE
-     (:file "model")))))   ; the forward pass
+     (:file "model")       ; the forward pass
+     (:file "batch")       ; prefill: three tokens per multiply
+     (:file "generate")))))  ; sampling, prompt reuse, streaming text
+
+(defsystem "illatio/openai"
+  :description "OpenAI chat completions computed in this image: chat templates
+                rendered in Lisp, tool calls parsed out of the reply."
+  :depends-on ("illatio" "json-simple")
+  :components ((:module "src" :components ((:file "openai")))))

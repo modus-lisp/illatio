@@ -91,6 +91,7 @@
   model
   (pos 0 :type fixnum)                 ; tokens in the cache
   (n-ctx 0 :type fixnum)
+  (plist (list :tokens (list)))        ; :tokens -- what the cache holds
   k-cache v-cache                      ; per layer: f32 [n-ctx * kv-dim]
   ;; scratch, allocated once
   x h q k v att ffn-a ffn-b xq hq logits)
@@ -146,57 +147,62 @@
               (setf (aref x a) (- (* x0 c) (* x1 s))
                     (aref x b) (+ (* x0 s) (* x1 c))))))))))
 
-(defun attention! (ctx layer-index)
-  "For every query head: softmax(q·K / sqrt(hd)) · V over positions 0..pos.
-   Query heads share KV heads in groups (GQA).  Heads run in parallel."
+(defun attend-head! (ctx layer-index q qo out n h)
+  "One query head: OUT[qo..] = softmax(q·K / sqrt(hd)) · V over positions
+   0..N-1, Q's head H starting at QO.  Query heads share KV heads in groups
+   (GQA)."
+  (declare (type f32vec q out) (type fixnum layer-index qo n h))
   (let* ((m (context-model ctx))
          (hd (model-head-dim m))
-         (nh (model-n-head m))
-         (group (floor nh (model-n-kv-head m)))
+         (group (floor (model-n-head m) (model-n-kv-head m)))
          (kvd (* (model-n-kv-head m) hd))
-         (n (1+ (context-pos ctx)))
-         (q (context-q ctx)) (out (context-att ctx))
          (kc (svref (context-k-cache ctx) layer-index))
          (vc (svref (context-v-cache ctx) layer-index))
-         (scale (/ 1f0 (sqrt (coerce hd 'single-float)))))
-    (declare (type fixnum hd nh group kvd n) (type f32vec q out kc vc) (type single-float scale))
-    (parallel-for (h nh (model-pool m))
-      (locally (declare (optimize speed (safety 0)))
-        (let ((scores (f32vec n))
-              (qo (* h hd))
-              (ko (* (floor h group) hd))
-              (mx most-negative-single-float))
-          (declare (type single-float mx) (type fixnum qo ko))
-          (dotimes (p n)
-            (let ((s 0f0) (base (+ (* p kvd) ko)))
-              (declare (type single-float s) (type fixnum base))
-              (dotimes (i hd) (incf s (* (aref kc (+ base i)) (aref q (+ qo i)))))
-              (let ((s (* s scale)))
-                (setf (aref scores p) s)
-                (when (> s mx) (setf mx s)))))
-          ;; ggml_vec_soft_max_f32: exp in float, the sum in double.
-          (let ((sum 0d0))
-            (declare (type double-float sum))
-            (dotimes (p n)
-              (let ((e (exp (- (aref scores p) mx))))
-                (setf (aref scores p) e)
-                (incf sum e)))
-            (let ((inv (coerce (/ 1d0 sum) 'single-float)))
-              (dotimes (p n) (setf (aref scores p) (* (aref scores p) inv)))))
-          (dotimes (i hd) (setf (aref out (+ qo i)) 0f0))
-          (dotimes (p n)
-            (let ((w (aref scores p)) (base (+ (* p kvd) ko)))
-              (dotimes (i hd)
-                (incf (aref out (+ qo i)) (* w (aref vc (+ base i))))))))))))
+         (scale (/ 1f0 (sqrt (coerce hd 'single-float))))
+         (scores (f32vec n))
+         (ko (* (floor h group) hd))
+         (mx most-negative-single-float))
+    (declare (type fixnum hd group kvd ko) (type f32vec kc vc scores)
+             (type single-float scale mx)
+             (optimize speed (safety 0)))
+    (dotimes (p n)
+      (let ((s 0f0) (base (+ (* p kvd) ko)))
+        (declare (type single-float s) (type fixnum base))
+        (dotimes (i hd) (incf s (* (aref kc (+ base i)) (aref q (+ qo i)))))
+        (let ((s (* s scale)))
+          (setf (aref scores p) s)
+          (when (> s mx) (setf mx s)))))
+    ;; ggml_vec_soft_max_f32: exp in float, the sum in double.
+    (let ((sum 0d0))
+      (declare (type double-float sum))
+      (dotimes (p n)
+        (let ((e (exp (- (aref scores p) mx))))
+          (setf (aref scores p) e)
+          (incf sum e)))
+      (let ((inv (coerce (/ 1d0 sum) 'single-float)))
+        (dotimes (p n) (setf (aref scores p) (* (aref scores p) inv)))))
+    (dotimes (i hd) (setf (aref out (+ qo i)) 0f0))
+    (dotimes (p n)
+      (let ((w (aref scores p)) (base (+ (* p kvd) ko)))
+        (dotimes (i hd)
+          (incf (aref out (+ qo i)) (* w (aref vc (+ base i)))))))))
 
-(defun add! (x y)
-  (declare (type f32vec x y) (optimize speed (safety 0)))
-  (dotimes (i (length x) x) (incf (aref x i) (aref y i))))
+(defun attention! (ctx layer-index)
+  "Every query head of the current token, in parallel."
+  (let* ((m (context-model ctx))
+         (hd (model-head-dim m))
+         (n (1+ (context-pos ctx))))
+    (parallel-for (h (model-n-head m) (model-pool m))
+      (attend-head! ctx layer-index (context-q ctx) (* h hd) (context-att ctx) n h))))
 
-(defun swiglu! (a b)
+(defun add! (x y &optional (end (length x)))
+  (declare (type f32vec x y) (type fixnum end) (optimize speed (safety 0)))
+  (dotimes (i end x) (incf (aref x i) (aref y i))))
+
+(defun swiglu! (a b &optional (end (length a)))
   "A = silu(A) * B, silu(x) = x/(1+e^-x)."
-  (declare (type f32vec a b) (optimize speed (safety 0)))
-  (dotimes (i (length a) a)
+  (declare (type f32vec a b) (type fixnum end) (optimize speed (safety 0)))
+  (dotimes (i end a)
     (let ((x (aref a i)))
       (setf (aref a i) (* (/ x (+ 1f0 (exp (- x)))) (aref b i))))))
 
@@ -269,9 +275,14 @@
     ctx))
 
 (defun eval-tokens (ctx tokens)
-  "Feed TOKENS; only the last one's logits are computed."
-  (loop for (tok . more) on tokens
-        do (forward ctx tok :logits (null more)))
+  "Feed TOKENS; only the last one's logits are computed.  More than one goes
+   through FORWARD-BATCH, a chunk at a time."
+  (if (null (rest tokens))
+      (when tokens (forward ctx (first tokens)))
+      (loop for rest = tokens then (nthcdr *prefill-chunk* rest)
+            while rest
+            do (let ((chunk (subseq rest 0 (min *prefill-chunk* (length rest)))))
+                 (forward-batch ctx chunk :logits (<= (length rest) *prefill-chunk*)))))
   (context-logits ctx))
 
 (defun argmax (v)
@@ -310,3 +321,11 @@
           (setf best (merge 'list (list (list i)) best #'> :key (lambda (e) (aref logits (car e)))))
           (when (> (length best) k) (setf best (butlast best))))))
     (loop for (i) in best collect (cons i (- (aref logits i) mx z)))))
+
+(defun replace-model-pool (into from threads)
+  "Make INTO share FROM's weights but run on a fresh pool of THREADS."
+  (loop for slot in (sb-mop:class-slots (class-of from))
+        for name = (sb-mop:slot-definition-name slot)
+        do (setf (slot-value into name) (slot-value from name)))
+  (setf (model-pool into) (make-pool threads))
+  into)
