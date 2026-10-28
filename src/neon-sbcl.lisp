@@ -29,7 +29,7 @@
 ;;; list's length, never counted by hand.  Every encoding was checked against
 ;;; the system assembler (as -arch arm64; objdump -d):
 ;;;
-;;;   ldp   qA, qB, [xN], #32     acc10400 | B<<10 | N<<5 | A
+;;;   ldp   qA, qB, [xN], #32     acc10000 | B<<10 | N<<5 | A
 ;;;   ldr   qT, [xN], #16         3cc10400 | N<<5 | T
 ;;;   ldr   qT, [xN]              3dc00000 | N<<5 | T
 ;;;   str   qT, [xN], #16         3c810400 | N<<5 | T
@@ -45,6 +45,23 @@
 ;;;   faddp vD.4s, vN.4s, vM.4s   6e20d400 | M<<16 | N<<5 | D
 ;;;   faddp sD, vN.2s             7e30d800 | N<<5 | D
 ;;;   subs  xD, xN, #1            f1000400 | N<<5 | D
+;;; and for the K-quant kernels:
+;;;   fmul / fsub / fadd sD,sN,sM 1e200800 / 1e203800 / 1e202800 | M<<16 | N<<5 | D
+;;;   uxtl  vD.8h, vN.8b          2f08a400 | N<<5 | D     (uxtl2 .16b: 6f08a400)
+;;;   uxtl  vD.4s, vN.4h          2f10a400 | N<<5 | D     (uxtl2 .8h:  6f10a400)
+;;;   sxtl  vD.8h, vN.8b          0f08a400 | N<<5 | D     (sxtl2 .16b: 4f08a400)
+;;;   sxtl  vD.4s, vN.4h          0f10a400 | N<<5 | D     (sxtl2 .8h:  4f10a400)
+;;;   mul / mla vD.4s,vN.4s,vM.4s 4ea09c00 / 4ea09400 | M<<16 | N<<5 | D
+;;;   mla vD.4s, vN.4s, vM.s[i]   6f800000 | M<<16 | N<<5 | D, +L (bit 21) for i odd, +H (bit 11) for i >= 2
+;;;   sub vD.4s, vN.4s, vM.4s     6ea08400 | M<<16 | N<<5 | D
+;;;   shl vD.4s, vN.4s, #5        4f255400 | N<<5 | D
+;;;   addv  sD, vN.4s             4eb1b800 | N<<5 | D
+;;;   scvtf sD, sN                5e21d800 | N<<5 | D
+;;;   and / orr vD.16b            4e201c00 / 4ea01c00 | M<<16 | N<<5 | D
+;;;   ushr vD.16b, vN.16b, #2/4/6 6f0e0400 / 6f0c0400 / 6f0a0400 | N<<5 | D
+;;;   shl  vD.16b, vN.16b, #4     4f0c5400 | N<<5 | D
+;;;   movi vD.16b, #15 / #3       4f00e5e0 / 4f00e460 | D
+;;;   ldr  xT, [xN, #8k]          f9400000 | k<<10 | N<<5 | T
 ;;;   b.ne  -K instructions       54000001 | (-K mod 2^19)<<5
 ;;;
 ;;; SDOT is FEAT_DotProd: every Apple M-series and the Pi 5's A76 have it, the
@@ -66,6 +83,15 @@
     (sb-sys:system-area-pointer sb-sys:system-area-pointer (unsigned-byte 32))
     single-float (sb-c:flushable))
 
+;;; The K-quant kernels walk six arrays, more pointers than SBCL can keep in
+;;; argument registers beside six walking copies, so they take one: DESC, six
+;;; words holding the arrays' addresses, loaded into the walkers at entry.
+(sb-c:defknown %q4k-dot (sb-sys:system-area-pointer (unsigned-byte 32))
+    single-float (sb-c:flushable))
+
+(sb-c:defknown %q6k-dot (sb-sys:system-area-pointer (unsigned-byte 32))
+    single-float (sb-c:flushable))
+
 (sb-c:defknown %f32-axpy4
     (sb-sys:system-area-pointer sb-sys:system-area-pointer single-float (unsigned-byte 32))
     (values) ())
@@ -73,8 +99,15 @@
 ;;; Instruction words, from register numbers.
 (defun a64 (base d &optional n m)
   (logior base d (if n (ash n 5) 0) (if m (ash m 16) 0)))
-(defun a64-ldp-q (a b ptr) (logior #xacc10400 (ash b 10) (ash ptr 5) a))
+(defun a64-ldp-q (a b ptr)
+  ;; acc10000, not acc10400: bit 10 is the low bit of Rt2, so the old base
+  ;; loaded an even B into B+1 -- harmless only while every pair's second
+  ;; register happened to be odd (it was, until the Q6_K kernel)
+  (logior #xacc10000 (ash b 10) (ash ptr 5) a))
 (defun a64-bne-back (k) (logior #x54000001 (ash (ldb (byte 19 0) (- k)) 5)))
+(defun a64-mla-lane (d n m i)
+  "mla vD.4s, vN.4s, vM.s[I]"
+  (logior #x6f800000 (if (oddp i) (ash 1 21) 0) (if (>= i 2) (ash 1 11) 0) (ash m 16) (ash n 5) d))
 
 (in-package #:sb-vm)
 
@@ -182,6 +215,196 @@
       (illatio::word (illatio::a64 #x4e20d400 k0 k0 k2))
       (illatio::word (illatio::a64 #x6e20d400 k0 k0 k0))
       (illatio::word (illatio::a64 #x7e30d800 sum k0)))))
+
+;;; Q4_K against Q8_K, one row: Q4K-ROW-DOT's arithmetic, in its order.  Per
+;;; super-block: the eight mins times the activation's eight 32-sums
+;;; (SUM -= dmin*that), then each 64 weights' low and high nibbles SDOTted with
+;;; their 32 activations, each group's dot multiplied by its scale into one
+;;; int32x4 (SUM += d*its lanes' total).  QS, SC (8 scales, 8 mins a block), DD
+;;; (d, dmin), YQ, YD (one per block) and YB (eight 32-sums a block) all walk.
+(define-vop (illatio::%q4k-dot)
+  (:translate illatio::%q4k-dot)
+  (:policy :fast-safe)
+  (:args (desc :scs (sap-reg) :target pd) (nb :scs (unsigned-reg) :target count))
+  (:arg-types system-area-pointer unsigned-num)
+  (:results (sum :scs (single-reg)))
+  (:result-types single-float)
+  (:temporary (:sc unsigned-reg) pqs)
+  (:temporary (:sc unsigned-reg) psc)
+  (:temporary (:sc unsigned-reg) pdd)
+  (:temporary (:sc unsigned-reg) pyq)
+  (:temporary (:sc unsigned-reg) pyd)
+  (:temporary (:sc unsigned-reg) pyb)
+  ;; DESC and NB live in these for the whole VOP: an argument's own register
+  ;; is free for a temporary once SBCL has loaded it
+  (:temporary (:sc unsigned-reg :from (:argument 0)) pd)
+  (:temporary (:sc unsigned-reg :from (:argument 1)) count)
+  (:temporary (:sc double-reg) mask) (:temporary (:sc double-reg) sm)
+  (:temporary (:sc double-reg) wa) (:temporary (:sc double-reg) wb)
+  (:temporary (:sc double-reg) s0) (:temporary (:sc double-reg) s1)
+  (:temporary (:sc double-reg) m0) (:temporary (:sc double-reg) m1)
+  (:temporary (:sc double-reg) b0) (:temporary (:sc double-reg) b1)
+  (:temporary (:sc double-reg) tt) (:temporary (:sc double-reg) acc)
+  (:temporary (:sc double-reg) qa) (:temporary (:sc double-reg) qb)
+  (:temporary (:sc double-reg) y0) (:temporary (:sc double-reg) y1)
+  (:temporary (:sc double-reg) y2) (:temporary (:sc double-reg) y3)
+  (:temporary (:sc double-reg) l0) (:temporary (:sc double-reg) l1)
+  (:temporary (:sc double-reg) dl) (:temporary (:sc double-reg) dh)
+  (:temporary (:sc double-reg) ydi) (:temporary (:sc double-reg) dx)
+  (:temporary (:sc double-reg) dmx)
+  (:generator 80
+    (move pd desc) (move count nb)
+    (illatio::with-a64 (pqs psc pdd pyq pyd pyb count sum mask sm wa wb s0 s1 m0 m1 b0 b1
+                        tt acc qa qb y0 y1 y2 y3 l0 l1 dl dh ydi dx dmx pd)
+      (illatio::word (illatio::a64 (logior #xf9400000 (ash 0 10)) pqs pd))
+      (illatio::word (illatio::a64 (logior #xf9400000 (ash 1 10)) psc pd))
+      (illatio::word (illatio::a64 (logior #xf9400000 (ash 2 10)) pdd pd))
+      (illatio::word (illatio::a64 (logior #xf9400000 (ash 3 10)) pyq pd))
+      (illatio::word (illatio::a64 (logior #xf9400000 (ash 4 10)) pyd pd))
+      (illatio::word (illatio::a64 (logior #xf9400000 (ash 5 10)) pyb pd))
+      (illatio::word (illatio::a64 #x6f00e400 sum))                 ; sum = 0
+      (illatio::word (illatio::a64 #x4f00e5e0 mask))                ; 0x0f in every byte
+      (illatio::loop-while-count
+       count
+       (append
+        (list (illatio::a64 #xbc404400 ydi pyd)                      ; y.d
+              (illatio::a64 #xbc404400 dx pdd)                       ; d
+              (illatio::a64 #xbc404400 dmx pdd)                      ; dmin
+              (illatio::a64 #x1e200800 dx ydi dx)                    ; y.d*d
+              (illatio::a64 #x1e200800 dmx ydi dmx)                  ; y.d*dmin
+              (illatio::a64 #x3cc10400 sm psc)                       ; 8 scales, 8 mins
+              (illatio::a64 #x2f08a400 wa sm) (illatio::a64 #x6f08a400 wb sm)
+              (illatio::a64 #x2f10a400 s0 wa) (illatio::a64 #x6f10a400 s1 wa)
+              (illatio::a64 #x2f10a400 m0 wb) (illatio::a64 #x6f10a400 m1 wb)
+              (illatio::a64-ldp-q b0 b1 pyb)                         ; eight 32-sums
+              (illatio::a64 #x4ea09c00 tt m0 b0) (illatio::a64 #x4ea09400 tt m1 b1)
+              (illatio::a64 #x4eb1b800 tt tt)                        ; imin
+              (illatio::a64 #x5e21d800 tt tt)
+              (illatio::a64 #x1e200800 tt dmx tt)
+              (illatio::a64 #x1e203800 sum sum tt)                   ; sum -= dmin*imin
+              (illatio::a64 #x6f00e400 acc))
+        (loop for k below 4
+              for sv = (if (< k 2) s0 s1)
+              for lane = (* 2 (mod k 2))
+              append (list (illatio::a64-ldp-q qa qb pqs)            ; 32 bytes: 64 weights
+                           (illatio::a64-ldp-q y0 y1 pyq) (illatio::a64-ldp-q y2 y3 pyq)
+                           (illatio::a64 #x4e201c00 l0 qa mask) (illatio::a64 #x4e201c00 l1 qb mask)
+                           (illatio::a64 #x6f0c0400 qa qa) (illatio::a64 #x6f0c0400 qb qb)
+                           (illatio::a64 #x6f00e400 dl)
+                           (illatio::a64 #x4e809400 dl l0 y0) (illatio::a64 #x4e809400 dl l1 y1)
+                           (illatio::a64 #x6f00e400 dh)
+                           (illatio::a64 #x4e809400 dh qa y2) (illatio::a64 #x4e809400 dh qb y3)
+                           (illatio::a64-mla-lane acc dl sv lane)
+                           (illatio::a64-mla-lane acc dh sv (1+ lane))))
+        (list (illatio::a64 #x4eb1b800 acc acc)                      ; isum
+              (illatio::a64 #x5e21d800 acc acc)
+              (illatio::a64 #x1e200800 acc dx acc)
+              (illatio::a64 #x1e202800 sum sum acc)))))))            ; sum += d*isum
+
+;;; Q6_K against Q8_K, one row: Q6K-ROW-DOT's arithmetic.  The 6-bit quants
+;;; are rebuilt 0..63 (four low nibbles, two high bits from QH), SDOTted in
+;;; groups of 16, each times its signed scale; the activation's sixteen
+;;; 16-sums times the scales give the -32 offset, taken off lane-wise before
+;;; the one across-lanes add.  SUM += (d*y.d) * that.
+(define-vop (illatio::%q6k-dot)
+  (:translate illatio::%q6k-dot)
+  (:policy :fast-safe)
+  (:args (desc :scs (sap-reg) :target pd) (nb :scs (unsigned-reg) :target count))
+  (:arg-types system-area-pointer unsigned-num)
+  (:results (sum :scs (single-reg)))
+  (:result-types single-float)
+  (:temporary (:sc unsigned-reg) pq)
+  (:temporary (:sc unsigned-reg) psc)
+  (:temporary (:sc unsigned-reg) pdd)
+  (:temporary (:sc unsigned-reg) pyq)
+  (:temporary (:sc unsigned-reg) pyd)
+  (:temporary (:sc unsigned-reg) pyb)
+  ;; DESC and NB live in these for the whole VOP: an argument's own register
+  ;; is free for a temporary once SBCL has loaded it
+  (:temporary (:sc unsigned-reg :from (:argument 0)) pd)
+  (:temporary (:sc unsigned-reg :from (:argument 1)) count)
+  (:temporary (:sc double-reg) m4) (:temporary (:sc double-reg) m3)
+  (:temporary (:sc double-reg) scb) (:temporary (:sc double-reg) wa)
+  (:temporary (:sc double-reg) wb)
+  (:temporary (:sc double-reg) sc0) (:temporary (:sc double-reg) sc1)
+  (:temporary (:sc double-reg) sc2) (:temporary (:sc double-reg) sc3)
+  (:temporary (:sc double-reg) tt) (:temporary (:sc double-reg) acc)
+  (:temporary (:sc double-reg) h0) (:temporary (:sc double-reg) h1)
+  (:temporary (:sc double-reg) q0) (:temporary (:sc double-reg) q1)
+  (:temporary (:sc double-reg) q2) (:temporary (:sc double-reg) q3)
+  (:temporary (:sc double-reg) hb) (:temporary (:sc double-reg) v)
+  (:temporary (:sc double-reg) y0) (:temporary (:sc double-reg) y1)
+  (:temporary (:sc double-reg) y2) (:temporary (:sc double-reg) y3)
+  (:temporary (:sc double-reg) dt) (:temporary (:sc double-reg) ydi)
+  (:temporary (:sc double-reg) dq)
+  (:generator 100
+    (move pd desc) (move count nb)
+    (illatio::with-a64 (pq psc pdd pyq pyd pyb count sum m4 m3 scb wa wb sc0 sc1 sc2 sc3
+                        tt acc h0 h1 q0 q1 q2 q3 hb v y0 y1 y2 y3 dt ydi dq pd)
+      (illatio::word (illatio::a64 (logior #xf9400000 (ash 0 10)) pq pd))
+      (illatio::word (illatio::a64 (logior #xf9400000 (ash 1 10)) psc pd))
+      (illatio::word (illatio::a64 (logior #xf9400000 (ash 2 10)) pdd pd))
+      (illatio::word (illatio::a64 (logior #xf9400000 (ash 3 10)) pyq pd))
+      (illatio::word (illatio::a64 (logior #xf9400000 (ash 4 10)) pyd pd))
+      (illatio::word (illatio::a64 (logior #xf9400000 (ash 5 10)) pyb pd))
+      (illatio::word (illatio::a64 #x6f00e400 sum))
+      (illatio::word (illatio::a64 #x4f00e5e0 m4))                  ; 0x0f
+      (illatio::word (illatio::a64 #x4f00e460 m3))                  ; 0x03
+      (flet ((group (lowfn qreg hreg hshift scv lane)
+               ;; one 16-weight group: its quants 0..63 into V, dotted with Y, times its scale
+               (append
+                (if (zerop hshift)
+                    (list (illatio::a64 #x4e201c00 hb hreg m3))
+                    (list (illatio::a64 (ecase hshift (2 #x6f0e0400) (4 #x6f0c0400) (6 #x6f0a0400)) hb hreg)
+                          (illatio::a64 #x4e201c00 hb hb m3)))
+                (list (illatio::a64 #x4f0c5400 hb hb))               ; << 4
+                (if (eq lowfn :lo)
+                    (list (illatio::a64 #x4e201c00 v qreg m4))
+                    (list (illatio::a64 #x6f0c0400 v qreg)))
+                (list (illatio::a64 #x4ea01c00 v v hb))))
+             (dot (yreg scv lane)
+               (list (illatio::a64 #x6f00e400 dt)
+                     (illatio::a64 #x4e809400 dt v yreg)
+                     (illatio::a64-mla-lane acc dt scv lane))))
+        (illatio::loop-while-count
+         count
+         (append
+          (list (illatio::a64 #xbc404400 ydi pyd)
+                (illatio::a64 #xbc404400 dq pdd)
+                (illatio::a64 #x1e200800 dq dq ydi)                  ; d*y.d
+                (illatio::a64 #x3cc10400 scb psc)                    ; 16 signed scales
+                (illatio::a64 #x0f08a400 wa scb) (illatio::a64 #x4f08a400 wb scb)
+                (illatio::a64 #x0f10a400 sc0 wa) (illatio::a64 #x4f10a400 sc1 wa)
+                (illatio::a64 #x0f10a400 sc2 wb) (illatio::a64 #x4f10a400 sc3 wb)
+                (illatio::a64-ldp-q y0 y1 pyb) (illatio::a64-ldp-q y2 y3 pyb) ; sixteen 16-sums
+                (illatio::a64 #x4ea09c00 tt sc0 y0) (illatio::a64 #x4ea09400 tt sc1 y1)
+                (illatio::a64 #x4ea09400 tt sc2 y2) (illatio::a64 #x4ea09400 tt sc3 y3)
+
+                (illatio::a64 #x6f00e400 acc))
+          (loop for c below 2
+                for sa = (if (zerop c) sc0 sc2)
+                for sb = (if (zerop c) sc1 sc3)
+                append (append
+                        (list (illatio::a64-ldp-q h0 h1 pq)           ; 32 bytes of high bits
+                              (illatio::a64-ldp-q q0 q1 pq) (illatio::a64-ldp-q q2 q3 pq)
+                              (illatio::a64-ldp-q y0 y1 pyq) (illatio::a64-ldp-q y2 y3 pyq))
+                        ;; low nibbles: weights 0-15 16-31 32-47 48-63 of this half
+                        (group :lo q0 h0 0 sa 0) (dot y0 sa 0)
+                        (group :lo q1 h1 0 sa 1) (dot y1 sa 1)
+                        (group :lo q2 h0 2 sa 2) (dot y2 sa 2)
+                        (group :lo q3 h1 2 sa 3) (dot y3 sa 3)
+                        (list (illatio::a64-ldp-q y0 y1 pyq) (illatio::a64-ldp-q y2 y3 pyq))
+                        ;; high nibbles: weights 64-127
+                        (group :hi q0 h0 4 sb 0) (dot y0 sb 0)
+                        (group :hi q1 h1 4 sb 1) (dot y1 sb 1)
+                        (group :hi q2 h0 6 sb 2) (dot y2 sb 2)
+                        (group :hi q3 h1 6 sb 3) (dot y3 sb 3)))
+          (list (illatio::a64 #x4f255400 tt tt)                      ; 32*imins, lane-wise
+                (illatio::a64 #x6ea08400 acc acc tt)                 ; isum - 32*imins
+                (illatio::a64 #x4eb1b800 acc acc)
+                (illatio::a64 #x5e21d800 acc acc)
+                (illatio::a64 #x1e200800 acc dq acc)
+                (illatio::a64 #x1e202800 sum sum acc))))))))
 
 (define-vop (illatio::%f32-axpy4)
   (:translate illatio::%f32-axpy4)

@@ -35,6 +35,7 @@
   (eps 1f-6 :type single-float)
   (rope-base 10000f0 :type single-float)
   (rope-neox nil)
+  (act-kinds '(:q8))             ; the activation formats its matrices take
   token-embd output-norm output
   (layers #() :type simple-vector)
   pool)
@@ -43,6 +44,9 @@
 
 (defun load-model (path &key (threads (default-thread-count)))
   "Read the GGUF model at PATH: weights, tokenizer, and a pool of THREADS."
+  (finish-model (load-model-1 path threads)))
+
+(defun load-model-1 (path threads)
   (let* ((g (read-gguf path))
          (arch (meta g "general.architecture"))
          (n-layer (arch-key g arch "block_count"))
@@ -51,7 +55,7 @@
          (vocab (make-vocab-from-gguf g)))
     (unless (member arch '("qwen2" "qwen3" "llama") :test #'equal)
       (error "architecture ~S is not supported (qwen2, qwen3 and llama are)" arch))
-    (flet ((q8 (name) (load-q8mat g name))
+    (flet ((q8 (name) (load-qmat g name))
            (f32 (name) (load-f32 g name))
            (opt (name f) (and (gguf-tensor g name nil) (funcall f name))))
       (%make-model
@@ -72,8 +76,9 @@
        :rope-neox (member arch '("qwen2" "qwen3") :test #'equal)
        :token-embd (q8 "token_embd.weight")
        :output-norm (f32 "output_norm.weight")
-       ;; Without an output matrix the head is tied to the embedding.
-       :output (or (opt "output.weight" #'q8) (q8 "token_embd.weight"))
+       ;; Without an output matrix the head is tied to the embedding (the
+       ;; same object: SET-MODEL-ACT-KINDS below fills it in)
+       :output (opt "output.weight" #'q8)
        :layers (coerce
                 (loop for i below n-layer
                       collect (flet ((n (s) (format nil "blk.~D.~A" i s)))
@@ -92,6 +97,19 @@
                                  :wdown (q8 (n "ffn_down.weight")))))
                 'simple-vector)
        :pool (make-pool threads)))))
+
+(defun finish-model (m)
+  "Tie the head to the embedding when the file has no output matrix, and
+   note which activation formats the matrices take."
+  (unless (model-output m) (setf (model-output m) (model-token-embd m)))
+  (setf (model-act-kinds m)
+        (remove-duplicates
+         (mapcar #'matrix-act-kind
+                 (list* (model-output m)
+                        (loop for l across (model-layers m)
+                              append (list (layer-wq l) (layer-wk l) (layer-wv l) (layer-wo l)
+                                           (layer-wgate l) (layer-wup l) (layer-wdown l)))))))
+  m)
 
 ;;; --- per-sequence state -----------------------------------------------------
 
@@ -117,7 +135,7 @@
      :v-cache (coerce (loop repeat (model-n-layer model) collect (f32vec (* n-ctx kv) :static t)) 'simple-vector)
      :x (f32vec d) :h (f32vec d) :q (f32vec qd) :k (f32vec kv) :v (f32vec kv)
      :att (f32vec qd) :ffn-a (f32vec f) :ffn-b (f32vec f)
-     :xq (make-q8vec (max d qd)) :hq (make-q8vec f)
+     :xq (make-qact (max d qd) (model-act-kinds model)) :hq (make-qact f (model-act-kinds model))
      :logits (f32vec (model-n-vocab model)))))
 
 ;;; --- ops --------------------------------------------------------------------
@@ -284,16 +302,16 @@
          (xq (context-xq ctx)) (hq (context-hq ctx)))
     (when (>= pos (context-n-ctx ctx))
       (error "context is full (~D tokens)" (context-n-ctx ctx)))
-    (q8mat-row! (model-token-embd m) token x)
+    (embed-row! (model-token-embd m) token x)
     (traced "embd" x)
     (loop for li below (model-n-layer m)
           for l = (svref (model-layers m) li)
           do (rmsnorm! x (layer-attn-norm l) h (model-eps m))
              (traced (format nil "attn_norm-~D" li) h)
-             (quantize-q8! h xq)
-             (matvec! pool (layer-wq l) xq (context-q ctx) (layer-bq l))
-             (matvec! pool (layer-wk l) xq (context-k ctx) (layer-bk l))
-             (matvec! pool (layer-wv l) xq (context-v ctx) (layer-bv l))
+             (quantize-act! h xq)
+             (qmatvec! pool (layer-wq l) xq (context-q ctx) (layer-bq l))
+             (qmatvec! pool (layer-wk l) xq (context-k ctx) (layer-bk l))
+             (qmatvec! pool (layer-wv l) xq (context-v ctx) (layer-bv l))
              (traced (format nil "Qcur-~D" li) (context-q ctx))
              (traced (format nil "Kcur-~D" li) (context-k ctx))
              (traced (format nil "Vcur-~D" li) (context-v ctx))
@@ -306,30 +324,30 @@
              (traced (format nil "Krope-~D" li) (context-k ctx))
              (attention! ctx li)
              (traced (format nil "kqv_out-~D" li) (context-att ctx))
-             (quantize-q8! (context-att ctx) xq)
-             (matvec! pool (layer-wo l) xq h)
+             (quantize-act! (context-att ctx) xq)
+             (qmatvec! pool (layer-wo l) xq h)
              (traced (format nil "attn_out-~D" li) h)
              (add! x h)
              (traced (format nil "ffn_inp-~D" li) x)
              (rmsnorm! x (layer-ffn-norm l) h (model-eps m))
              (traced (format nil "ffn_norm-~D" li) h)
-             (quantize-q8! h xq)
-             (matvec! pool (layer-wgate l) xq (context-ffn-a ctx))
-             (matvec! pool (layer-wup l) xq (context-ffn-b ctx))
+             (quantize-act! h xq)
+             (qmatvec! pool (layer-wgate l) xq (context-ffn-a ctx))
+             (qmatvec! pool (layer-wup l) xq (context-ffn-b ctx))
              (traced (format nil "ffn_gate-~D" li) (context-ffn-a ctx))
              (traced (format nil "ffn_up-~D" li) (context-ffn-b ctx))
              (swiglu! (context-ffn-a ctx) (context-ffn-b ctx))
              (traced (format nil "ffn_swiglu-~D" li) (context-ffn-a ctx))
-             (quantize-q8! (context-ffn-a ctx) hq)
-             (matvec! pool (layer-wdown l) hq h)
+             (quantize-act! (context-ffn-a ctx) hq)
+             (qmatvec! pool (layer-wdown l) hq h)
              (traced (format nil "ffn_out-~D" li) h)
              (add! x h)
              (traced (format nil "l_out-~D" li) x))
     (incf (context-pos ctx))
     (when logits
       (rmsnorm! x (model-output-norm m) h (model-eps m))
-      (quantize-q8! h xq)
-      (matvec! pool (model-output m) xq (context-logits ctx)))
+      (quantize-act! h xq)
+      (qmatvec! pool (model-output m) xq (context-logits ctx)))
     ctx))
 
 (defun argmax (v)

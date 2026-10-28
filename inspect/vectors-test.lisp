@@ -21,6 +21,11 @@
 ;;;   - |dlogprob| of its ranks 2-5:     median < 0.10, p95 < 0.40;
 ;;;   - our argmax is llama.cpp's, except where llama.cpp's own top two are
 ;;;     within +NEAR-TIE+ (either is then a faithful answer).
+;;; K-quant weights (Q4_K_M) set a floor about 2.5x higher, measured the same
+;;; way on Qwen3-4B: illatio against its Q8_K tie variant gives top-1 median
+;;; 0.0014, p95 0.12, ranks 2-5 median 0.098, p95 0.34 -- illatio against
+;;; llama.cpp gives 0.0020, 0.079, 0.103, 0.366.  Their bounds (+KQUANT-BOUNDS+)
+;;; are that floor with the same headroom.
 ;;; Exits 0 iff all hold.  Needs the model: $ILLATIO_TEST_MODEL, or
 ;;; ~/models/qwen2.5-0.5b-instruct-q8_0.gguf; and its vectors:
 ;;; $ILLATIO_TEST_VECTORS, or vectors/qwen2.5-0.5b-q8_0.sexp.
@@ -32,6 +37,7 @@
 
 (defparameter +near-tie+ 0.25)
 (defparameter +bounds+ '((:top1 0.5 0.02) (:top1 0.95 0.15) (:rest 0.5 0.10) (:rest 0.95 0.40)))
+(defparameter +kquant-bounds+ '((:top1 0.5 0.02) (:top1 0.95 0.25) (:rest 0.5 0.20) (:rest 0.95 0.60)))
 
 (defvar *deltas* (list :top1 '() :rest '()))
 
@@ -86,7 +92,7 @@
                                  (merge-pathnames "vectors/qwen2.5-0.5b-q8_0.sexp"
                                                   (or *load-truename* *default-pathname-defaults*)))))
       (run-case m c))
-    (loop for (key p bound) in +bounds+
+    (loop for (key p bound) in (if (member :q8k (model-act-kinds m)) +kquant-bounds+ +bounds+)
           for q = (quantile (getf *deltas* key) p)
           do (format t "~&~5A p~2D |dlogprob| ~,4F (bound ~,2F)~%" key (round (* 100 p)) q bound)
              (check (< q bound) "~A p~D ~,4F exceeds ~,2F" key (round (* 100 p)) q bound))

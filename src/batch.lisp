@@ -25,17 +25,22 @@
 (defstruct (q8batch (:constructor %make-q8batch))
   (n 0 :type fixnum)
   (cols 0 :type fixnum)
-  (qv (make-q8vec 32) :type q8vec)
+  (qv nil)                              ; a Q8VEC, when the model takes Q8_0
+  (qk nil)                              ; a Q8KVEC, when it takes Q8_K
   (words (make-array 0 :element-type '(signed-byte 64)) :type i64vec))
 
 (defun q8batch-quants (xb) (q8vec-quants (q8batch-qv xb)))
 (defun q8batch-scales (xb) (q8vec-scales (q8batch-qv xb)))
 
-(defun make-q8batch (max-n cols)
+(defun make-q8batch (max-n cols &optional (kinds '(:q8)))
   (%make-q8batch :cols cols
-                 :qv (%make-q8vec :quants (make-i8vec (* max-n cols))
-                                  :scales (f32vec (* max-n (floor cols 32))))
-                 :words (make-array (* (ceiling max-n 3) cols) :element-type '(signed-byte 64))))
+                 :qv (and (member :q8 kinds)
+                          (%make-q8vec :quants (make-i8vec (* max-n cols))
+                                       :scales (f32vec (* max-n (floor cols 32)))))
+                 :qk (and (member :q8k kinds) (make-q8kvec (* max-n cols)))
+                 :words (if (member :q8 kinds)
+                            (make-array (* (ceiling max-n 3) cols) :element-type '(signed-byte 64))
+                            (make-array 0 :element-type '(signed-byte 64)))))
 
 (defun quantize-batch! (xs n out)
   "Quantize rows 0..N-1 of XS (N rows of COLS floats, row-major) into OUT,
@@ -46,6 +51,10 @@
          (qv (q8batch-qv out)))
     (declare (type fixnum cols nb))
     (setf (q8batch-n out) n)
+    (when (q8batch-qk out)
+      (dotimes (tk n)
+        (quantize-q8k! xs (q8batch-qk out) (* tk cols) cols (* tk cols))))
+    (unless qv (return-from quantize-batch! out))
     (dotimes (tk n)
       (quantize-q8! xs qv (* tk cols) cols (* tk cols) (* tk nb)))
     (unless (neon-active-p)
@@ -83,7 +92,20 @@
   "OUT[t*rows + r] = (W·x_t)[r] (+ BIAS[r]) for the N tokens in XB.  With SDOT,
    each (row, token) is one NEON row product; otherwise three tokens share
    each multiply.  Both give the scalar path's bits."
-  (declare (type q8mat w) (type q8batch xb) (type f32vec out))
+  (declare (type q8batch xb) (type f32vec out))
+  (when (kmat-p w)
+    (let ((rows (kmat-rows w)) (cols (kmat-cols w)) (n (q8batch-n xb)) (qk (q8batch-qk xb)))
+      (declare (type fixnum rows cols n))
+      (parallel-for (r rows pool)
+        (dotimes (tk n)
+          (setf (aref out (+ (* tk rows) r)) (kmat-row-dot w r qk (* tk cols)))))
+      (when bias
+        (let ((bias bias))
+          (declare (type f32vec bias))
+          (dotimes (tk n)
+            (dotimes (r rows)
+              (incf (aref out (+ (* tk rows) r)) (aref bias r))))))
+      (return-from matmul! out)))
   (when (neon-active-p)
     (let* ((rows (q8mat-rows w)) (cols (q8mat-cols w)) (nb (floor cols 32))
            (n (q8batch-n xb)) (xq (q8batch-quants xb)) (xs (q8batch-scales xb)))
@@ -155,7 +177,8 @@
                :x (f32vec (* n d)) :h (f32vec (* n d)) :q (f32vec (* n qd))
                :k (f32vec (* n kv)) :v (f32vec (* n kv)) :att (f32vec (* n qd))
                :fa (f32vec (* n f)) :fb (f32vec (* n f))
-               :xb (make-q8batch n d) :ab (make-q8batch n qd) :fb-q (make-q8batch n f))))))
+               :xb (make-q8batch n d (model-act-kinds m)) :ab (make-q8batch n qd (model-act-kinds m))
+               :fb-q (make-q8batch n f (model-act-kinds m)))))))
 
 (defun forward-batch (ctx tokens &key (logits t))
   "Run TOKENS (at most *PREFILL-CHUNK*) at the next positions; bit-identical
@@ -178,7 +201,7 @@
       (error "context is full (~D tokens)" (context-n-ctx ctx)))
     (loop for tok in tokens for tk from 0
           do (let ((row (f32vec d)))
-               (q8mat-row! (model-token-embd m) tok row)
+               (embed-row! (model-token-embd m) tok row)
                (replace x row :start1 (* tk d))))
     (loop for li below (model-n-layer m)
           for l = (svref (model-layers m) li)
@@ -214,8 +237,8 @@
       (let ((last (f32vec d)) (hr (f32vec d)) (xq (context-xq ctx)))
         (replace last x :start2 (* (1- n) d))
         (rmsnorm! last (model-output-norm m) hr eps)
-        (quantize-q8! hr xq)
-        (matvec! pool (model-output m) xq (context-logits ctx))))
+        (quantize-act! hr xq)
+        (qmatvec! pool (model-output m) xq (context-logits ctx))))
     ctx))
 
 (defun eval-tokens (ctx tokens)
