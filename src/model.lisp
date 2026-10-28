@@ -360,9 +360,14 @@
   `(when *trace* (funcall *trace* ,name ,vec)))
 
 (defun forward (ctx token &key (logits t))
-  "Run TOKEN at the next position; the logits (if LOGITS) land in the context."
+  "Run TOKEN at the next position; the logits (if LOGITS) land in the context.
+   With SBCL's float overflow trap masked, as C runs (see POOL-WORKER)."
+  #+sbcl (sb-int:with-float-traps-masked (:overflow :inexact) (forward-1 ctx token logits))
+  #-sbcl (forward-1 ctx token logits))
+
+(defun forward-1 (ctx token logits)
   (when (model-recurrent-p (context-model ctx))
-    (return-from forward (forward-qwen35 ctx token :logits logits)))
+    (return-from forward-1 (forward-qwen35 ctx token :logits logits)))
   (let* ((m (context-model ctx))
          (pool (model-pool m))
          (pos (context-pos ctx))

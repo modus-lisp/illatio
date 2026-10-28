@@ -67,6 +67,14 @@
 
 #+sbcl
 (defun pool-worker (p index)
+  ;; C's float semantics, not SBCL's traps: an exp that overflows is
+  ;; infinity, and a sigmoid or silu of it the 0 or 1 ggml computes.  The
+  ;; mode is per thread, so each worker sets its own (FORWARD the caller's).
+  (sb-int:with-float-traps-masked (:overflow :inexact)
+    (pool-worker-1 p index)))
+
+#+sbcl
+(defun pool-worker-1 (p index)
   (let ((seen (pool-generation p)))
     (loop
       ;; spin for the next generation; park if it is long in coming

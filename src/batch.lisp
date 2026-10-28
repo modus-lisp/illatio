@@ -96,9 +96,10 @@
   (when (kmat-p w)
     (let ((rows (kmat-rows w)) (cols (kmat-cols w)) (n (q8batch-n xb)) (qk (q8batch-qk xb)))
       (declare (type fixnum rows cols n))
-      (parallel-for (r rows pool)
-        (dotimes (tk n)
-          (setf (aref out (+ (* tk rows) r)) (kmat-row-dot w r qk (* tk cols)))))
+      (pool-run pool (lambda (i c)
+                       (multiple-value-bind (s e) (share rows i c)
+                         (dotimes (tk n)
+                           (kmat-range-dot! w qk (* tk cols) out s e (* tk rows))))))
       (when bias
         (let ((bias bias))
           (declare (type f32vec bias))
