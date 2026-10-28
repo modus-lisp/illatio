@@ -3,16 +3,18 @@
 (defpackage #:illatio
   (:use #:cl)
   (:export
-   ;; gguf
-   #:read-gguf #:gguf #:gguf-metadata #:gguf-tensors #:gguf-path
-   #:meta #:tensor-info #:tensor-info-name #:tensor-info-type #:tensor-info-dims
-   ;; model
-   #:load-model #:model #:model-config #:model-vocab #:model-context-length
-   #:model-name
-   ;; tokenizer
-   #:tokenize #:detokenize #:token-piece
-   ;; inference
-   #:make-context #:context #:context-pos #:eval-tokens #:logits
-   #:generate #:complete #:chat #:render-chat
-   ;; sampling
-   #:make-sampler #:sample))
+   ;; the file
+   #:read-gguf #:gguf #:meta
+   ;; a model, and a sequence's state on it
+   #:load-model #:model #:model-name #:model-context-length
+   #:make-context #:context #:context-n-ctx #:context-pos #:context-logits
+   ;; text <-> tokens
+   #:tokenize #:detokenize
+   ;; running it
+   #:forward #:eval-tokens #:top-logprobs
+   #:make-sampler #:sample #:generate #:complete
+   ;; chat completions (system illatio/openai)
+   #:make-engine #:engine #:engine-model #:engine-context
+   #:chat-completion #:chat-completion-chunks #:render-chat
+   ;; the server (system illatio/server)
+   #:serve))

@@ -209,3 +209,14 @@
         (quantize-q8! hr xq)
         (matvec! pool (model-output m) xq (context-logits ctx))))
     ctx))
+
+(defun eval-tokens (ctx tokens)
+  "Feed TOKENS; only the last one's logits are computed.  More than one goes
+   through FORWARD-BATCH, a chunk at a time."
+  (if (null (rest tokens))
+      (when tokens (forward ctx (first tokens)))
+      (loop for rest = tokens then (nthcdr *prefill-chunk* rest)
+            while rest
+            do (let ((chunk (subseq rest 0 (min *prefill-chunk* (length rest)))))
+                 (forward-batch ctx chunk :logits (<= (length rest) *prefill-chunk*)))))
+  (context-logits ctx))

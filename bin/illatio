@@ -1,0 +1,30 @@
+#!/usr/bin/env bash
+# bin/illatio — run illatio from a core image, rebuilt when a source changes.
+#
+# Loading and compiling from source takes a few seconds; the core starts in
+# milliseconds.  Sibling repos (json-simple, cl-transport) are found beside
+# this one, so no Quicklisp setup is needed.  The weights are not in the core:
+# they are read from the GGUF on every start.
+set -euo pipefail
+
+SELF="$0"
+while [ -L "$SELF" ]; do
+  TARGET="$(readlink "$SELF")"
+  case "$TARGET" in /*) SELF="$TARGET" ;; *) SELF="$(dirname "$SELF")/$TARGET" ;; esac
+done
+ROOT="$(cd "$(dirname "$SELF")/.." && pwd -P)"
+CORE="$ROOT/illatio.core"
+SBCL="${ILLATIO_SBCL:-sbcl}"
+# The weights live in the Lisp heap: room for them, plus scratch.
+HEAP="${ILLATIO_HEAP_MB:-16384}"
+
+if [ ! -f "$CORE" ] || [ -n "$(find "$ROOT/src" "$ROOT/bin" "$ROOT/illatio.asd" -newer "$CORE" 2>/dev/null | head -1)" ]; then
+  echo "illatio: building core image…" >&2
+  "$SBCL" --noinform --non-interactive --no-sysinit --no-userinit \
+    --eval '(defvar cl-user::*system* "illatio/cli")' \
+    --load "$ROOT/inspect/load.lisp" \
+    --eval "(sb-ext:save-lisp-and-die \"$CORE\" :toplevel (lambda () (illatio.cli:main (rest sb-ext:*posix-argv*)) (uiop:quit 0)) :executable nil)" >&2
+fi
+
+exec "$SBCL" --core "$CORE" --dynamic-space-size "$HEAP" --noinform --end-runtime-options \
+  "$@"

@@ -58,6 +58,16 @@
                    do (write-string (or (jget part "text") "") s))))
         (t "")))
 
+;;; --- ids ----------------------------------------------------------------------
+;;; Seeded on first use, not at load: a state made at load time is frozen into
+;;; a saved core, and every process started from it would mint the same ids.
+
+(defvar *id-random* nil)
+
+(defun fresh-id (prefix &optional (digits 12))
+  (format nil "~A~36R" prefix
+          (random (expt 36 digits) (or *id-random* (setf *id-random* (make-random-state t))))))
+
 ;;; --- qwen2.5's template -----------------------------------------------------
 
 (defparameter +qwen-default-system+
@@ -148,7 +158,7 @@
                 (write-string text content :start pos :end open)
                 (let ((args (gethash "arguments" obj)))
                   (push (let ((h (make-hash-table :test 'equal)) (f (make-hash-table :test 'equal)))
-                          (setf (gethash "id" h) (format nil "call_~36R~D" (random (expt 36 8)) (incf n))
+                          (setf (gethash "id" h) (progn (incf n) (fresh-id "call_" 8))
                                 (gethash "type" h) "function"
                                 (gethash "name" f) (jget obj "name")
                                 (gethash "arguments" f) (if (stringp args) args
@@ -214,7 +224,7 @@
           (unless t1 (setf t1 t2))
           (multiple-value-bind (content calls) (parse-tool-calls text)
             (flet ((ms (a b) (/ (* 1000d0 (- b a)) internal-time-units-per-second)))
-              (hobj "id" (format nil "chatcmpl-~36R" (random (expt 36 12)))
+              (hobj "id" (fresh-id "chatcmpl-")
                     "object" "chat.completion"
                     "created" (- (get-universal-time) 2208988800)
                     "model" (model-name m)
@@ -235,3 +245,67 @@
                                     "prompt_ms" (ms t0 t1)
                                     "predicted_n" (length out)
                                     "predicted_ms" (ms t1 t2))))))))))
+
+;;; --- streamed -----------------------------------------------------------------
+;;; The same answer as a sequence of chat.completion.chunk objects -- what an
+;;; SSE stream carries, before it is text.  The server writes them as events;
+;;; a Lisp caller in this image (operandi --illatio) folds them directly.
+
+(defun chunk-object (id model delta &optional finish)
+  (hobj "id" id "object" "chat.completion.chunk"
+        "created" (- (get-universal-time) 2208988800)
+        "model" model
+        "choices" (vector (hobj "index" 0 "delta" delta "finish_reason" (or finish 'null)))))
+
+(defun make-tool-call-filter (emit)
+  "A text sink that passes text to EMIT until a <tool_call> starts, holding
+   back a tail that might be the start of that tag.  The calls themselves
+   are sent whole, parsed, once the reply is done."
+  (let ((pending "") (stopped nil) (tag "<tool_call>"))
+    (lambda (piece)
+      (unless stopped
+        (let* ((text (concatenate 'string pending piece))
+               (at (search tag text)))
+          (if at
+              (progn (when (plusp at) (funcall emit (subseq text 0 at)))
+                     (setf stopped t pending ""))
+              ;; keep the longest suffix that is a proper prefix of the tag
+              (let ((keep (loop for k from (min (1- (length tag)) (length text)) downto 1
+                                when (string= text tag :start1 (- (length text) k) :end2 k)
+                                  return k
+                                finally (return 0))))
+                (when (> (length text) keep)
+                  (funcall emit (subseq text 0 (- (length text) keep))))
+                (setf pending (subseq text (- (length text) keep))))))))))
+
+(defun chat-completion-chunks (engine req on-chunk)
+  "Answer REQ as CHAT-COMPLETION does, calling ON-CHUNK with each
+   chat.completion.chunk object as the reply is generated: content deltas,
+   then any tool calls, then the finish reason, then usage and timings.
+   Returns the complete response object as well."
+  (let* ((id (fresh-id "chatcmpl-"))
+         (name (model-name (engine-model engine)))
+         (sent-role nil)
+         (emit (lambda (text)
+                 (funcall on-chunk
+                          (chunk-object id name (if sent-role
+                                                    (hobj "content" text)
+                                                    (progn (setf sent-role t)
+                                                           (hobj "role" "assistant" "content" text)))))))
+         (resp (chat-completion engine req
+                                :on-text (if (jget req "tools") (make-tool-call-filter emit) emit)))
+         (choice (aref (jget resp "choices") 0))
+         (calls (jget choice "message" "tool_calls")))
+    (when calls
+      (funcall on-chunk
+               (chunk-object id name
+                             (hobj "tool_calls"
+                                   (map 'vector (lambda (c i)
+                                                  (hobj "index" i "id" (jget c "id") "type" "function"
+                                                        "function" (jget c "function")))
+                                        calls (loop for i below (length calls) collect i))))))
+    (funcall on-chunk (chunk-object id name (hobj) (jget choice "finish_reason")))
+    (funcall on-chunk (hobj "id" id "object" "chat.completion.chunk" "model" name
+                            "choices" (vector) "usage" (jget resp "usage")
+                            "timings" (jget resp "timings")))
+    resp))

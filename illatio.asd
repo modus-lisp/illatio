@@ -27,3 +27,14 @@
                 rendered in Lisp, tool calls parsed out of the reply."
   :depends-on ("illatio" "json-simple")
   :components ((:module "src" :components ((:file "openai")))))
+
+(defsystem "illatio/server"
+  :description "The OpenAI-compatible HTTP server: /v1/chat/completions
+                (blocking and streamed), /v1/models, /health."
+  :depends-on ("illatio/openai" "cl-transport")
+  :components ((:module "src" :components ((:file "server")))))
+
+(defsystem "illatio/cli"
+  :description "bin/illatio: complete, chat, or serve."
+  :depends-on ("illatio/server")
+  :components ((:module "bin" :components ((:file "illatio")))))
