@@ -21,13 +21,15 @@
 #-modus (deftype i8vec () '(simple-array (signed-byte 8) (*)))
 #+modus (deftype i8vec () '(simple-array (unsigned-byte 8) (*)))
 
-(declaim (inline i8-ref i8-byte))
-(defun i8-ref (v i)
-  #-modus (aref v i)
-  #+modus (let ((b (aref v i))) (if (> b 127) (- b 256) b)))
-(defun i8-byte (x)
-  #-modus x
-  #+modus (logand x 255))
+#-modus (declaim (inline i8-ref i8-byte))
+#-modus (defun i8-ref (v i) (aref v i))
+#-modus (defun i8-byte (x) x)
+;; modus compiles an inline-declared function as a call, one per element in
+;; every kernel that reads or writes an int8, so there they are macros
+#+modus (defmacro i8-ref (v i)
+          (let ((b (gensym)))
+            `(let ((,b (aref ,v ,i))) (declare (type (unsigned-byte 8) ,b)) (if (> ,b 127) (- ,b 256) ,b))))
+#+modus (defmacro i8-byte (x) `(logand ,x 255))
 
 (defun make-i8vec (n &key static)
   #+modus (if static

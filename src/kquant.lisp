@@ -261,6 +261,12 @@
   "Row ROW of W against XV at XO: the NEON kernel when it can run (see
    NEON-ACTIVE-P), the portable one -- which defines the bits -- otherwise."
   #+(and sbcl arm64) (when (neon-active-p) (return-from kmat-row-dot (kmat-row-dot-neon w row xv xo)))
+  #+modus (return-from kmat-row-dot
+            (if (eq (kmat-type w) :q4_k)
+                (%modus-q4k-row-dot (kmat-qs w) (kmat-sc w) (kmat-dd w) (q8kvec-qs xv) (q8kvec-d xv)
+                                    (q8kvec-bsum32 xv) (kmat-nb w) row xo)
+                (%modus-q6k-row-dot (kmat-qs w) (kmat-sc w) (kmat-dd w) (q8kvec-qs xv) (q8kvec-d xv)
+                                    (q8kvec-bsums xv) (kmat-nb w) row xo)))
   (if (eq (kmat-type w) :q4_k) (q4k-row-dot w row xv xo) (q6k-row-dot w row xv xo)))
 
 ;;; --- rows as floats (the embedding) ---------------------------------------------
