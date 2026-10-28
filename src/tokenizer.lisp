@@ -164,10 +164,14 @@
                            (and s (loop for i from s while (letterp (at i))
                                         finally (return i))))
                          ;; \p{N}{1,digits}
+                         ;; (not FINALLY's I: after a BELOW end test its value is
+                         ;; the spec's open question -- SBCL leaves the bound,
+                         ;; modus, like ansi-test, the last one inside, and a
+                         ;; one-digit run never advanced)
                          (and (numberp* c)
-                              (loop for i from pos below (min n (+ pos digits))
-                                    while (numberp* (at i))
-                                    finally (return i)))
+                              (let ((i pos) (lim (min n (+ pos digits))))
+                                (loop while (and (< i lim) (numberp* (at i))) do (incf i))
+                                i))
                          ;; ' ?[^\s\p{L}\p{N}]+[\r\n]*'
                          (let ((s (if (and (char= c #\Space) (at (1+ pos))) (1+ pos) pos)))
                            (flet ((other (x) (and x (not (spacep x)) (not (letterp x)) (not (numberp* x)))))

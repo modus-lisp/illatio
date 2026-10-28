@@ -42,3 +42,44 @@
                                 (%f32v* (%f32v-ref ws4 (* 4 (+ s0 b))) (%f32v-broadcast-ref xs (+ xso b)))))))))
     (%f32v-set out oo acc)
     nil))
+
+;;; Attention's two kernels, F32-DOT16 and F32-AXPY's bits on f32x4 lanes.
+;;; The dot's sixteen strided partial sums are four f32x4 accumulators --
+;;; lane L of accumulator J is partial sum 4J+L, fed the same products in the
+;;; same order -- stored into the sixteen-float array the portable kernel
+;;; sums with the same tree.  There is no fused multiply-add on these lanes,
+;;; so a product is rounded before it is added, as in the scalar code.
+
+(defun %modus-f32-dot16 (a ao b bo n)
+  "F32-DOT16 for N a multiple of 16."
+  (declare (type (simple-array single-float (*)) a b)
+           (type (unsigned-byte 40) ao bo n) (optimize (speed 3) (safety 0)))
+  (let ((s (make-array 16 :element-type 'single-float :initial-element 0f0)))
+    (declare (type (simple-array single-float (*)) s))
+    (let ((a0 (%f32v-broadcast 0.0)) (a1 (%f32v-broadcast 0.0))
+          (a2 (%f32v-broadcast 0.0)) (a3 (%f32v-broadcast 0.0)))
+      (declare (type f32v-pack a0 a1 a2 a3))
+      (dotimes (k (ash n -4))
+        (let ((p (+ ao (* k 16))) (q (+ bo (* k 16))))
+          (declare (type (unsigned-byte 40) p q))
+          (setq a0 (%f32v+ a0 (%f32v* (%f32v-ref a p) (%f32v-ref b q))))
+          (setq a1 (%f32v+ a1 (%f32v* (%f32v-ref a (+ p 4)) (%f32v-ref b (+ q 4)))))
+          (setq a2 (%f32v+ a2 (%f32v* (%f32v-ref a (+ p 8)) (%f32v-ref b (+ q 8)))))
+          (setq a3 (%f32v+ a3 (%f32v* (%f32v-ref a (+ p 12)) (%f32v-ref b (+ q 12)))))))
+      (%f32v-set s 0 a0) (%f32v-set s 4 a1) (%f32v-set s 8 a2) (%f32v-set s 12 a3))
+    (+ (+ (+ (+ (aref s 0) (aref s 4)) (+ (aref s 8) (aref s 12)))
+          (+ (+ (aref s 1) (aref s 5)) (+ (aref s 9) (aref s 13))))
+       (+ (+ (+ (aref s 2) (aref s 6)) (+ (aref s 10) (aref s 14)))
+          (+ (+ (aref s 3) (aref s 7)) (+ (aref s 11) (aref s 15)))))))
+
+(defun %modus-f32-axpy (y yo x xo w n)
+  "F32-AXPY for N a multiple of 4: Y[yo..] += W * X[xo..]."
+  (declare (type (simple-array single-float (*)) y x) (type single-float w)
+           (type (unsigned-byte 40) yo xo n) (optimize (speed 3) (safety 0)))
+  (let ((wv (%f32v-broadcast w)))
+    (declare (type f32v-pack wv))
+    (dotimes (k (ash n -2))
+      (let ((p (+ yo (* k 4))) (q (+ xo (* k 4))))
+        (declare (type (unsigned-byte 40) p q))
+        (%f32v-set y p (%f32v+ (%f32v-ref y p) (%f32v* wv (%f32v-ref x q)))))))
+  y)

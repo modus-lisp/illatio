@@ -156,7 +156,13 @@
                           (,axpy (w vo oo hd) (f32-axpy ,out oo ,vc vo w hd)))
                      (declare (inline ,dot ,axpy) (ignorable #',dot #',axpy))
                      ,@body)))
-    #-(and sbcl arm64) portable
+    #-(or modus (and sbcl arm64)) portable
+    ;; modus: the f32x4 twins (neon-modus.lisp); head dims are multiples of 16
+    #+modus
+    `(flet ((,dot (ko qo hd) (%modus-f32-dot16 ,kc ko ,q qo hd))
+            (,axpy (w vo oo hd) (%modus-f32-axpy ,out oo ,vc vo w hd)))
+       (declare (inline ,dot ,axpy) (ignorable #',dot #',axpy))
+       ,@body)
     #+(and sbcl arm64)
     `(if (neon-active-p)
          (sb-sys:with-pinned-objects (,kc ,vc ,q ,out)
