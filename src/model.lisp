@@ -320,18 +320,28 @@
 (defun top-logprobs (logits k)
   "The K most likely tokens as (id . logprob), most likely first.  The
    normaliser is summed in double, like everything else that reduces a
-   whole vocabulary."
-  (declare (type f32vec logits))
-  (let* ((mx (reduce #'max logits))
-         (z (log (loop for x across logits sum (exp (coerce (- x mx) 'double-float)))))
-         (best '()))
-    ;; a K-long insertion list beats sorting 150k entries
-    (dotimes (i (length logits))
+   whole vocabulary.  One pass over the logits with the best K kept sorted in
+   a small array: a candidate costs one compare unless it beats the K-th."
+  (declare (type f32vec logits) (type fixnum k))
+  (let* ((n (length logits))
+         (k (min k n))
+         (ids (make-array k :element-type 'fixnum :initial-element 0))
+         (vals (make-array k :element-type 'single-float :initial-element most-negative-single-float))
+         (mx (reduce #'max logits))
+         (z 0d0))
+    (declare (type double-float z))
+    (dotimes (i n)
       (let ((x (aref logits i)))
-        (when (or (< (length best) k) (> x (aref logits (car (car (last best))))))
-          (setf best (merge 'list (list (list i)) best #'> :key (lambda (e) (aref logits (car e)))))
-          (when (> (length best) k) (setf best (butlast best))))))
-    (loop for (i) in best collect (cons i (- (aref logits i) mx z)))))
+        (setq z (+ z (exp (coerce (- x mx) 'double-float))))
+        (when (> x (aref vals (1- k)))
+          ;; insert, shifting the smaller ones down
+          (let ((j (1- k)))
+            (loop while (and (> j 0) (> x (aref vals (1- j))))
+                  do (setf (aref vals j) (aref vals (1- j)) (aref ids j) (aref ids (1- j)))
+                     (decf j))
+            (setf (aref vals j) x (aref ids j) i)))))
+    (let ((lz (log z)))
+      (loop for j below k collect (cons (aref ids j) (- (aref vals j) mx lz))))))
 
 (defun replace-model-pool (into from threads)
   "Make INTO share FROM's weights but run on a fresh pool of THREADS."
