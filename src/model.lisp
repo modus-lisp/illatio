@@ -250,11 +250,18 @@
   (dotimes (i end x) (incf (aref x i) (aref y i))))
 
 (defun swiglu! (a b &optional (end (length a)))
-  "A = silu(A) * B, silu(x) = x/(1+e^-x)."
+  "A = silu(A) * B, silu(x) = x/(1+e^-x).  A gate below about -88.7 makes
+   e^-x overflow; C's expf gives infinity and silu -0.0, which is ggml's
+   answer, so SBCL's overflow trap is masked here (modus gives infinity as
+   it is).  Qwen3-4B reaches such gates on long prompts."
   (declare (type f32vec a b) (type fixnum end) (optimize speed (safety 0)))
-  (dotimes (i end a)
-    (let ((x (aref a i)))
-      (setf (aref a i) (* (/ x (+ 1f0 (exp (- x)))) (aref b i))))))
+  (flet ((run ()
+           (dotimes (i end a)
+             (let ((x (aref a i)))
+               (setf (aref a i) (* (/ x (+ 1f0 (exp (- x)))) (aref b i)))))))
+    (declare (inline run))
+    #+sbcl (sb-int:with-float-traps-masked (:overflow :inexact) (run))
+    #-sbcl (run)))
 
 ;;; --- one token --------------------------------------------------------------
 
