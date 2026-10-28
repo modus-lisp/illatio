@@ -16,6 +16,7 @@
      (:file "half")        ; binary16 <-> single, bit for bit
      (:file "gguf")        ; the container: metadata + tensor directory
      (:file "pool")        ; worker threads, one job at a time
+     (:file "neon-sbcl" :if-feature (:and :sbcl :arm64)) ; SDOT row kernel (a VOP)
      (:file "tensor")      ; Q8_0 weights and the quantized matvec
      (:file "tokenizer")   ; byte-level BPE
      (:file "model")       ; the forward pass

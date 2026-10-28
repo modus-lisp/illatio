@@ -8,7 +8,9 @@
 ;;;   - a batched prefill and feeding the same tokens one at a time;
 ;;;   - one thread and many (each output is computed whole by one thread);
 ;;;   - a context reused across prompts that share a prefix (the KV reuse an
-;;;     agent's growing conversation relies on) and a fresh context.
+;;;     agent's growing conversation relies on) and a fresh context;
+;;;   - the NEON kernels and the portable ones they are written to match, on
+;;;     a whole prefill and a decoded token (where the machine has NEON).
 
 (load (merge-pathnames "load.lisp" (or *load-truename* *default-pathname-defaults*)))
 (in-package #:illatio)
@@ -57,6 +59,18 @@
     (let ((fresh (logits-after *ids*)))
       (sync-prompt ctx *ids*)
       (check (equalp fresh (context-logits ctx)) "reused context = fresh context"))))
+
+(if (neon-active-p)
+    (let ((neon (logits-after *ids*))
+          (portable (let ((*neon-dot* nil)) (logits-after *ids*))))
+      (check (equalp neon portable) "NEON kernels = portable kernels (prefill)")
+      (flet ((decoded (neon-p)
+               (let ((*neon-dot* neon-p) (ctx (make-context *m*)))
+                 (eval-tokens ctx *ids*)
+                 (forward ctx 13)
+                 (copy-seq (context-logits ctx)))))
+        (check (equalp (decoded t) (decoded nil)) "NEON kernels = portable kernels (decode)")))
+    (format t "~&  --   no NEON here: the portable kernels are the only ones~%"))
 
 (format t "~&~:[ok~;~:*~D failures~]~%" (and (plusp *failures*) *failures*))
 (uiop:quit (if (zerop *failures*) 0 1))

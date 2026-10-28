@@ -111,23 +111,24 @@
 
 ;;; --- ops --------------------------------------------------------------------
 
-(defun rmsnorm! (x w out eps)
-  "ggml_rms_norm then ggml_mul: the sum of squares is taken in double, the
-   scale is a float, and x is scaled before it is weighted."
-  (declare (type f32vec x w out) (type single-float eps) (optimize speed (safety 0)))
-  (let* ((n (length x))
-         (sum (loop for i of-type fixnum below n
+(defun rmsnorm! (x w out eps &optional (xo 0) (n (length w)))
+  "ggml_rms_norm then ggml_mul on X[xo..xo+n): the sum of squares is taken in
+   double, the scale is a float, and x is scaled before it is weighted.  The
+   result goes to OUT at the same offset."
+  (declare (type f32vec x w out) (type single-float eps) (type fixnum xo n)
+           (optimize speed (safety 0)))
+  (let* ((sum (loop for i of-type fixnum from xo below (+ xo n)
                     sum (coerce (* (aref x i) (aref x i)) 'double-float) of-type double-float))
          (scale (/ 1f0 (sqrt (coerce (+ (/ sum n) eps) 'single-float)))))
     (declare (type single-float scale))
     (dotimes (i n out)
-      (setf (aref out i) (* (* (aref x i) scale) (aref w i))))))
+      (setf (aref out (+ xo i)) (* (* (aref x (+ xo i)) scale) (aref w i))))))
 
-(defun rope! (x n-heads head-dim pos base neox)
+(defun rope! (x n-heads head-dim pos base neox &optional (xo 0))
   "Rotate each head of X for position POS.  theta is advanced by repeated
    multiplication, as ggml_rope_cache_init does, not by a fresh pow per
    pair: the two differ in the last bits and those bits reach the logits."
-  (declare (type f32vec x) (type fixnum n-heads head-dim pos) (type single-float base)
+  (declare (type f32vec x) (type fixnum n-heads head-dim pos xo) (type single-float base)
            (optimize speed (safety 0)))
   (let* ((half (floor head-dim 2))
          (cos (f32vec half)) (sin (f32vec half))
@@ -138,7 +139,7 @@
       (setf (aref cos i) (cos theta) (aref sin i) (sin theta)
             theta (* theta theta-scale)))
     (dotimes (h n-heads x)
-      (let ((o (* h head-dim)))
+      (let ((o (+ xo (* h head-dim))))
         (dotimes (i half)
           (multiple-value-bind (a b) (if neox
                                          (values (+ o i) (+ o i half))
@@ -147,10 +148,34 @@
               (setf (aref x a) (- (* x0 c) (* x1 s))
                     (aref x b) (+ (* x0 s) (* x1 c))))))))))
 
+(defmacro with-attention-kernels ((dot axpy) (kc vc q out) &body body)
+  "Run BODY with (DOT k-offset q-offset hd) and (AXPY w v-offset out-offset hd)
+   bound to the NEON kernels when this machine has them, else the portable
+   twins that define their bits."
+  (let ((portable `(flet ((,dot (ko qo hd) (f32-dot16 ,kc ko ,q qo hd))
+                          (,axpy (w vo oo hd) (f32-axpy ,out oo ,vc vo w hd)))
+                     (declare (inline ,dot ,axpy) (ignorable #',dot #',axpy))
+                     ,@body)))
+    #-(and sbcl arm64) portable
+    #+(and sbcl arm64)
+    `(if (neon-active-p)
+         (sb-sys:with-pinned-objects (,kc ,vc ,q ,out)
+           (let ((ks (sb-sys:vector-sap ,kc)) (vs (sb-sys:vector-sap ,vc))
+                 (qs (sb-sys:vector-sap ,q)) (os (sb-sys:vector-sap ,out)))
+             (flet ((,dot (ko qo hd)
+                      (declare (type fixnum ko qo hd))
+                      (%f32-dot16 (sb-sys:sap+ ks (* 4 ko)) (sb-sys:sap+ qs (* 4 qo)) (ash hd -4)))
+                    (,axpy (w vo oo hd)
+                      (declare (type fixnum vo oo hd) (type single-float w))
+                      (%f32-axpy4 (sb-sys:sap+ os (* 4 oo)) (sb-sys:sap+ vs (* 4 vo)) w (ash hd -2))))
+               (declare (inline ,dot ,axpy))
+               ,@body)))
+         ,portable)))
+
 (defun attend-head! (ctx layer-index q qo out n h)
   "One query head: OUT[qo..] = softmax(q·K / sqrt(hd)) · V over positions
    0..N-1, Q's head H starting at QO.  Query heads share KV heads in groups
-   (GQA)."
+   (GQA).  The dot products are summed in F32-DOT16's order."
   (declare (type f32vec q out) (type fixnum layer-index qo n h))
   (let* ((m (context-model ctx))
          (hd (model-head-dim m))
@@ -165,27 +190,24 @@
     (declare (type fixnum hd group kvd ko) (type f32vec kc vc scores)
              (type single-float scale mx)
              (optimize speed (safety 0)))
-    (dotimes (p n)
-      (let ((s 0f0) (base (+ (* p kvd) ko)))
-        (declare (type single-float s) (type fixnum base))
-        (dotimes (i hd) (incf s (* (aref kc (+ base i)) (aref q (+ qo i)))))
-        (let ((s (* s scale)))
-          (setf (aref scores p) s)
-          (when (> s mx) (setf mx s)))))
-    ;; ggml_vec_soft_max_f32: exp in float, the sum in double.
-    (let ((sum 0d0))
-      (declare (type double-float sum))
+    (assert (zerop (mod hd 16)))
+    (with-attention-kernels (dot axpy) (kc vc q out)
       (dotimes (p n)
-        (let ((e (exp (- (aref scores p) mx))))
-          (setf (aref scores p) e)
-          (incf sum e)))
-      (let ((inv (coerce (/ 1d0 sum) 'single-float)))
-        (dotimes (p n) (setf (aref scores p) (* (aref scores p) inv)))))
-    (dotimes (i hd) (setf (aref out (+ qo i)) 0f0))
-    (dotimes (p n)
-      (let ((w (aref scores p)) (base (+ (* p kvd) ko)))
-        (dotimes (i hd)
-          (incf (aref out (+ qo i)) (* w (aref vc (+ base i)))))))))
+        (let ((s (* (the single-float (dot (+ (* p kvd) ko) qo hd)) scale)))
+          (setf (aref scores p) s)
+          (when (> s mx) (setf mx s))))
+      ;; ggml_vec_soft_max_f32: exp in float, the sum in double.
+      (let ((sum 0d0))
+        (declare (type double-float sum))
+        (dotimes (p n)
+          (let ((e (exp (- (aref scores p) mx))))
+            (setf (aref scores p) e)
+            (incf sum e)))
+        (let ((inv (coerce (/ 1d0 sum) 'single-float)))
+          (dotimes (p n) (setf (aref scores p) (* (aref scores p) inv)))))
+      (dotimes (i hd) (setf (aref out (+ qo i)) 0f0))
+      (dotimes (p n)
+        (axpy (aref scores p) (+ (* p kvd) ko) qo hd)))))
 
 (defun attention! (ctx layer-index)
   "Every query head of the current token, in parallel."

@@ -17,17 +17,25 @@ operandi --illatio "task"             # or no server at all: the model in operan
 ## Status
 
 The first model runs, and it is checked against llama.cpp. Qwen2.5-0.5B-Instruct
-in Q8_0 (the `qwen2` architecture; `llama` shares the code path) on an M-series
-Mac with 10 performance cores:
+in Q8_0 (the `qwen2` architecture; `llama` shares the code path), on an Apple
+M-series laptop, against llama.cpp's CPU backend on the same file:
 
-| | |
-|---|---|
-| load | 2.8 s |
-| decode | ~30 tok/s |
-| prefill | ~67 tok/s at short context |
-| tokenizer | llama.cpp's ids on every test prompt |
-| chat template | byte-identical to llama-server's `/apply-template`, with and without tools |
-| logits | at llama.cpp's noise floor (see Testing) |
+| tok/s | illatio, NEON | illatio, portable | llama.cpp CPU |
+|---|---|---|---|
+| decode, 1 thread | 88 | 4.6 | 136 |
+| prefill, 1 thread | 178 | 9.6 | 334 |
+| decode, 10 threads | 99 | 32 | 280–315 |
+| prefill, 10 threads | 511 | 72 | 1,892 |
+
+Other checks:
+
+- **Load time.** 2.8 s.
+- **Tokenizer.** llama.cpp's ids on every test prompt.
+- **Chat template.** Byte-identical to llama-server's `/apply-template`, with
+  and without tools.
+- **Logits.** At llama.cpp's noise floor (see Testing).
+- **First turn under operandi.** `operandi --illatio` answers its first turn
+  in 30 s, prefill of its 6,328-token system prompt included.
 
 It follows [ds4](https://github.com/antirez/ds4) in spirit: a small engine
 built for a few chosen models, not a general GGUF runner. Correctness comes
@@ -96,6 +104,17 @@ folds them straight into its stream state.
 - **The forward pass** mirrors llama.cpp's graph op for op: RMSNorm with its
   sum in double, NEOX RoPE with theta advanced by repeated multiplication as
   ggml does, GQA attention with ggml's softmax, SwiGLU (`src/model.lisp`).
+- **NEON, as an option beside the portable code.** On arm64 with
+  FEAT_DotProd, the three hot loops run as NEON (`src/neon-sbcl.lisp`, SBCL
+  VOPs emitted as instruction words). They are the Q8_0 matrix product, four
+  rows per pass with SDOT, and attention's dot product and update. Each is
+  written to give the portable kernel's bits: never a fused multiply-add,
+  the same rounding steps in the same order. A reduction's order is defined
+  by the portable code (sixteen strided partial sums and a fixed tree), so
+  the narrow and wide versions are one kernel at two widths.
+  consistency-test checks them against each other to the bit on whole
+  forward passes. Without SDOT (or not on SBCL/arm64), the portable kernels
+  run.
 - **The tokenizer** is GPT-2 byte-level BPE. The qwen2/llama3
   pre-tokenizer pattern is matched by hand, as llama.cpp's own custom
   splitter does, with no regex engine (`src/tokenizer.lisp`).
@@ -137,13 +156,16 @@ inspect/collect-vectors.py http://localhost:18931 inspect/vectors/qwen2.5-0.5b-q
 
 ## Next
 
-- **Speed.** The kernels are scalar Lisp, at 3.3 GMAC/s per core. Prefill
-  dominates agent use: operandi's 6k-token system prompt takes minutes, and
-  attention is now half of that. Options, roughly in order:
-  - disk KV checkpoints for a prompt prefix that never changes (ds4 does this
-    for long agent sessions);
-  - a tiled attention kernel;
-  - SIMD through SBCL VOPs, as an optional fast path beside the portable one.
+- **Speed.**
+  - Prefill could use I8MM's SMMLA, which takes 2×2 tiles of rows by
+    tokens, with weights repacked at load as ggml does.
+  - Decode is now near what one core can pull from memory.
+  - Disk KV checkpoints for a prompt prefix that never changes (ds4 does
+    this) would remove most of operandi's first-turn cost.
+- **modus.** Modus has integer NEON lanes (its Layer 2b, `%vi-*`) but no
+  SDOT yet. The kernels are behind three names (`%q8-dot-4rows`,
+  `%f32-dot16`, `%f32-axpy4`) with portable twins, so a `#+modus` arm is
+  those three.
 - **More formats.** K-quants (Q4_K, Q6_K) and more architectures.
 - **ds4f.** DeepSeek V4 Flash, ported from ds4's CPU reference path, with
   SSD streaming of routed experts for machines with less RAM than the model.

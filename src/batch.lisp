@@ -17,21 +17,25 @@
 
 (defconstant +lane+ 21)
 
-;;; Activations of N tokens, quantized, packed three to a word.
-;;; WORDS[g*cols + j] packs column j of tokens 3g, 3g+1, 3g+2 (absent tokens
-;;; are zero); SCALES[t*(cols/32) + b] is token t's scale for block b.
+;;; Activations of N tokens, quantized.  QV holds them as N rows of int8
+;;; (token t's at t*cols) with their scales (token t's block b at t*(cols/32)+b).
+;;; WORDS packs them three to a word for the portable kernel: WORDS[g*cols + j]
+;;; is column j of tokens 3g, 3g+1, 3g+2 (absent tokens are zero).  The NEON
+;;; kernel reads QV directly, so the packing is only done when it is needed.
 (defstruct (q8batch (:constructor %make-q8batch))
   (n 0 :type fixnum)
   (cols 0 :type fixnum)
-  (words (make-array 0 :element-type '(signed-byte 64)) :type i64vec)
-  (scales (f32vec 0) :type f32vec)
-  (row (make-q8vec 32)))                ; scratch: one token's quantization
+  (qv (make-q8vec 32) :type q8vec)
+  (words (make-array 0 :element-type '(signed-byte 64)) :type i64vec))
+
+(defun q8batch-quants (xb) (q8vec-quants (q8batch-qv xb)))
+(defun q8batch-scales (xb) (q8vec-scales (q8batch-qv xb)))
 
 (defun make-q8batch (max-n cols)
   (%make-q8batch :cols cols
-                 :words (make-array (* (ceiling max-n 3) cols) :element-type '(signed-byte 64))
-                 :scales (f32vec (* max-n (floor cols 32)))
-                 :row (make-q8vec cols)))
+                 :qv (%make-q8vec :quants (make-array (* max-n cols) :element-type '(signed-byte 8))
+                                  :scales (f32vec (* max-n (floor cols 32))))
+                 :words (make-array (* (ceiling max-n 3) cols) :element-type '(signed-byte 64))))
 
 (defun quantize-batch! (xs n out)
   "Quantize rows 0..N-1 of XS (N rows of COLS floats, row-major) into OUT,
@@ -39,25 +43,25 @@
   (declare (type f32vec xs) (type fixnum n) (optimize speed (safety 0)))
   (let* ((cols (q8batch-cols out))
          (nb (floor cols 32))
-         (words (q8batch-words out))
-         (scales (q8batch-scales out))
-         (row (q8batch-row out))
-         (tmp (f32vec cols)))
-    (declare (type fixnum cols nb) (type i64vec words) (type f32vec scales tmp))
+         (qv (q8batch-qv out)))
+    (declare (type fixnum cols nb))
     (setf (q8batch-n out) n)
-    (fill words 0 :end (* (ceiling n 3) cols))
-    (dotimes (tk n out)
-      (replace tmp xs :start2 (* tk cols) :end2 (* (1+ tk) cols))
-      (quantize-q8! tmp row)
-      (let ((q (q8vec-quants row))
-            (base (* (floor tk 3) cols))
-            (shift (* +lane+ (mod tk 3))))
-        (declare (type i8vec q) (type fixnum base) (type (integer 0 42) shift))
-        (replace scales (q8vec-scales row) :start1 (* tk nb))
-        (dotimes (j cols)
-          (setf (aref words (+ base j))
-                (the (signed-byte 64) (+ (aref words (+ base j))
-                                         (the (signed-byte 50) (ash (aref q j) shift))))))))))
+    (dotimes (tk n)
+      (quantize-q8! xs qv (* tk cols) cols (* tk cols) (* tk nb)))
+    (unless (neon-active-p)
+      (let ((words (q8batch-words out)) (q (q8vec-quants qv)))
+        (declare (type i64vec words) (type i8vec q))
+        (fill words 0 :end (* (ceiling n 3) cols))
+        (dotimes (tk n)
+          (let ((base (* (floor tk 3) cols))
+                (shift (* +lane+ (mod tk 3)))
+                (qo (* tk cols)))
+            (declare (type fixnum base qo) (type (integer 0 42) shift))
+            (dotimes (j cols)
+              (setf (aref words (+ base j))
+                    (the (signed-byte 64) (+ (aref words (+ base j))
+                                             (the (signed-byte 50) (ash (aref q (+ qo j)) shift))))))))))
+    out))
 
 (defmacro sext21 (v)
   "The low 21 bits of V as a signed number: offset by 2^20, mask, unoffset."
@@ -76,8 +80,25 @@
        ,@body)))
 
 (defun matmul! (pool w xb out &optional bias)
-  "OUT[t*rows + r] = (W·x_t)[r] (+ BIAS[r]) for the N tokens in XB."
+  "OUT[t*rows + r] = (W·x_t)[r] (+ BIAS[r]) for the N tokens in XB.  With SDOT,
+   each (row, token) is one NEON row product; otherwise three tokens share
+   each multiply.  Both give the scalar path's bits."
   (declare (type q8mat w) (type q8batch xb) (type f32vec out))
+  (when (neon-active-p)
+    (let* ((rows (q8mat-rows w)) (cols (q8mat-cols w)) (nb (floor cols 32))
+           (n (q8batch-n xb)) (xq (q8batch-quants xb)) (xs (q8batch-scales xb)))
+      (declare (type fixnum rows cols nb n))
+      (with-dot-rows (dot-rows w xq xs out)
+        (parallel-for (g (floor rows 4) pool)
+          (dotimes (tk n)
+            (dot-rows g (* tk cols) (* tk nb) (+ (* tk rows) (* 4 g))))))
+      (when bias
+        (let ((bias bias))
+          (declare (type f32vec bias) (optimize speed (safety 0)))
+          (dotimes (tk n)
+            (dotimes (r rows)
+              (incf (aref out (+ (* tk rows) r)) (aref bias r))))))
+      (return-from matmul! out)))
   (let* ((rows (q8mat-rows w)) (cols (q8mat-cols w)) (nb (floor cols 32))
          (n (q8batch-n xb)) (groups (ceiling n 3))
          (wq (q8mat-quants w)) (ws (q8mat-scales w))
@@ -136,17 +157,6 @@
                :fa (f32vec (* n f)) :fb (f32vec (* n f))
                :xb (make-q8batch n d) :fb-q (make-q8batch n f))))))
 
-(defun map-rows! (fn n width &rest vecs)
-  "Call FN on row-sized copies of row T of each of VECS (N rows of WIDTH), and
-   write the copies back: the single-token ops, applied row by row."
-  (let ((rows (mapcar (lambda (v) (declare (ignore v)) (f32vec width)) vecs)))
-    (dotimes (tk n)
-      (loop for v in vecs for r in rows
-            do (replace r v :start2 (* tk width) :end2 (* (1+ tk) width)))
-      (apply fn tk rows)
-      (loop for v in vecs for r in rows
-            do (replace v r :start1 (* tk width))))))
-
 (defun forward-batch (ctx tokens &key (logits t))
   "Run TOKENS (at most *PREFILL-CHUNK*) at the next positions; bit-identical
    to FORWARD on each in turn.  The logits, if LOGITS, are the last token's."
@@ -172,16 +182,14 @@
                (replace x row :start1 (* tk d))))
     (loop for li below (model-n-layer m)
           for l = (svref (model-layers m) li)
-          do (map-rows! (lambda (tk xr hr) (declare (ignore tk)) (rmsnorm! xr (layer-attn-norm l) hr eps))
-                        n d x h)
+          do (dotimes (tk n) (rmsnorm! x (layer-attn-norm l) h eps (* tk d)))
              (quantize-batch! h n xb)
              (matmul! pool (layer-wq l) xb q (layer-bq l))
              (matmul! pool (layer-wk l) xb k (layer-bk l))
              (matmul! pool (layer-wv l) xb v (layer-bv l))
-             (map-rows! (lambda (tk qr) (rope! qr (model-n-head m) hd (+ pos0 tk) (model-rope-base m) (model-rope-neox m)))
-                        n d q)
-             (map-rows! (lambda (tk kr) (rope! kr (model-n-kv-head m) hd (+ pos0 tk) (model-rope-base m) (model-rope-neox m)))
-                        n kvd k)
+             (dotimes (tk n)
+               (rope! q (model-n-head m) hd (+ pos0 tk) (model-rope-base m) (model-rope-neox m) (* tk d))
+               (rope! k (model-n-kv-head m) hd (+ pos0 tk) (model-rope-base m) (model-rope-neox m) (* tk kvd)))
              (replace (svref (context-k-cache ctx) li) k :start1 (* pos0 kvd) :end2 (* n kvd))
              (replace (svref (context-v-cache ctx) li) v :start1 (* pos0 kvd) :end2 (* n kvd))
              ;; token tk sees positions 0..pos0+tk: causality is the length
@@ -192,8 +200,7 @@
              (quantize-batch! att n xb)
              (matmul! pool (layer-wo l) xb h)
              (add! x h (* n d))          ; elementwise, so whole rows at once
-             (map-rows! (lambda (tk xr hr) (declare (ignore tk)) (rmsnorm! xr (layer-ffn-norm l) hr eps))
-                        n d x h)
+             (dotimes (tk n) (rmsnorm! x (layer-ffn-norm l) h eps (* tk d)))
              (quantize-batch! h n xb)
              (matmul! pool (layer-wgate l) xb fa)
              (matmul! pool (layer-wup l) xb fb)
