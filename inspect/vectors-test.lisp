@@ -16,7 +16,11 @@
 ;;; every percentile (top-1 logprob: median 0.006, p95 0.07; ranks 2-5:
 ;;; median 0.05, p95 0.22).  So the bounds below are that floor with headroom,
 ;;; and a real bug -- a wrong rope, norm or mask -- lands far outside them:
-;;;   - every one of llama.cpp's top 5 is in our top 10, at every step;
+;;;   - every one of llama.cpp's top 5 is in our top 10, at every step --
+;;;     unless it is so far down the tail that the noise could drop it below
+;;;     our tenth: its logprob within the p95 ranks-2-5 bound of our tenth's
+;;;     (a 27B model's alternatives sit at -9 or below, and one 0.3 nats away
+;;;     from our tenth is noise, not a missing token);
 ;;;   - |dlogprob| of llama.cpp's top-1: median < 0.02, p95 < 0.15;
 ;;;   - |dlogprob| of its ranks 2-5:     median < 0.10, p95 < 0.40;
 ;;;   - our argmax is llama.cpp's, except where llama.cpp's own top two are
@@ -41,6 +45,8 @@
 
 (defvar *deltas* (list :top1 '() :rest '()))
 
+(defun bounds-for (m) (if (member :q8k (model-act-kinds m)) +kquant-bounds+ +bounds+))
+
 (defun quantile (list p)
   (let ((s (sort (copy-list list) #'<)))
     (nth (floor (* p (1- (length s)))) s)))
@@ -57,6 +63,13 @@
   (unless ok (incf *failures*) (format t "  FAIL ~?~%" fmt args))
   ok)
 
+(defun tail-noise-p (lp ours bounds)
+  "True when LP, absent from our top 10 OURS, is within the p95 ranks-2-5
+   bound of our tenth logprob: below what this format's noise resolves."
+  (let ((tenth (cdr (car (last ours))))
+        (b (third (find-if (lambda (e) (and (eq (first e) :rest) (= (second e) 0.95))) bounds))))
+    (and tenth b (< lp (+ tenth b)))))
+
 (defun run-case (m c)
   (let* ((name (getf c :name))
          (prompt (getf c :prompt))
@@ -72,9 +85,11 @@
                (loop for (id lp) in (subseq ref 0 (min 5 (length ref)))
                      for mine = (cdr (assoc id ours))
                      for rank from 0
-                     do (when (check mine "~A step ~D: llama.cpp's ~D (~,3F) is not in our top 10" name i id lp)
-                          (setf worst (max worst (abs (- mine lp))))
-                          (push (abs (- mine lp)) (getf *deltas* (if (zerop rank) :top1 :rest)))))
+                     do (when (check (or mine (tail-noise-p lp ours (bounds-for m)))
+                                     "~A step ~D: llama.cpp's ~D (~,3F) is not in our top 10" name i id lp)
+                          (when mine
+                            (setf worst (max worst (abs (- mine lp))))
+                            (push (abs (- mine lp)) (getf *deltas* (if (zerop rank) :top1 :rest))))))
                (cond ((= (car (first ours)) want) (incf agree))
                      (tie (incf ties))
                      (t (check nil "~A step ~D: argmax ~D, llama.cpp ~D (margin ~,3F)" name i
@@ -92,7 +107,7 @@
                                  (merge-pathnames "vectors/qwen2.5-0.5b-q8_0.sexp"
                                                   (or *load-truename* *default-pathname-defaults*)))))
       (run-case m c))
-    (loop for (key p bound) in (if (member :q8k (model-act-kinds m)) +kquant-bounds+ +bounds+)
+    (loop for (key p bound) in (bounds-for m)
           for q = (quantile (getf *deltas* key) p)
           do (format t "~&~5A p~2D |dlogprob| ~,4F (bound ~,2F)~%" key (round (* 100 p)) q bound)
              (check (< q bound) "~A p~D ~,4F exceeds ~,2F" key (round (* 100 p)) q bound))

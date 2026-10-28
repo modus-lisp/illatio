@@ -140,9 +140,16 @@
 (declaim (inline newlinep))
 (defun newlinep (c) (and c (or (char= c #\Return) (char= c #\Newline))))
 
-(defun split-words (text &key (digits 1))
+(defun markp (c)
+  (and c (>= (char-code c) 768) (in-ranges-p (char-code c) +mark-ranges+)))
+
+(defun split-words (text &key (digits 1) marks)
+  "TEXT split as the pre-tokenizer's regex splits it.  MARKS (qwen35): a
+   word is letters and combining marks, [\\p{L}\\p{M}]+, and a run of other
+   characters excludes marks too."
   (let ((n (length text)) (pos 0) (words '()))
-    (flet ((at (i) (and (< i n) (char text i))))
+    (flet ((at (i) (and (< i n) (char text i)))
+           (wordp (c) (or (letterp c) (and marks (markp c)))))
       (loop while (< pos n)
             do (let* ((c (at pos))
                       (end
@@ -157,11 +164,11 @@
                                            (and (eql a #\l) (eql b #\l)))
                                        (+ pos 3)))))
                          ;; [^\r\n\p{L}\p{N}]?\p{L}+
-                         (let ((s (cond ((letterp c) pos)
+                         (let ((s (cond ((wordp c) pos)
                                         ((and (not (newlinep c)) (not (numberp* c))
-                                              (letterp (at (1+ pos))))
+                                              (wordp (at (1+ pos))))
                                          (1+ pos)))))
-                           (and s (loop for i from s while (letterp (at i))
+                           (and s (loop for i from s while (wordp (at i))
                                         finally (return i))))
                          ;; \p{N}{1,digits}
                          ;; (not FINALLY's I: after a BELOW end test its value is
@@ -174,7 +181,7 @@
                                 i))
                          ;; ' ?[^\s\p{L}\p{N}]+[\r\n]*'
                          (let ((s (if (and (char= c #\Space) (at (1+ pos))) (1+ pos) pos)))
-                           (flet ((other (x) (and x (not (spacep x)) (not (letterp x)) (not (numberp* x)))))
+                           (flet ((other (x) (and x (not (spacep x)) (not (wordp x)) (not (numberp* x)))))
                              (when (other (at s))
                                (let ((i (loop for i from s while (other (at i)) finally (return i))))
                                  (loop while (newlinep (at i)) do (incf i))
@@ -200,7 +207,7 @@
     (nreverse words)))
 
 (defun pre-tokenizer-digits (pre)
-  (cond ((member pre '("qwen2" "deepseek-r1-qwen") :test #'equal) 1)
+  (cond ((member pre '("qwen2" "qwen35" "deepseek-r1-qwen") :test #'equal) 1)
         ((member pre '("llama3" "llama-bpe" "smaug-bpe") :test #'equal) 3)
         (t (error "pre-tokenizer ~S is not supported yet" pre))))
 
@@ -233,11 +240,12 @@
                                                   (error "no token for byte ~S" ch))))))))
 
 (defun tokenize-with (vocab text &key (add-bos (vocab-add-bos vocab)))
-  (let ((digits (pre-tokenizer-digits (vocab-pre vocab))))
+  (let ((digits (pre-tokenizer-digits (vocab-pre vocab)))
+        (marks (equal (vocab-pre vocab) "qwen35")))
     (append (and add-bos (vocab-bos vocab) (list (vocab-bos vocab)))
             (loop for f in (split-specials vocab text)
                   if (integerp f) collect f
-                  else append (loop for w in (split-words f :digits digits)
+                  else append (loop for w in (split-words f :digits digits :marks marks)
                                     append (bpe-word vocab w))))))
 
 ;;; --- decoding ---------------------------------------------------------------

@@ -73,6 +73,12 @@
     ;; are what the next token is sampled from, and we don't keep logits
     ;; per position.
     (setf common (min common (1- (length ids))))
+    ;; A recurrent model's state can't go back: it continues only when IDS
+    ;; extends exactly what it has seen, and otherwise starts over.
+    (when (model-recurrent-p (context-model ctx))
+      (if (and (= common (length have)) (< common (length ids)))
+          nil
+          (progn (setf common 0) (reset-recurrent! ctx))))
     (setf (context-pos ctx) common
           (context-tokens ctx) (subseq ids 0 common))
     (eval-tokens ctx (nthcdr common ids))

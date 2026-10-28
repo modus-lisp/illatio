@@ -18,7 +18,11 @@
 (defstruct layer
   attn-norm wq wk wv wo bq bk bv
   q-norm k-norm                         ; qwen3: per-head RMSNorm of q and k
-  ffn-norm wgate wup wdown)
+  ffn-norm wgate wup wdown
+  ;; qwen35 (qwen35.lisp): a layer is :FULL (gated attention) or :LINEAR
+  ;; (gated delta net), and its FFN is normed by post_attention_norm
+  (kind :full)
+  wqkv wz walpha wbeta ssm-a ssm-dt conv1d ssm-norm ssm-out)
 
 (defstruct (model (:constructor %make-model))
   gguf vocab arch name
@@ -36,6 +40,11 @@
   (rope-base 10000f0 :type single-float)
   (rope-neox nil)
   (act-kinds '(:q8))             ; the activation formats its matrices take
+  (rope-dims 0 :type fixnum)     ; dimensions RoPE rotates (qwen35: 64 of 256)
+  ;; qwen35's linear-attention shape (rows of ssm.*): the conv kernel, K
+  ;; heads x their dim, V heads x their dim
+  (ssm-conv 0 :type fixnum) (ssm-k-heads 0 :type fixnum) (ssm-k-dim 0 :type fixnum)
+  (ssm-v-heads 0 :type fixnum) (ssm-v-dim 0 :type fixnum)
   token-embd output-norm output
   (layers #() :type simple-vector)
   pool)
@@ -53,8 +62,8 @@
          (d (arch-key g arch "embedding_length"))
          (n-head (arch-key g arch "attention.head_count"))
          (vocab (make-vocab-from-gguf g)))
-    (unless (member arch '("qwen2" "qwen3" "llama") :test #'equal)
-      (error "architecture ~S is not supported (qwen2, qwen3 and llama are)" arch))
+    (unless (member arch '("qwen2" "qwen3" "qwen35" "llama") :test #'equal)
+      (error "architecture ~S is not supported (qwen2, qwen3, qwen35 and llama are)" arch))
     (flet ((q8 (name) (load-qmat g name))
            (f32 (name) (load-f32 g name))
            (opt (name f) (and (gguf-tensor g name nil) (funcall f name))))
@@ -73,7 +82,15 @@
        :rope-base (coerce (or (arch-key g arch "rope.freq_base") 10000) 'single-float)
        ;; llama.cpp's rope type per architecture: qwen2 rotates (i, i+d/2)
        ;; pairs (NEOX), llama rotates adjacent (2i, 2i+1) pairs.
-       :rope-neox (member arch '("qwen2" "qwen3") :test #'equal)
+       :rope-neox (member arch '("qwen2" "qwen3" "qwen35") :test #'equal)
+       :rope-dims (or (arch-key g arch "rope.dimension_count")
+                      (arch-key g arch "attention.key_length") (floor d n-head))
+       :ssm-conv (or (arch-key g arch "ssm.conv_kernel") 0)
+       :ssm-k-heads (or (arch-key g arch "ssm.group_count") 0)
+       :ssm-k-dim (or (arch-key g arch "ssm.state_size") 0)
+       :ssm-v-heads (or (arch-key g arch "ssm.time_step_rank") 0)
+       :ssm-v-dim (let ((r (arch-key g arch "ssm.time_step_rank")))
+                    (if r (floor (arch-key g arch "ssm.inner_size") r) 0))
        :token-embd (q8 "token_embd.weight")
        :output-norm (f32 "output_norm.weight")
        ;; Without an output matrix the head is tied to the embedding (the
@@ -84,14 +101,24 @@
                       collect (flet ((n (s) (format nil "blk.~D.~A" i s)))
                                 (make-layer
                                  :attn-norm (f32 (n "attn_norm.weight"))
-                                 :wq (q8 (n "attn_q.weight")) :wk (q8 (n "attn_k.weight"))
-                                 :wv (q8 (n "attn_v.weight")) :wo (q8 (n "attn_output.weight"))
+                                 ;; qwen35's linear layers have no attn_q: their
+                                 ;; projections are below
+                                 :kind (if (gguf-tensor g (n "attn_q.weight") nil) :full :linear)
+                                 :wq (opt (n "attn_q.weight") #'q8) :wk (opt (n "attn_k.weight") #'q8)
+                                 :wv (opt (n "attn_v.weight") #'q8) :wo (opt (n "attn_output.weight") #'q8)
+                                 :wqkv (opt (n "attn_qkv.weight") #'q8) :wz (opt (n "attn_gate.weight") #'q8)
+                                 :walpha (opt (n "ssm_alpha.weight") #'q8) :wbeta (opt (n "ssm_beta.weight") #'q8)
+                                 :ssm-a (opt (n "ssm_a") #'f32) :ssm-dt (opt (n "ssm_dt.bias") #'f32)
+                                 :conv1d (opt (n "ssm_conv1d.weight") #'f32)
+                                 :ssm-norm (opt (n "ssm_norm.weight") #'f32)
+                                 :ssm-out (opt (n "ssm_out.weight") #'q8)
                                  :bq (opt (n "attn_q.bias") #'f32)
                                  :bk (opt (n "attn_k.bias") #'f32)
                                  :bv (opt (n "attn_v.bias") #'f32)
                                  :q-norm (opt (n "attn_q_norm.weight") #'f32)
                                  :k-norm (opt (n "attn_k_norm.weight") #'f32)
-                                 :ffn-norm (f32 (n "ffn_norm.weight"))
+                                 :ffn-norm (or (opt (n "ffn_norm.weight") #'f32)
+                                               (f32 (n "post_attention_norm.weight")))
                                  :wgate (q8 (n "ffn_gate.weight"))
                                  :wup (q8 (n "ffn_up.weight"))
                                  :wdown (q8 (n "ffn_down.weight")))))
@@ -107,8 +134,11 @@
          (mapcar #'matrix-act-kind
                  (list* (model-output m)
                         (loop for l across (model-layers m)
-                              append (list (layer-wq l) (layer-wk l) (layer-wv l) (layer-wo l)
-                                           (layer-wgate l) (layer-wup l) (layer-wdown l)))))))
+                              append (remove nil
+                                             (list (layer-wq l) (layer-wk l) (layer-wv l) (layer-wo l)
+                                                   (layer-wqkv l) (layer-wz l) (layer-walpha l) (layer-wbeta l)
+                                                   (layer-ssm-out l)
+                                                   (layer-wgate l) (layer-wup l) (layer-wdown l))))))))
   m)
 
 ;;; --- per-sequence state -----------------------------------------------------
@@ -131,8 +161,12 @@
      :model model :n-ctx n-ctx
      ;; static on modus: a 4B model's cache at 4096 tokens is 1.2 GB, more
      ;; than its copying heap's semispace; FREE-CONTEXT gives it back
-     :k-cache (coerce (loop repeat (model-n-layer model) collect (f32vec (* n-ctx kv) :static t)) 'simple-vector)
-     :v-cache (coerce (loop repeat (model-n-layer model) collect (f32vec (* n-ctx kv) :static t)) 'simple-vector)
+     :k-cache (coerce (loop for l across (model-layers model)
+                            collect (f32vec (if (eq (layer-kind l) :full) (* n-ctx kv) 0) :static t))
+                      'simple-vector)
+     :v-cache (coerce (loop for l across (model-layers model)
+                            collect (f32vec (if (eq (layer-kind l) :full) (* n-ctx kv) 0) :static t))
+                      'simple-vector)
      :x (f32vec d) :h (f32vec d) :q (f32vec qd) :k (f32vec kv) :v (f32vec kv)
      :att (f32vec qd) :ffn-a (f32vec f) :ffn-b (f32vec f)
      :xq (make-qact (max d qd) (model-act-kinds model)) :hq (make-qact f (model-act-kinds model))
@@ -327,6 +361,8 @@
 
 (defun forward (ctx token &key (logits t))
   "Run TOKEN at the next position; the logits (if LOGITS) land in the context."
+  (when (model-recurrent-p (context-model ctx))
+    (return-from forward (forward-qwen35 ctx token :logits logits)))
   (let* ((m (context-model ctx))
          (pool (model-pool m))
          (pos (context-pos ctx))
@@ -398,7 +434,8 @@
   "Release CTX's KV cache now (on modus it is outside the heap, so the
    collector would never reclaim it); CTX is unusable afterwards.  Harmless
    to call twice, and on SBCL it only drops the references."
-  #+modus (dolist (caches (list (context-k-cache ctx) (context-v-cache ctx)))
+  #+modus (dolist (caches (list (context-k-cache ctx) (context-v-cache ctx)
+                                (let ((st (getf (context-plist ctx) :q35))) (and st (q35-ssm st)))))
             (when caches (loop for c across caches do (modus:free-static-vector c))))
   (setf (context-k-cache ctx) nil (context-v-cache ctx) nil)
   ctx)
