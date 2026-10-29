@@ -325,6 +325,99 @@
                               (kmat-row-dot w r xv (+ xo (* tk xstride))))))))
   out)
 
+;;; --- a batch of tokens against Q6_K, four at a time (SMMLA) ------------------------
+
+;;; %Q6K-DOT-2X4 takes the activations of four tokens (a "quad") interleaved
+;;; as SMMLA reads them: for each 16-weight group, in the order the kernel
+;;; rebuilds them (per half, for x = 0..3, the low-nibble group then the high
+;;; one), 64 bytes: [t0 0-7 | t1 0-7 | t0 8-15 | t1 8-15], then t2 and t3 the
+;;; same.  Their scales go beside: per super-block [y0 y1 y0 y1 y2 y3 y2 y3].
+;;; A missing token (past N) is zeros.
+
+(defun quad-group-order ()
+  (loop for c below 2 append (loop for x below 4 append (list (+ (* c 8) x) (+ (* c 8) 4 x)))))
+
+#+(and sbcl arm64)
+(defun pack-quads! (xv n cols quads qd)
+  "Lay out tokens 0..N-1 of XV (token t at t*COLS) for %Q6K-DOT-2X4."
+  (declare (type q8kvec xv) (type fixnum n cols) (type u8vec quads) (type f32vec qd)
+           (optimize speed (safety 0)))
+  (let* ((nb (floor cols +qk-k+)) (nq (ceiling n 4))
+         (order (coerce (quad-group-order) '(simple-array fixnum (16))))
+         (qs (q8kvec-qs xv)) (yd (q8kvec-d xv)))
+    (declare (type fixnum nb nq) (type (simple-array fixnum (16)) order))
+    (fill quads 0 :end (* nq 4 cols))
+    (fill qd 0f0 :end (* nq nb 8))
+    (sb-sys:with-pinned-objects (qs quads)
+      (let ((src (sb-sys:vector-sap qs)) (dst (sb-sys:vector-sap quads)))
+        (dotimes (q nq)
+          (dotimes (b nb)
+            (dotimes (gi 16)
+              (let ((g (aref order gi))
+                    (o (+ (* q 4 cols) (* b 1024) (* gi 64))))
+                (declare (type fixnum g o))
+                (dotimes (p 2)
+                  (dotimes (half 2)
+                    (dotimes (j 2)
+                      (let ((tk (+ (* q 4) (* p 2) j)))
+                        (when (< tk n)
+                          (setf (sb-sys:sap-ref-64 dst (+ o (* p 32) (* half 16) (* j 8)))
+                                (sb-sys:sap-ref-64 src (+ (* tk cols) (* b 256) (* g 16) (* half 8)))))))))))
+            (dotimes (k 8)
+              (let ((tk (+ (* q 4) (* 2 (floor k 4)) (mod k 2))))
+                (when (< tk n)
+                  (setf (aref qd (+ (* (+ (* q nb) b) 8) k))
+                        (aref yd (+ (floor (* tk cols) +qk-k+) b))))))))))
+    nil))
+
+#+(and sbcl arm64)
+(defun kmat-quads-dot-neon! (w quads qd n out start end rows)
+  "OUT[t*ROWS + r] for Q6_K rows START..END-1 (an even count from an even
+   START) against the N tokens PACK-QUADS! laid out: two rows by four tokens
+   a kernel call, a tile of rows past every quad before the next tile."
+  (declare (type kmat w) (type u8vec quads) (type f32vec qd out)
+           (type fixnum n start end rows) (optimize speed (safety 0)))
+  (let* ((nb (kmat-nb w)) (cols (* nb +qk-k+)) (nq (ceiling n 4))
+         (qstride (* nb 192)) (sstride (* nb 16)) (dstride (* nb 4))
+         (tile (max 2 (logandc2 (kmat-tile-rows w) 1)))
+         (qs (kmat-qs w)) (sc (kmat-sc w)) (dd (kmat-dd w))
+         (desc (make-array 9 :element-type '(unsigned-byte 64)))
+         (res (make-array 8 :element-type 'single-float)))
+    (declare (type fixnum nb cols nq qstride sstride dstride tile)
+             (type (simple-array (unsigned-byte 64) (9)) desc)
+             (type (simple-array single-float (8)) res))
+    (sb-sys:with-pinned-objects (qs sc dd quads qd desc res)
+      (let ((q0 (sb-sys:sap-int (sb-sys:vector-sap qs)))
+            (s0 (sb-sys:sap-int (sb-sys:vector-sap sc)))
+            (d0 (sb-sys:sap-int (sb-sys:vector-sap dd)))
+            (x0 (sb-sys:sap-int (sb-sys:vector-sap quads)))
+            (y0 (sb-sys:sap-int (sb-sys:vector-sap qd)))
+            (dsap (sb-sys:vector-sap desc)))
+        (declare (type (unsigned-byte 64) q0 s0 d0 x0 y0))
+        (setf (aref desc 8) (sb-sys:sap-int (sb-sys:vector-sap res)))
+        (loop for t0 of-type fixnum from start below end by tile
+              do (let ((t1 (min end (+ t0 tile))))
+                   (declare (type fixnum t1))
+                   (dotimes (q nq)
+                     (setf (aref desc 6) (+ x0 (* q 4 cols))
+                           (aref desc 7) (+ y0 (* q nb 32)))
+                     (loop for r of-type fixnum from t0 below t1 by 2
+                           do (setf (aref desc 0) (+ q0 (* r qstride))
+                                    (aref desc 1) (+ q0 (* (1+ r) qstride))
+                                    (aref desc 2) (+ s0 (* r sstride))
+                                    (aref desc 3) (+ s0 (* (1+ r) sstride))
+                                    (aref desc 4) (+ d0 (* r dstride))
+                                    (aref desc 5) (+ d0 (* (1+ r) dstride)))
+                              (%q6k-dot-2x4 dsap nb)
+                              ;; RES: per pair [A.t0 A.t1 B.t0 B.t1]
+                              (dotimes (j 4)
+                                (let ((tk (+ (* q 4) j)) (k (+ (* 4 (floor j 2)) (mod j 2))))
+                                  (declare (type fixnum tk k))
+                                  (when (< tk n)
+                                    (setf (aref out (+ (* tk rows) r)) (aref res k)
+                                          (aref out (+ (* tk rows) r 1)) (aref res (+ k 2))))))))))))
+    out))
+
 (defun kmat-row-dot (w row xv xo)
   "Row ROW of W against XV at XO: the NEON kernel when it can run (see
    NEON-ACTIVE-P), the portable one -- which defines the bits -- otherwise."

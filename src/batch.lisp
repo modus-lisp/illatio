@@ -27,7 +27,10 @@
   (cols 0 :type fixnum)
   (qv nil)                              ; a Q8VEC, when the model takes Q8_0
   (qk nil)                              ; a Q8KVEC, when it takes Q8_K
-  (words (make-array 0 :element-type '(signed-byte 64)) :type i64vec))
+  (words (make-array 0 :element-type '(signed-byte 64)) :type i64vec)
+  (quads nil)                           ; QK packed by PACK-QUADS!, once a batch,
+  (quads-d nil)                         ; when a Q6_K matrix wants them
+  (quads-ok nil))
 
 (defun q8batch-quants (xb) (q8vec-quants (q8batch-qv xb)))
 (defun q8batch-scales (xb) (q8vec-scales (q8batch-qv xb)))
@@ -50,7 +53,7 @@
          (nb (floor cols 32))
          (qv (q8batch-qv out)))
     (declare (type fixnum cols nb))
-    (setf (q8batch-n out) n)
+    (setf (q8batch-n out) n (q8batch-quads-ok out) nil)
     (when (q8batch-qk out)
       (dotimes (tk n)
         (quantize-q8k! xs (q8batch-qk out) (* tk cols) cols (* tk cols))))
@@ -71,6 +74,28 @@
                     (the (signed-byte 64) (+ (aref words (+ base j))
                                              (the (signed-byte 50) (ash (i8-ref q (+ qo j)) shift))))))))))
     out))
+
+(defun q6k-quads-p ()
+  "Whether a Q6_K multiply takes four tokens a call (SMMLA)."
+  #+(and sbcl arm64) (neon-mmla-p)
+  #-(and sbcl arm64) nil)
+
+(defun batch-quads (xb)
+  "XB's Q8_K activations packed for the four-token Q6_K kernel, made the
+   first time a batch asks."
+  (let* ((cols (q8batch-cols xb)) (n (q8batch-n xb)) (nq (ceiling n 4))
+         (bytes (* nq 4 cols)) (floats (* nq (floor cols +qk-k+) 8)))
+    (unless (and (q8batch-quads xb) (<= bytes (length (q8batch-quads xb))))
+      (setf (q8batch-quads xb) (make-u8vec bytes)
+            (q8batch-quads-d xb) (f32vec floats)))
+    (unless (q8batch-quads-ok xb)
+      #+(and sbcl arm64) (pack-quads! (q8batch-qk xb) n cols (q8batch-quads xb) (q8batch-quads-d xb))
+      (setf (q8batch-quads-ok xb) t))
+    (q8batch-quads xb)))
+
+(defun kmat-quads-dot! (w quads qd n out start end rows)
+  #+(and sbcl arm64) (kmat-quads-dot-neon! w quads qd n out start end rows)
+  #-(and sbcl arm64) (error "no four-token kernel here ~S" (list w quads qd n out start end rows)))
 
 (defmacro sext21 (v)
   "The low 21 bits of V as a signed number: offset by 2^20, mask, unoffset."
@@ -96,9 +121,17 @@
   (when (kmat-p w)
     (let ((rows (kmat-rows w)) (cols (kmat-cols w)) (n (q8batch-n xb)) (qk (q8batch-qk xb)))
       (declare (type fixnum rows cols n))
-      (pool-run pool (lambda (i c)
-                       (multiple-value-bind (s e) (share rows i c)
-                         (kmat-range-dot! w qk 0 out s e 0 n cols rows))))
+      (if (and (>= n 2) (eq (kmat-type w) :q6_k) (q6k-quads-p))
+          (let ((quads (batch-quads xb)) (qd (q8batch-quads-d xb)) (pairs (floor rows 2)))
+            ;; two rows by four tokens a kernel call; an odd last row on its own
+            (pool-run pool (lambda (i c)
+                             (multiple-value-bind (s e) (share pairs i c)
+                               (kmat-quads-dot! w quads qd n out (* 2 s) (* 2 e) rows))))
+            (when (oddp rows)
+              (kmat-range-dot! w qk 0 out (1- rows) rows 0 n cols rows)))
+          (pool-run pool (lambda (i c)
+                           (multiple-value-bind (s e) (share rows i c)
+                             (kmat-range-dot! w qk 0 out s e 0 n cols rows)))))
       (when bias
         (let ((bias bias))
           (declare (type f32vec bias))

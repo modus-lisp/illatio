@@ -62,6 +62,13 @@
 ;;;   shl  vD.16b, vN.16b, #4     4f0c5400 | N<<5 | D
 ;;;   movi vD.16b, #15 / #3       4f00e5e0 / 4f00e460 | D
 ;;;   ldr  xT, [xN, #8k]          f9400000 | k<<10 | N<<5 | T
+;;; and for the batched Q6_K kernel (FEAT_I8MM):
+;;;   smmla vD.4s, vN.16b, vM.16b 4e80a400 | M<<16 | N<<5 | D
+;;;   zip1 / zip2 vD.2d           4ec03800 / 4ec07800 | M<<16 | N<<5 | D
+;;;   mov  vD.d[1], vN.d[1]       6e184400 | N<<5 | D
+;;;   sub  vD.16b, vN.16b, vM.16b 6e208400 | M<<16 | N<<5 | D
+;;;   movi vD.16b, #32            4f01e400 | D
+;;;   str  qT, [xN, #16]          3d800400 | N<<5 | T
 ;;;   b.ne  -K instructions       54000001 | (-K mod 2^19)<<5
 ;;;
 ;;; SDOT is FEAT_DotProd: every Apple M-series and the Pi 5's A76 have it, the
@@ -91,6 +98,12 @@
 
 (sb-c:defknown %q6k-dot (sb-sys:system-area-pointer (unsigned-byte 32))
     single-float (sb-c:flushable))
+
+;;; Two Q6_K rows against four tokens (two interleaved pairs, see PACK-QUADS!):
+;;; DESC holds both rows' quants, scales and d, the packed activations and
+;;; their scales, and where the eight results go.
+(sb-c:defknown %q6k-dot-2x4 (sb-sys:system-area-pointer (unsigned-byte 32))
+    (values) ())
 
 (sb-c:defknown %f32-axpy4
     (sb-sys:system-area-pointer sb-sys:system-area-pointer single-float (unsigned-byte 32))
@@ -406,6 +419,111 @@
                 (illatio::a64 #x1e200800 acc dq acc)
                 (illatio::a64 #x1e202800 sum sum acc))))))))
 
+;;; Q6_K, two rows (A, B) against four tokens, for a batch: each 16-weight
+;;; group is rebuilt once per row and used for all four tokens.  The quants
+;;; are rebuilt as q-32 (signed), so no activation sums are needed: the
+;;; group's integer dot is the same integer the one-row kernel gets by
+;;; subtracting 32 times them.  ZIP puts A's and B's halves side by side, and
+;;; SMMLA multiplies that 2x8 by a token pair's 2x8 (PACK-QUADS! lays them
+;;; out so), giving [A.t0 A.t1 B.t0 B.t1] for the group.  Each row's scale
+;;; multiplies its two lanes (an accumulator for A's scales, one for B's, the
+;;; halves rejoined at the end).  Per super-block and (row, token) it is then
+;;; the one-row kernel's float arithmetic: SUM += (d*y.d) * float(isum).
+(define-vop (illatio::%q6k-dot-2x4)
+  (:translate illatio::%q6k-dot-2x4)
+  (:policy :fast-safe)
+  (:args (desc :scs (sap-reg) :target pd) (nb :scs (unsigned-reg) :target count))
+  (:arg-types system-area-pointer unsigned-num)
+  (:temporary (:sc unsigned-reg) pqa) (:temporary (:sc unsigned-reg) pqb)
+  (:temporary (:sc unsigned-reg) psa) (:temporary (:sc unsigned-reg) psb)
+  (:temporary (:sc unsigned-reg) pda) (:temporary (:sc unsigned-reg) pdb)
+  (:temporary (:sc unsigned-reg) px) (:temporary (:sc unsigned-reg) py)
+  (:temporary (:sc unsigned-reg :from (:argument 0)) pd)
+  (:temporary (:sc unsigned-reg :from (:argument 1)) count)
+  (:temporary (:sc double-reg) m4) (:temporary (:sc double-reg) m3)
+  (:temporary (:sc double-reg) c32)
+  (:temporary (:sc double-reg) ha0) (:temporary (:sc double-reg) ha1)
+  (:temporary (:sc double-reg) hb0) (:temporary (:sc double-reg) hb1)
+  (:temporary (:sc double-reg) qa) (:temporary (:sc double-reg) qb)
+  (:temporary (:sc double-reg) sba) (:temporary (:sc double-reg) sbb)
+  (:temporary (:sc double-reg) saa) (:temporary (:sc double-reg) sab)
+  (:temporary (:sc double-reg) sbaa) (:temporary (:sc double-reg) sbab)
+  (:temporary (:sc double-reg) a0a) (:temporary (:sc double-reg) a0b)
+  (:temporary (:sc double-reg) a1a) (:temporary (:sc double-reg) a1b)
+  (:temporary (:sc double-reg) s0) (:temporary (:sc double-reg) s1)
+  (:temporary (:sc double-reg) va) (:temporary (:sc double-reg) vb)
+  (:temporary (:sc double-reg) hb)
+  (:temporary (:sc double-reg) w1) (:temporary (:sc double-reg) w2)
+  (:temporary (:sc double-reg) x1) (:temporary (:sc double-reg) x2)
+  (:temporary (:sc double-reg) dd)
+  (:generator 300
+    (move pd desc) (move count nb)
+    (illatio::with-a64 (pqa pqb psa psb pda pdb px py pd count m4 m3 c32 ha0 ha1 hb0 hb1 qa qb
+                        sba sbb saa sab sbaa sbab a0a a0b a1a a1b s0 s1 va vb hb w1 w2 x1 x2 dd)
+      (loop for r in (list pqa pqb psa psb pda pdb px py) for k from 0
+            do (illatio::word (illatio::a64 (logior #xf9400000 (ash k 10)) r pd)))
+      (illatio::word (illatio::a64 #x6f00e400 s0))
+      (illatio::word (illatio::a64 #x6f00e400 s1))
+      (illatio::word (illatio::a64 #x4f00e5e0 m4))                  ; 0x0f
+      (illatio::word (illatio::a64 #x4f00e460 m3))                  ; 0x03
+      (illatio::word (illatio::a64 #x4f01e400 c32))                 ; 32
+      (flet ((rebuild (v q h shift hi)
+               ;; V = (low or high nibble of Q) | (2 bits of H at SHIFT) << 4, minus 32
+               (append
+                (if (zerop shift)
+                    (list (illatio::a64 #x4e201c00 hb h m3))
+                    (list (illatio::a64 (ecase shift (2 #x6f0e0400) (4 #x6f0c0400) (6 #x6f0a0400)) hb h)
+                          (illatio::a64 #x4e201c00 hb hb m3)))
+                (list (illatio::a64 #x4f0c5400 hb hb)
+                      (if hi (illatio::a64 #x6f0c0400 v q) (illatio::a64 #x4e201c00 v q m4))
+                      (illatio::a64 #x4ea01c00 v v hb)
+                      (illatio::a64 #x6e208400 v v c32)))))
+        (illatio::loop-while-count
+         count
+         (append
+          (list (illatio::a64 #x3cc10400 sba psa)                    ; 16 signed scales, each row
+                (illatio::a64 #x3cc10400 sbb psb)
+                (illatio::a64 #x6f00e400 a0a) (illatio::a64 #x6f00e400 a0b)
+                (illatio::a64 #x6f00e400 a1a) (illatio::a64 #x6f00e400 a1b))
+          (loop for c below 2
+                append (append
+                        ;; this half's scales as int32: groups 0-3 (low nibbles), 4-7 (high)
+                        (list (illatio::a64 (if (zerop c) #x0f08a400 #x4f08a400) va sba)
+                              (illatio::a64 #x0f10a400 saa va) (illatio::a64 #x4f10a400 sab va)
+                              (illatio::a64 (if (zerop c) #x0f08a400 #x4f08a400) vb sbb)
+                              (illatio::a64 #x0f10a400 sbaa vb) (illatio::a64 #x4f10a400 sbab vb)
+                              (illatio::a64-ldp-q ha0 ha1 pqa) (illatio::a64-ldp-q hb0 hb1 pqb))
+                        (loop for x below 4
+                              append (append
+                                      (list (illatio::a64 #x3cc10400 qa pqa) (illatio::a64 #x3cc10400 qb pqb))
+                                      (loop for hi in '(nil t)
+                                            for shift = (+ (* 2 (floor x 2)) (if hi 4 0))
+                                            append (append
+                                                    (rebuild va qa (if (evenp x) ha0 ha1) shift hi)
+                                                    (rebuild vb qb (if (evenp x) hb0 hb1) shift hi)
+                                                    (list (illatio::a64 #x4ec03800 w1 va vb)
+                                                          (illatio::a64 #x4ec07800 w2 va vb))
+                                                    (loop for (acca accb) in (list (list a0a a0b) (list a1a a1b))
+                                                          append (list (illatio::a64-ldp-q x1 x2 px)
+                                                                       (illatio::a64 #x6f00e400 dd)
+                                                                       (illatio::a64 #x4e80a400 dd w1 x1)
+                                                                       (illatio::a64 #x4e80a400 dd w2 x2)
+                                                                       (illatio::a64-mla-lane acca dd (if hi sab saa) x)
+                                                                       (illatio::a64-mla-lane accb dd (if hi sbab sbaa) x)))))))))
+          ;; the super-block's floats: [dA dA dB dB] * [y.d of the pair], then per lane
+          (list (illatio::a64 #xbc404400 va pda) (illatio::a64 #xbc404400 vb pdb)
+                (illatio::a64 #x4e040400 va va) (illatio::a64 #x4e040400 vb vb)
+                (illatio::a64 #x4ec03800 hb va vb)
+                (illatio::a64-ldp-q x1 x2 py)
+                (illatio::a64 #x6e20dc00 w1 hb x1) (illatio::a64 #x6e20dc00 w2 hb x2)
+                (illatio::a64 #x6e184400 a0a a0b) (illatio::a64 #x6e184400 a1a a1b)
+                (illatio::a64 #x4e21d800 a0a a0a) (illatio::a64 #x4e21d800 a1a a1a)
+                (illatio::a64 #x6e20dc00 a0a w1 a0a) (illatio::a64 #x6e20dc00 a1a w2 a1a)
+                (illatio::a64 #x4e20d400 s0 s0 a0a) (illatio::a64 #x4e20d400 s1 s1 a1a)))))
+      (illatio::word (illatio::a64 (logior #xf9400000 (ash 8 10)) pqa pd)) ; the results' address
+      (illatio::word (illatio::a64 #x3d800000 s0 pqa))
+      (illatio::word (illatio::a64 #x3d800400 s1 pqa)))))
+
 (define-vop (illatio::%f32-axpy4)
   (:translate illatio::%f32-axpy4)
   (:policy :fast-safe)
@@ -452,3 +570,25 @@
   (if (eq *neon-dot* :unknown)
       (setf *neon-dot* (and (cpu-has-dotprod-p) t))
       *neon-dot*))
+
+(defvar *neon-mmla* :unknown
+  "T when SMMLA (FEAT_I8MM: Apple M2 and later) can run here; asked on first use.")
+
+(defun neon-mmla-p ()
+  "Whether the batched Q6_K kernel can run: SDOT's kernels are on, and SMMLA is here."
+  (and (neon-dot-p)
+       (if (eq *neon-mmla* :unknown)
+           (setf *neon-mmla*
+                 (and (or (ignore-errors
+                           (string= "1" (string-trim '(#\Newline #\Space)
+                                                     (with-output-to-string (o)
+                                                       (sb-ext:run-program "/usr/sbin/sysctl"
+                                                                           '("-n" "hw.optional.arm.FEAT_I8MM")
+                                                                           :output o :error nil)))))
+                          (ignore-errors
+                           (with-open-file (s "/proc/cpuinfo")
+                             (loop for line = (read-line s nil) while line
+                                   thereis (and (eql 0 (search "Features" line))
+                                                (search " i8mm" line))))))
+                      t))
+           *neon-mmla*)))
