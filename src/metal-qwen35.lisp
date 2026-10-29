@@ -114,9 +114,15 @@
     (if (= n 1)
         (dispatch gpu e "mv_q6k" (list (gmat-cols w) (gmat-rows w) (gmat-row-bytes w) 0 0)
                   (list wb x y) (list (ceiling (gmat-rows w) 4) 1 1) 64)
-        (dispatch gpu e "mm_q6k" (list (gmat-cols w) (gmat-rows w) n (gmat-row-bytes w))
-                  (list wb x y) (list (ceiling n 32) (ceiling (gmat-rows w) 64) 1) 128
-                  :shared 8192))))
+        (if *mm-64*
+            (dispatch gpu e "mm_q6k_64" (list (gmat-cols w) (gmat-rows w) n (gmat-row-bytes w))
+                      (list wb x y) (list (ceiling n 64) (ceiling (gmat-rows w) 64) 1) 128
+                      :shared 16384)
+            (dispatch gpu e "mm_q6k" (list (gmat-cols w) (gmat-rows w) n (gmat-row-bytes w))
+                      (list wb x y) (list (ceiling n 32) (ceiling (gmat-rows w) 64) 1) 128
+                      :shared 8192)))))
+
+(defvar *mm-64* t "Whether a prefill's products take 64-token tiles (MM_Q6K_64).")
 
 (defun gpu-forward (ctx token logits)
   "FORWARD on the GPU: TOKEN at the next position."

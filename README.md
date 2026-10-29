@@ -60,7 +60,7 @@ the same 512-token prefill, except its 1-thread one, on 96):
 | decode, 10 threads | 9.3 | 6.9 |
 | prefill, 10 threads | 35.5 | 22.8 |
 | decode, Metal GPU | 11.1 | 10.2 |
-| prefill, Metal GPU | 110 | 121 |
+| prefill, Metal GPU | 123 | 121 |
 
 On the GPU (`load-model-gpu`; `-ngl 99` for llama.cpp) it passes the same
 llama.cpp vectors at the same noise floor as the CPU.
@@ -177,8 +177,10 @@ folds them straight into its stream state.
   handed to Metal as one buffer, so the GPU reads the weights in their own
   blocks where they lie: no repacked copy, and a 22 GB model loads in
   0.3 s.  A pass (a token, or up to 512 of a prompt) is one command buffer.
-  The Q6_K kernels follow ggml's (its simdgroup-matrix `mul_mm`, which is
-  most of a prefill); the rest are written from the Lisp ops, with the
+  The Q6_K kernels follow ggml's simdgroup-matrix ones, the prefill's
+  product with 64-token tiles where ggml's are 32 (each weight rebuilt half
+  as often): about 7.3 TFLOPS, near this GPU's peak.  The rest are written
+  from the Lisp ops, with the
   delta rule's state k-major as on the CPU and each thread's column of it
   kept in registers across a chunk.
 - **The forward pass** mirrors llama.cpp's graph op for op: RMSNorm with its
@@ -241,9 +243,8 @@ inspect/collect-vectors.py http://localhost:18931 inspect/vectors/qwen2.5-0.5b-q
 ## Next
 
 - **Speed.**
-  - The GPU's Q6_K matrix product is ggml's kernel and ~92% of a GPU
-    prefill; larger token tiles, or weights dequantized once per chunk,
-    are where more would come from.
+  - A GPU prefill is ~90% its Q6_K product, which runs near the GPU's
+    peak; attention, written plainly, is what grows with prompt length.
   - Q4_K prefill through the same rebuild-then-SMMLA path as Q6_K (the
     4B Q4_K_M's prefill is still below llama.cpp's), and Q8_0's.
   - Decode is now near what one core can pull from memory.

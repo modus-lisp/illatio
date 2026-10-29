@@ -287,6 +287,113 @@ kernel void mm_q6k(constant mm_args & a [[buffer(0)]],
     }
 }
 
+// MM_Q6K with 64-token tiles: 64 rows by 64 tokens a threadgroup, each of its
+// four simdgroups 32 by 32 (sixteen 8x8 accumulators).  A weight is rebuilt
+// and a weight tile read half as often per token as with 32-token tiles.
+kernel void mm_q6k_64(constant mm_args & a [[buffer(0)]],
+                      device const char  * src0 [[buffer(1)]],
+                      device const float * src1 [[buffer(2)]],
+                      device       float * dst  [[buffer(3)]],
+                      threadgroup  char  * shmem [[threadgroup(0)]],
+                      uint3  tgpig [[threadgroup_position_in_grid]],
+                      ushort tiitg [[thread_index_in_threadgroup]],
+                      ushort sgitg [[simdgroup_index_in_threadgroup]]) {
+    threadgroup half * sa = (threadgroup half *)(shmem);
+    threadgroup half * sb = (threadgroup half *)(shmem + 4096);
+
+    constexpr int NR0 = 64;
+    constexpr int NR1 = 64;
+    constexpr int NK  = 32;
+    constexpr int NL0 = NK/16;
+    constexpr int NL1 = NK/8;
+    constexpr short nl = 16;
+
+    const int r0 = tgpig.y*NR0;
+    const int r1 = tgpig.x*NR1;
+
+    const short nr0 = ((int)a.nrows - r0 < NR0) ? ((int)a.nrows - r0) : NR0;
+    const short nr1 = ((int)a.ntok  - r1 < NR1) ? ((int)a.ntok  - r1) : NR1;
+
+    const short lr0 = ((short)tiitg/NL0) < nr0 ? ((short)tiitg/NL0) : nr0 - 1;
+    // each thread stages two token rows: lr1 and lr1 + 32
+    const short t0 = (short)tiitg/NL1, t1 = t0 + 32;
+    const short lr1a = t0 < nr1 ? t0 : nr1 - 1;
+    const short lr1b = t1 < nr1 ? t1 : nr1 - 1;
+
+    const short il0 = (tiitg % NL0);
+    short il = il0;
+
+    device const block_q6_K * x = (device const block_q6_K *)(src0 + (ulong)a.row_bytes*(r0 + lr0)) + il0/nl;
+
+    const short iy = 8*(tiitg % NL1);
+    device const float * ya = src1 + (ulong)a.ncols*(r1 + lr1a) + iy;
+    device const float * yb = src1 + (ulong)a.ncols*(r1 + lr1b) + iy;
+
+    simdgroup_half8x8 ma[4];
+    simdgroup_half8x8 mb[4];
+    simdgroup_float8x8 mc[16];
+    for (short i = 0; i < 16; i++) mc[i] = make_filled_simdgroup_matrix<float, 8>(0.f);
+
+    for (uint loop_k = 0; loop_k < a.ncols; loop_k += NK) {
+        half4x4 temp_a;
+        dequantize_q6_K(x, il, temp_a);
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        for (short i = 0; i < 16; i++) {
+            const short sx = 2*il0 + i/8;
+            const short sy = (tiitg/NL0)/8;
+            const short lx = (tiitg/NL0)%8;
+            const short ly = i%8;
+            const short ib = 8*sx + sy;
+            *(sa + 64*ib + 8*ly + lx) = temp_a[i/4][i%4];
+        }
+
+        {
+            const short sx = (tiitg%NL1);
+            *(threadgroup half2x4 *)(sb + 64*(8*sx + t0/8) + 8*(t0%8)) = (half2x4)(*((device float2x4 *) ya));
+            *(threadgroup half2x4 *)(sb + 64*(8*sx + t1/8) + 8*(t1%8)) = (half2x4)(*((device float2x4 *) yb));
+        }
+
+        il = (il + 2 < nl) ? il + 2 : il % 2;
+        x  = (il < 2) ? x + (2 + nl - 1)/nl : x;
+        ya += NK; yb += NK;
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        threadgroup const half * lsma = (sa + 4*64*(sgitg%2));
+        threadgroup const half * lsmb = (sb + 4*64*(sgitg/2));
+
+        for (short ik = 0; ik < NK/8; ik++) {
+            simdgroup_barrier(mem_flags::mem_none);
+            for (short i = 0; i < 4; i++) simdgroup_load(ma[i], lsma + 64*i, 8, 0, false);
+            simdgroup_barrier(mem_flags::mem_none);
+            for (short i = 0; i < 4; i++) simdgroup_load(mb[i], lsmb + 64*i, 8, 0, false);
+            simdgroup_barrier(mem_flags::mem_none);
+            for (short i = 0; i < 16; i++) simdgroup_multiply_accumulate(mc[i], mb[i/4], ma[i%4], mc[i]);
+            lsma += 8*64;
+            lsmb += 8*64;
+        }
+    }
+
+    if (r0 + NR0 <= (int)a.nrows && r1 + NR1 <= (int)a.ntok) {
+        device float * C = dst + (r0 + 32*(sgitg & 1)) + (ulong)(r1 + 32*(sgitg >> 1)) * a.nrows;
+        for (short i = 0; i < 16; i++) simdgroup_store(mc[i], C + 8*(i%4) + 8*a.nrows*(i/4), a.nrows, 0, false);
+    } else {
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        threadgroup float * temp_str = ((threadgroup float *) shmem) + 32*(sgitg&1) + (32*(sgitg >> 1))*NR0;
+        for (short i = 0; i < 16; i++) simdgroup_store(mc[i], temp_str + 8*(i%4) + 8*NR0*(i/4), NR0, 0, false);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (sgitg == 0) {
+            for (int j = tiitg; j < nr1; j += 32) {
+                device float * D = dst + r0 + (ulong)(r1 + j)*a.nrows;
+                threadgroup float * C = ((threadgroup float *) shmem) + j*NR0;
+                for (int i = 0; i < nr0; i++) D[i] = C[i];
+            }
+        }
+    }
+}
+
 // --- norms and elementwise ops ---------------------------------------------------
 
 struct norm_args { uint n; float eps; uint w_stride; };
