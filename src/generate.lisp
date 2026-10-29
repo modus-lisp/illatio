@@ -108,7 +108,8 @@
   (let ((v (model-vocab model)))
     (remove-duplicates
      (remove nil (list* (vocab-eos v) (vocab-eot v)
-                        (loop for name in '("<|im_end|>" "<|endoftext|>" "<|eot_id|>" "<|end_of_text|>")
+                        (loop for name in '("<|im_end|>" "<|endoftext|>" "<|eot_id|>" "<|end_of_text|>"
+                                            "<｜end▁of▁sentence｜>")
                               collect (gethash name (vocab-ids v))))))))
 
 (defun generate (ctx prompt &key (max-tokens 256) (sampler (make-sampler :temperature 0))

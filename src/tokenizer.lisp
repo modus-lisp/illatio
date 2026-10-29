@@ -206,6 +206,64 @@
                  (setf pos end))))
     (nreverse words)))
 
+;;; DeepSeek V4 Flash declares tokenizer.ggml.pre = "joyai-llm".  This is
+;;; ds4.c's split for it (bpe_tokenize_text), rule for rule: the JoyAI
+;;; pattern
+;;;   \p{N}{1,3} | [CJK/kana]+ | [P/S][A-Za-z]+ | [^\r\n\p{L}\p{P}\p{S}]?[\p{L}\p{M}]+
+;;;   |  ?[\p{P}\p{S}]+[\r\n]* | \s*[\r\n]+ | \s+(?!\S) | \s+
+;;; with ds4's choices: ASCII punctuation is the P/S class, any non-ASCII
+;;; character is letter-like (CJK and kana runs are taken first), a
+;;; punctuation run keeps its trailing newlines, and in a run of spaces
+;;; before a word the last space goes with the word.
+
+(defun joyai-punctp (c)
+  (let ((k (char-code c)))
+    (or (<= 33 k 47) (<= 58 k 64) (<= 91 k 96) (<= 123 k 126))))
+(defun joyai-alphap (c) (let ((k (char-code c))) (or (<= 65 k 90) (<= 97 k 122))))
+(defun joyai-digitp (c) (char<= #\0 c #\9))
+(defun joyai-letterp (c) (or (joyai-alphap c) (>= (char-code c) 128)))
+(defun joyai-cjkp (c)
+  (let ((k (char-code c))) (or (<= #x4e00 k #x9fa5) (<= #x3040 k #x309f) (<= #x30a0 k #x30ff))))
+(defun joyai-spacep (c) (member (char-code c) '(32 9 10 13 11 12)))
+(defun joyai-newlinep (c) (member c '(#\Newline #\Return)))
+
+(defun split-words-joyai (text)
+  (let ((len (length text)) (pos 0) (words '()))
+    (flet ((at (p) (and (< p len) (char text p))))
+      (loop while (< pos len)
+            do (let ((start pos) (c (char text pos)))
+                 (flet ((letters () (loop while (and (< pos len) (joyai-letterp (char text pos))) do (incf pos)))
+                        (punct-run () (loop while (and (< pos len) (joyai-punctp (char text pos))) do (incf pos))
+                                      (loop while (and (< pos len) (joyai-newlinep (char text pos))) do (incf pos))))
+                   (cond ((joyai-digitp c)
+                          (loop repeat 3 while (and (< pos len) (joyai-digitp (char text pos))) do (incf pos)))
+                         ((joyai-cjkp c)
+                          (loop do (incf pos) while (and (< pos len) (joyai-cjkp (char text pos)))))
+                         ((and (joyai-punctp c) (at (1+ pos)) (joyai-alphap (at (1+ pos))))
+                          (incf pos)
+                          (loop while (and (< pos len) (joyai-alphap (char text pos))) do (incf pos)))
+                         ((joyai-letterp c) (letters))
+                         ((and (not (joyai-newlinep c)) (not (joyai-punctp c))
+                               (at (1+ pos)) (joyai-letterp (at (1+ pos))))
+                          (incf pos) (letters))
+                         ((and (char= c #\Space) (at (1+ pos)) (joyai-punctp (at (1+ pos))))
+                          (incf pos) (punct-run))
+                         ((joyai-punctp c) (punct-run))
+                         ((joyai-spacep c)
+                          (let ((p pos) (last-nl nil))
+                            (loop while (and (< p len) (joyai-spacep (char text p)))
+                                  do (when (joyai-newlinep (char text p)) (setf last-nl (1+ p)))
+                                     (incf p))
+                            (setf pos (cond (last-nl last-nl)
+                                            ((and (< p len) (> p (1+ pos))
+                                                  (or (joyai-letterp (char text p)) (joyai-punctp (char text p))))
+                                             (1- p))
+                                            (t p)))))
+                         (t (incf pos))))
+                 (when (= pos start) (incf pos))
+                 (push (subseq text start pos) words))))
+    (nreverse words)))
+
 (defun pre-tokenizer-digits (pre)
   (cond ((member pre '("qwen2" "qwen35" "deepseek-r1-qwen") :test #'equal) 1)
         ((member pre '("llama3" "llama-bpe" "smaug-bpe") :test #'equal) 3)
@@ -240,12 +298,13 @@
                                                   (error "no token for byte ~S" ch))))))))
 
 (defun tokenize-with (vocab text &key (add-bos (vocab-add-bos vocab)))
-  (let ((digits (pre-tokenizer-digits (vocab-pre vocab)))
-        (marks (equal (vocab-pre vocab) "qwen35")))
+  (let* ((joyai (equal (vocab-pre vocab) "joyai-llm"))
+         (digits (if joyai 3 (pre-tokenizer-digits (vocab-pre vocab))))
+         (marks (equal (vocab-pre vocab) "qwen35")))
     (append (and add-bos (vocab-bos vocab) (list (vocab-bos vocab)))
             (loop for f in (split-specials vocab text)
                   if (integerp f) collect f
-                  else append (loop for w in (split-words f :digits digits :marks marks)
+                  else append (loop for w in (if joyai (split-words-joyai f) (split-words f :digits digits :marks marks))
                                     append (bpe-word vocab w))))))
 
 ;;; --- decoding ---------------------------------------------------------------

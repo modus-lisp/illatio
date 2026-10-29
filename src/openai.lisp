@@ -227,9 +227,11 @@
         (when add-generation-prompt
           (emit "<|im_start|>assistant" (string #\Newline)))))))
 
-(defun render-chat (model messages &optional tools)
+(defun render-chat (model messages &optional tools &key (thinking t))
   (let ((template (meta (model-gguf model) "tokenizer.chat_template" "")))
-    (cond ((and (search "<|im_start|>" template) (search "<tool_call>" template)
+    (cond ((equal (model-arch model) "deepseek4")
+           (render-ds4f-chat messages tools :thinking thinking))
+          ((and (search "<|im_start|>" template) (search "<tool_call>" template)
                 (search "</think>" template))
            (render-qwen3-chat messages tools))
           ((and (search "<|im_start|>" template) (search "<tool_call>" template))
@@ -323,7 +325,9 @@
   (sb-thread:with-mutex ((engine-lock engine))
     (let* ((m (engine-model engine))
            (ctx (engine-context engine))
-           (prompt (render-chat m (jget req "messages") (jget req "tools")))
+           (thinking (request-thinking req))
+           (ds4f (equal (model-arch m) "deepseek4"))
+           (prompt (render-chat m (jget req "messages") (jget req "tools") :thinking thinking))
            (ids (tokenize m prompt))
            (max (or (jget req "max_completion_tokens") (jget req "max_tokens") 2048))
            (t0 (get-internal-real-time))
@@ -336,7 +340,8 @@
                                        (when on-text (funcall on-text piece))))
         (let ((t2 (get-internal-real-time)))
           (unless t1 (setf t1 t2))
-          (multiple-value-bind (content calls) (parse-tool-calls text)
+          (multiple-value-bind (content calls reasoning)
+              (if ds4f (ds4f-parse-reply text thinking) (parse-tool-calls text))
             (flet ((ms (a b) (/ (* 1000d0 (- b a)) internal-time-units-per-second)))
               (hobj "id" (fresh-id "chatcmpl-")
                     "object" "chat.completion"
@@ -346,6 +351,8 @@
                                (hobj "index" 0
                                      "message" (let ((msg (hobj "role" "assistant" "content" content)))
                                                  (when calls (setf (gethash "tool_calls" msg) (coerce calls 'vector)))
+                                                 (when (and reasoning (plusp (length reasoning)))
+                                                   (setf (gethash "reasoning_content" msg) reasoning))
                                                  msg)
                                      "finish_reason" (cond (calls "tool_calls")
                                                            ((eq reason :length) "length")
@@ -406,8 +413,17 @@
                                                     (hobj "content" text)
                                                     (progn (setf sent-role t)
                                                            (hobj "role" "assistant" "content" text)))))))
+         (emit-reasoning (lambda (text)
+                           (funcall on-chunk
+                                    (chunk-object id name (if sent-role
+                                                              (hobj "reasoning_content" text)
+                                                              (progn (setf sent-role t)
+                                                                     (hobj "role" "assistant" "reasoning_content" text)))))))
          (resp (chat-completion engine req
-                                :on-text (if (jget req "tools") (make-tool-call-filter emit) emit)))
+                                :on-text (cond ((equal (model-arch (engine-model engine)) "deepseek4")
+                                                (make-ds4f-stream-filter emit emit-reasoning (request-thinking req)))
+                                               ((jget req "tools") (make-tool-call-filter emit))
+                                               (t emit))))
          (choice (aref (jget resp "choices") 0))
          (calls (jget choice "message" "tool_calls")))
     (when calls
@@ -423,3 +439,252 @@
                             "choices" (vector) "usage" (jget resp "usage")
                             "timings" (jget resp "timings")))
     resp))
+
+;;; --- DeepSeek V4 Flash: its chat format, as ds4's server renders it ----------------
+;;; (ds4_server.c, render_deepseek_chat_prompt_text): the tool schemas, one
+;;; JSON object a line under ds4's instructions, come before the client's
+;;; system text; turns are <｜User｜> / <｜Assistant｜>; an assistant turn
+;;; opens with its reasoning in <think>..</think> where thinking keeps it, else
+;;; </think>; tool calls are DSML blocks; tool output is wrapped in
+;;; <tool_result>, only its own closing tag escaped.  Thinking is on unless the
+;;; request turns it off, as in ds4's server.
+
+(defparameter +ds4f-tools-header+
+  (concatenate 'string
+   "## Tools" (string #\Newline) (string #\Newline)
+   "You have access to a set of tools to help answer the user question. "
+   "You can invoke tools by writing a \"<｜DSML｜tool_calls>\" block like the following:" (string #\Newline) (string #\Newline)
+   "<｜DSML｜tool_calls>" (string #\Newline)
+   "<｜DSML｜invoke name=\"$TOOL_NAME\">" (string #\Newline)
+   "<｜DSML｜parameter name=\"$PARAMETER_NAME\" string=\"true|false\">$PARAMETER_VALUE</｜DSML｜parameter>" (string #\Newline)
+   "..." (string #\Newline)
+   "</｜DSML｜invoke>" (string #\Newline)
+   "<｜DSML｜invoke name=\"$TOOL_NAME2\">" (string #\Newline)
+   "..." (string #\Newline)
+   "</｜DSML｜invoke>" (string #\Newline)
+   "</｜DSML｜tool_calls>" (string #\Newline) (string #\Newline)
+   "String parameters should be specified as raw text and set `string=\"true\"`. "
+   "Preserve characters such as `>`, `&`, and `&&` exactly; never replace normal string characters with XML or HTML entity escapes. "
+   "Only if a string value itself contains the exact closing parameter tag `</｜DSML｜parameter>`, write that tag as `&lt;/｜DSML｜parameter>` inside the value. "
+   "For all other types (numbers, booleans, arrays, objects), pass the value in JSON format and set `string=\"false\"`." (string #\Newline) (string #\Newline)
+   "When thinking mode is enabled, finish reasoning with </think> before any tool calls or final response." (string #\Newline) (string #\Newline)
+   "Otherwise, output directly after </think> with tool calls or final response." (string #\Newline) (string #\Newline)
+   "### Available Tool Schemas" (string #\Newline) (string #\Newline)))
+
+(defparameter +ds4f-tools-footer+
+  (concatenate 'string (string #\Newline) (string #\Newline)
+               "You MUST strictly follow the above defined tool name and parameter schemas to invoke tool calls. "
+               "Use the exact parameter names from the schemas."))
+
+(defun request-thinking (req)
+  "Whether REQ wants the model to think: on, as in ds4's server, unless
+   \"thinking\" or chat_template_kwargs.enable_thinking is given false (or
+   {\"type\": \"disabled\"}), or reasoning_effort is \"none\".  (A JSON false
+   and a missing key both read as NIL, so presence is asked of the table.)"
+  (flet ((given-false (h key)
+           (and (hash-table-p h)
+                (multiple-value-bind (v present) (gethash key h) (and present (null v))))))
+    (let ((th (and (hash-table-p req) (gethash "thinking" req))))
+      (not (or (given-false req "thinking")
+               (and (hash-table-p th) (equal (jget th "type") "disabled"))
+               (given-false (and (hash-table-p req) (gethash "chat_template_kwargs" req)) "enable_thinking")
+               (equal (jget req "reasoning_effort") "none"))))))
+
+(defun ds4f-escape-close (text end)
+  "TEXT with END (a closing tag) written as &lt;..., and any spelling of that
+   escape with one &amp; more, so the text can't close its wrapper early
+   (ds4_tool_text_needs_escape)."
+  (with-output-to-string (o)
+    (let ((i 0) (n (length text)) (tail (subseq end 1)))
+      (loop while (< i n)
+            do (cond ((and (<= (+ i (length end)) n) (string= end text :start2 i :end2 (+ i (length end))))
+                      (write-string "&lt;" o) (incf i))
+                     ((and (char= (char text i) #\&)
+                           (let ((j (1+ i)))
+                             (loop while (and (<= (+ j 4) n) (string= "amp;" text :start2 j :end2 (+ j 4))) do (incf j 4))
+                             (and (<= (+ j 3 (length tail)) n) (string= "lt;" text :start2 j :end2 (+ j 3))
+                                  (string= tail text :start2 (+ j 3) :end2 (+ j 3 (length tail))))))
+                      (write-string "&amp;" o) (incf i))
+                     (t (write-char (char text i) o) (incf i)))))))
+
+(defun ds4f-unescape-close (text end)
+  "ds4_tool_text_unescape: one level of DS4F-ESCAPE-CLOSE undone."
+  (with-output-to-string (o)
+    (let ((i 0) (n (length text)) (tail (subseq end 1)))
+      (loop while (< i n)
+            do (if (and (char= (char text i) #\&)
+                        (let ((j (1+ i)))
+                          (loop while (and (<= (+ j 4) n) (string= "amp;" text :start2 j :end2 (+ j 4))) do (incf j 4))
+                          (and (<= (+ j 3 (length tail)) n) (string= "lt;" text :start2 j :end2 (+ j 3))
+                               (string= tail text :start2 (+ j 3) :end2 (+ j 3 (length tail))))))
+                   (if (and (<= (+ i 5) n) (string= "&amp;" text :start2 i :end2 (+ i 5)))
+                       (progn (write-char #\& o) (incf i 5))
+                       (progn (write-char #\< o) (incf i 4)))
+                   (progn (write-char (char text i) o) (incf i)))))))
+
+(defun ds4f-attr-escape (s)
+  (with-output-to-string (o)
+    (loop for c across s
+          do (case c (#\& (write-string "&amp;" o)) (#\< (write-string "&lt;" o)) (#\> (write-string "&gt;" o))
+                   (#\" (write-string "&quot;" o)) (t (write-char c o))))))
+
+(defun ds4f-dsml-calls (calls)
+  "append_dsml_tool_calls_text: CALLS (OpenAI tool_calls) as a DSML block."
+  (with-output-to-string (o)
+    (format o "~%~%<｜DSML｜tool_calls>~%")
+    (loop for c across calls
+          do (let* ((f (jget c "function")) (args (jget f "arguments"))
+                    (obj (if (stringp args) (ignore-errors (json-simple:parse args)) args)))
+               (format o "<｜DSML｜invoke name=\"~A\">~%" (ds4f-attr-escape (or (jget f "name") "")))
+               (if (hash-table-p obj)
+                   (maphash (lambda (k v)
+                              (format o "<｜DSML｜parameter name=\"~A\" string=\"~:[false~;true~]\">~A</｜DSML｜parameter>~%"
+                                      (ds4f-attr-escape k) (stringp v)
+                                      (if (stringp v)
+                                          (ds4f-escape-close v "</｜DSML｜parameter>")
+                                          (let ((j (json-simple:stringify v)))
+                                            ;; append_dsml_json_literal: the closing tag's < as \u003c
+                                            (with-output-to-string (o2)
+                                              (loop with end = "</｜DSML｜parameter>"
+                                                    for i from 0 below (length j)
+                                                    do (if (and (<= (+ i (length end)) (length j))
+                                                                (string= end j :start2 i :end2 (+ i (length end))))
+                                                           (write-string "\\u003c" o2)
+                                                           (write-char (char j i) o2))))))))
+                            obj)
+                   (format o "<｜DSML｜parameter name=\"arguments\" string=\"true\">~A</｜DSML｜parameter>~%"
+                           (ds4f-escape-close (if (stringp args) args "") "</｜DSML｜parameter>")))
+               (format o "</｜DSML｜invoke>~%")))
+    (write-string "</｜DSML｜tool_calls>" o)))
+
+(defun render-ds4f-chat (messages tools &key (thinking t))
+  (let* ((msgs (coerce messages 'list))
+         (tools (and tools (plusp (length tools)) (coerce tools 'list)))
+         (tool-context (or tools
+                           (some (lambda (m) (or (and (equal (jget m "role") "assistant") (jget m "tool_calls")
+                                                      (plusp (length (jget m "tool_calls"))))
+                                                 (member (jget m "role") '("tool" "function") :test #'equal)))
+                                 msgs)))
+         (last-user (loop for m in msgs for i from 0
+                          when (member (jget m "role") '("user" "tool" "function") :test #'equal) maximize i))
+         (system (with-output-to-string (o)
+                   (when tools
+                     (write-string +ds4f-tools-header+ o)
+                     (loop for tool in tools for first = t then nil
+                           do (unless first (write-char #\Newline o))
+                              (write-string (json-simple:stringify (or (jget tool "function") tool)) o))
+                     (write-string +ds4f-tools-footer+ o))))
+         (pending-assistant nil) (pending-tool nil))
+    (dolist (m msgs)
+      (when (equal (jget m "role") "system")
+        (setf system (concatenate 'string system (if (plusp (length system)) (format nil "~%~%") "")
+                                  (content-string (jget m "content"))))))
+    (with-output-to-string (o)
+      (write-string "<｜begin▁of▁sentence｜>" o)
+      (write-string system o)
+      (loop for m in msgs for i from 0
+            for role = (jget m "role")
+            do (cond ((equal role "system"))
+                     ((equal role "user")
+                      (write-string "<｜User｜>" o) (write-string (content-string (jget m "content")) o)
+                      (setf pending-assistant t pending-tool nil))
+                     ((member role '("tool" "function") :test #'equal)
+                      (unless pending-tool (write-string "<｜User｜>" o))
+                      (write-string "<tool_result>" o)
+                      (write-string (ds4f-escape-close (content-string (jget m "content")) "</tool_result>") o)
+                      (write-string "</tool_result>" o)
+                      (setf pending-assistant t pending-tool t))
+                     ((equal role "assistant")
+                      (when pending-assistant
+                        (write-string "<｜Assistant｜>" o)
+                        (if (and thinking (or tool-context (> i last-user)))
+                            (format o "<think>~A</think>" (or (jget m "reasoning_content") ""))
+                            (write-string "</think>" o)))
+                      (write-string (content-string (jget m "content")) o)
+                      (let ((calls (jget m "tool_calls")))
+                        (when (and calls (plusp (length calls))) (write-string (ds4f-dsml-calls calls) o)))
+                      (write-string "<｜end▁of▁sentence｜>" o)
+                      (setf pending-assistant nil pending-tool nil))))
+      (when pending-assistant
+        (write-string "<｜Assistant｜>" o)
+        (write-string (if thinking "<think>" "</think>") o)))))
+
+(defun ds4f-parse-reply (text thinking)
+  "(values content tool-calls reasoning) from the model's reply: with
+   thinking, the reasoning is what comes before </think>; tool calls are
+   the DSML block's invokes, string parameters unescaped as ds4 does,
+   others parsed as JSON."
+  (let* ((close (and thinking (search "</think>" text)))
+         (reasoning (cond (close (subseq text 0 close)) (thinking text) (t nil)))
+         (rest (cond (close (subseq text (+ close 8))) (thinking "") (t text)))
+         (start (search "<｜DSML｜tool_calls>" rest))
+         (content (string-trim '(#\Space #\Newline #\Tab #\Return) (subseq rest 0 (or start (length rest)))))
+         (calls '()))
+    (when start
+      (let ((pos start) (pend "</｜DSML｜parameter>"))
+        (loop
+          (let* ((inv (search "<｜DSML｜invoke name=\"" rest :start2 pos))
+                 (inv-end (and inv (search "</｜DSML｜invoke>" rest :start2 inv))))
+            (unless (and inv inv-end) (return))
+            (let* ((name-start (+ inv (length "<｜DSML｜invoke name=\"")))
+                   (name-end (search "\"" rest :start2 name-start))
+                   (args (make-hash-table :test 'equal))
+                   (p (search ">" rest :start2 name-end)))
+              (loop
+                (let ((ps (search "<｜DSML｜parameter name=\"" rest :start2 p :end2 inv-end)))
+                  (unless ps (return))
+                  (let* ((ks (+ ps (length "<｜DSML｜parameter name=\"")))
+                         (ke (search "\"" rest :start2 ks))
+                         (strp (search "string=\"true\"" rest :start2 ke :end2 (search ">" rest :start2 ke)))
+                         (vs (1+ (search ">" rest :start2 ke)))
+                         (ve (or (search pend rest :start2 vs) inv-end))
+                         (raw (subseq rest vs ve)))
+                    (setf (gethash (ds4f-attr-unescape (subseq rest ks ke)) args)
+                          (if strp
+                              (ds4f-unescape-close raw pend)
+                              (let ((v (ignore-errors (json-simple:parse raw)))) (if v v raw))))
+                    (setf p (+ ve (length pend))))))
+              (push (hobj "id" (fresh-id "call_" 8) "type" "function"
+                          "function" (hobj "name" (ds4f-attr-unescape (subseq rest name-start name-end))
+                                           "arguments" (json-simple:stringify args)))
+                    calls)
+              (setf pos (+ inv-end (length "</｜DSML｜invoke>"))))))))
+    (values content (nreverse calls) reasoning)))
+
+(defun ds4f-attr-unescape (s)
+  (let ((out s))
+    (loop for (from to) in '(("&quot;" "\"") ("&gt;" ">") ("&lt;" "<") ("&amp;" "&"))
+          do (setf out (with-output-to-string (o)
+                         (loop with i = 0 while (< i (length out))
+                               do (if (and (<= (+ i (length from)) (length out))
+                                           (string= from out :start2 i :end2 (+ i (length from))))
+                                      (progn (write-string to o) (incf i (length from)))
+                                      (progn (write-char (char out i) o) (incf i)))))))
+    out))
+
+(defun make-ds4f-stream-filter (emit-content emit-reasoning thinking)
+  "A text sink for a DeepSeek reply: reasoning (when THINKING, up to
+   </think>) to EMIT-REASONING, then content to EMIT-CONTENT until a DSML
+   tool-call block starts (the calls are sent whole once the reply is done).
+   A tail that might begin the next tag is held back."
+  (let ((pending "") (state (if thinking :reasoning :content)))
+    (labels ((tag () (if (eq state :reasoning) "</think>" "<｜DSML｜tool_calls>"))
+             (feed (text)
+               (unless (eq state :done)
+                 (let* ((tag (tag)) (at (search tag text)))
+                   (if at
+                       (progn (when (plusp at)
+                                (funcall (if (eq state :reasoning) emit-reasoning emit-content) (subseq text 0 at)))
+                              (setf pending "")
+                              (if (eq state :reasoning)
+                                  (progn (setf state :content) (feed (subseq text (+ at (length tag)))))
+                                  (setf state :done)))
+                       (let ((keep (loop for k from (min (1- (length tag)) (length text)) downto 1
+                                         when (string= text tag :start1 (- (length text) k) :end2 k)
+                                           return k
+                                         finally (return 0))))
+                         (when (> (length text) keep)
+                           (funcall (if (eq state :reasoning) emit-reasoning emit-content)
+                                    (subseq text 0 (- (length text) keep))))
+                         (setf pending (subseq text (- (length text) keep)))))))))
+      (lambda (piece) (feed (concatenate 'string pending piece))))))

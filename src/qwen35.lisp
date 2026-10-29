@@ -25,7 +25,10 @@
 (in-package #:illatio)
 
 (defun model-recurrent-p (m)
-  (some (lambda (l) (eq (layer-kind l) :linear)) (model-layers m)))
+  "Whether a context's state can't go back to an earlier position: the
+   delta net's, or DeepSeek V4 Flash's compressors and window."
+  (or (model-impl m)
+      (some (lambda (l) (eq (layer-kind l) :linear)) (model-layers m))))
 
 ;;; --- per-context state and scratch ----------------------------------------------
 
@@ -57,6 +60,8 @@
 
 (defun reset-recurrent! (ctx)
   "Zero every linear layer's state: the context starts over."
+  (when (model-impl (context-model ctx))
+    (return-from reset-recurrent! (ds4f-context-reset ctx)))
   (let ((st (q35-state ctx)))
     (loop for v across (q35-conv st) do (fill v 0f0))
     (loop for v across (q35-ssm st) do (fill v 0f0)))

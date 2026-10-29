@@ -1019,3 +1019,46 @@
     (when logits
       (ds4f-head! m (subseq cur (* (1- n) hcd)) (d4ctx-logits ctx)))
     ctx))
+
+;;; --- as an illatio model -------------------------------------------------------------
+;;; LOAD-MODEL gives a MODEL whose IMPL is the DS4F, so generate, the engine and
+;;; the CLI take it as any other: a context carries a D4CTX in its plist (the
+;;; logits shared), FORWARD and EVAL-TOKENS come here, and the model counts as
+;;; recurrent -- its compressors and window can't go back -- so SYNC-PROMPT
+;;; continues a context only past what it has seen and otherwise starts over.
+
+(defun load-ds4f-model (path threads)
+  (let* ((d (load-ds4f path :threads threads)) (g (ds4f-gguf d)) (v (make-vocab-from-gguf g)))
+    (setf (ds4f-vocab d) v)
+    (%make-model :gguf g :vocab v :arch "deepseek4" :name (meta g "general.name" "DeepSeek V4 Flash")
+                 :n-layer (ds4f-n-layer d) :d 0 :n-head 0 :n-kv-head 1 :head-dim 1 :q-dim 0 :ffn 0
+                 :n-vocab (ds4f-n-vocab d)
+                 :context-length (or (arch-key g "deepseek4" "context_length") 4096)
+                 :pool (ds4f-pool d) :impl d)))
+
+(defun ds4f-context (ctx)
+  (or (getf (context-plist ctx) :ds4f)
+      (setf (getf (context-plist ctx) :ds4f)
+            (let ((c (make-d4ctx (model-impl (context-model ctx)) :n-ctx (context-n-ctx ctx))))
+              (setf (d4ctx-logits c) (context-logits ctx))
+              c))))
+
+(defun ds4f-context-forward (ctx token logits)
+  (let ((c (ds4f-context ctx)))
+    (setf (d4ctx-pos c) (context-pos ctx))
+    (ds4f-forward c token :logits logits)
+    (setf (context-pos ctx) (d4ctx-pos c))
+    ctx))
+
+(defun ds4f-context-eval (ctx tokens)
+  (let ((c (ds4f-context ctx)))
+    (setf (d4ctx-pos c) (context-pos ctx))
+    (if (rest tokens) (ds4f-prefill c tokens) (when tokens (ds4f-forward c (first tokens))))
+    (setf (context-pos ctx) (d4ctx-pos c))
+    (context-logits ctx)))
+
+(defun ds4f-context-reset (ctx)
+  "Start CTX over: fresh caches and compressor windows."
+  (remf (context-plist ctx) :ds4f)
+  (setf (context-pos ctx) 0)
+  ctx)

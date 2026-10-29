@@ -49,13 +49,16 @@
   (layers #() :type simple-vector)
   pool
   gpu                                   ; a GMODEL when the GPU runs it (metal-qwen35.lisp)
+  impl                                  ; a DS4F when the model is DeepSeek V4 Flash (ds4f.lisp)
   (notes '()))                          ; a plist: things said once (warnings)
 
 (defun arch-key (g arch key) (meta g (format nil "~A.~A" arch key)))
 
 (defun load-model (path &key (threads (default-thread-count)))
   "Read the GGUF model at PATH: weights, tokenizer, and a pool of THREADS."
-  (finish-model (load-model-1 path threads)))
+  (if (equal (meta (read-gguf path) "general.architecture") "deepseek4")
+      (load-ds4f-model path threads)
+      (finish-model (load-model-1 path threads))))
 
 (defun load-model-1 (path threads)
   (let* ((g (read-gguf path))
@@ -379,6 +382,8 @@
   #-sbcl (forward-1 ctx token logits))
 
 (defun forward-1 (ctx token logits)
+  (when (model-impl (context-model ctx))
+    (return-from forward-1 (ds4f-context-forward ctx token logits)))
   #+(and sbcl darwin)
   (when (model-gpu (context-model ctx))
     (return-from forward-1 (gpu-forward ctx token logits)))

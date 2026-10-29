@@ -108,7 +108,7 @@ flags:
                  #+(and sbcl darwin) (illatio::load-model-gpu path)
                  #-(and sbcl darwin) (die "--gpu needs Metal (SBCL on macOS)")
                  (load-model path :threads (or (getf opts :threads) (default-thread-count))))))
-      (format *error-output* "illatio: ~A, ~D layers, ~:[~D threads~;~*~A~], ~,1Fs~%"
+      (format *error-output* "illatio: ~A, ~D layers, ~:[~D threads~*~;~*~A~], ~,1Fs~%"
               (model-name m) (illatio::model-n-layer m)
               (getf opts :gpu) (illatio::pool-size (illatio::model-pool m))
               #+(and sbcl darwin) (and (getf opts :gpu)

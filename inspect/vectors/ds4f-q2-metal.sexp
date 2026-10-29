@@ -58,7 +58,35 @@
   (5744 (5744 -0.955421) (270 -1.587924) (13621 -1.853530) (10296 -2.531127) (3980 -3.608993) (6258 -4.185977) (786 -4.291732) (1951 -4.553468) (2998 -4.647106) (8341 -4.746795))
 ))
 (:name "code"
- :text "def merge_sorted(a, b):\n    \"\"\"Merge two sorted lists into one sorted list.\"\"\"\n    result = []\n    i = j = 0\n    while i < len(a) and j < len(b):\n        if a[i] <= b[j]:\n            result.append(a[i])\n            i += 1\n        else:\n            result.append(b[j])\n            j += 1\n    result.extend(a[i:])\n    result.extend(b[j:])\n    return result\n\n\ndef merge_sort(xs):\n    \"\"\"Sort a list with merge sort, returning a new list.\"\"\"\n    if len(xs) <= 1:\n        return list(xs)\n    mid = len(xs) // 2\n    left = merge_sort(xs[:mid])\n    right = merge_sort(xs[mid:])\n    return merge_sorted(left, right)\n\n\ndef test_merge_sort():\n    assert merge_sort([]) == []\n    assert merge_sort([3, 1, 2]) =="
+ :text "def merge_sorted(a, b):
+    \"\"\"Merge two sorted lists into one sorted list.\"\"\"
+    result = []
+    i = j = 0
+    while i < len(a) and j < len(b):
+        if a[i] <= b[j]:
+            result.append(a[i])
+            i += 1
+        else:
+            result.append(b[j])
+            j += 1
+    result.extend(a[i:])
+    result.extend(b[j:])
+    return result
+
+
+def merge_sort(xs):
+    \"\"\"Sort a list with merge sort, returning a new list.\"\"\"
+    if len(xs) <= 1:
+        return list(xs)
+    mid = len(xs) // 2
+    left = merge_sort(xs[:mid])
+    right = merge_sort(xs[mid:])
+    return merge_sorted(left, right)
+
+
+def test_merge_sort():
+    assert merge_sort([]) == []
+    assert merge_sort([3, 1, 2]) =="
  :prompt (3465 29446 4731 14035 6036 14 291 3395 361 26495 115685 1234 24216 16893 1055 834 24216 2310 77319 361 1529 438 16461 361 1008 438 597 438 223 18 201 361 1901 1008 818 9080 6036 11 305 597 818 9080 7011 3395 528 855 260 3166 63 8593 291 11293 23902 775 1529 10108 6036 3166 9876 775 1008 7004 223 19 201 528 3006 1137 775 1529 10108 7011 11293 9876 775 597 7004 223 19 201 361 1529 102394 6036 3166 28 9876 361 1529 102394 7011 11293 28 9876 361 1354 1529 6328 3465 29446 61961 4042 85 3395 361 26495 22156 260 2310 418 29446 5803 14 20465 260 1017 2310 77319 361 855 9080 4042 85 11 8593 223 19 1137 528 1354 2310 4042 85 682 361 6431 438 9080 4042 85 11 1915 223 20 201 361 3001 438 29446 61961 4042 85 20926 14062 9876 361 1748 438 29446 61961 4042 85 57280 28 9876 361 1354 29446 4731 14035 46605 14 1748 14532 3465 1950 65 46467 61961 15536 361 8719 29446 61961 47545 11 2606 16461 361 8719 29446 61961 10425 21 14 223 19 14 223 20 8123 2606)
  :steps (
   (764 (764 -0.000101) (24216 -9.703062) (29446 -11.241459) (16461 -11.667767) (15529 -12.602064) (223 -12.956528) (10606 -13.488754) (33530 -13.502409) (12955 -14.044550) (2310 -14.158716))

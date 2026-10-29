@@ -287,6 +287,8 @@
 (defun eval-tokens (ctx tokens)
   "Feed TOKENS; only the last one's logits are computed.  More than one goes
    through FORWARD-BATCH, a chunk at a time."
+  (when (model-impl (context-model ctx))
+    (return-from eval-tokens (ds4f-context-eval ctx tokens)))
   #+(and sbcl darwin)
   (when (model-gpu (context-model ctx))
     (return-from eval-tokens (gpu-eval ctx tokens)))
