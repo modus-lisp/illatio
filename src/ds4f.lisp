@@ -721,14 +721,17 @@
   #-sbcl (progn w start bytes))
 
 ;;; madvise WILLNEED reads in the calling thread on macOS, so the reads are
-;;; handed to a thread of their own: the FFN queues them and goes on, and they
+;;; handed to threads of their own: the FFN queues them and goes on, and they
 ;;; overlap its work instead of preceding it.
 #+sbcl
 (progn
   (defvar *prefetch-lock* (sb-thread:make-mutex :name "prefetch"))
   (defvar *prefetch-cv* (sb-thread:make-waitqueue))
   (defvar *prefetch-queue* '())
-  (defvar *prefetch-thread* nil)
+  (defvar *prefetch-threads* '())
+  (defparameter *prefetch-thread-count* 4
+    "Read-ahead threads: each madvise blocks its thread on the read, so
+     several keep several reads in flight.")
 
   (defun prefetch-loop ()
     (loop
@@ -742,8 +745,9 @@
   (defun queue-prefetch (jobs)
     "Read JOBS ((vector start bytes)...) ahead, in order, in the background."
     (sb-thread:with-mutex (*prefetch-lock*)
-      (unless (and *prefetch-thread* (sb-thread:thread-alive-p *prefetch-thread*))
-        (setf *prefetch-thread* (sb-thread:make-thread #'prefetch-loop :name "illatio prefetch")))
+      (setf *prefetch-threads* (remove-if-not #'sb-thread:thread-alive-p *prefetch-threads*))
+      (loop while (< (length *prefetch-threads*) *prefetch-thread-count*)
+            do (push (sb-thread:make-thread #'prefetch-loop :name "illatio prefetch") *prefetch-threads*))
       (setf *prefetch-queue* (append *prefetch-queue* jobs))
       (sb-thread:condition-broadcast *prefetch-cv*))))
 
@@ -905,7 +909,10 @@
 ;;; are summed in its slot order -- the decode's arithmetic, so a prefill is
 ;;; bit-identical to feeding the tokens one at a time.
 
-(defparameter *ds4f-chunk* 256 "Tokens a layer-major pass takes at once.")
+(defparameter *ds4f-chunk* 2048
+  "Tokens a layer-major pass takes at once.  A chunk reads nearly every
+   expert of every layer (77 GB), more than the page cache holds, so long
+   prompts want long chunks.")
 
 (defun ds4f-prefill (ctx tokens &key (logits t))
   "TOKENS at the next positions, *DS4F-CHUNK* at a time."
