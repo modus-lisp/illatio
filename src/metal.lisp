@@ -172,13 +172,21 @@
          (enc (msg ptr cb "computeCommandEncoder")))
     (%make-enc :cb cb :enc enc)))
 
-(defun end-work (e)
-  "Finish encoding, run it, and wait."
+(defun commit-work (e)
+  "Finish encoding and start it running."
   (msg sb-alien:void (enc-enc e) "endEncoding")
-  (msg sb-alien:void (enc-cb e) "commit")
+  (msg sb-alien:void (enc-cb e) "commit"))
+
+(defun wait-work (e)
+  "Wait for E, committed, to finish."
   (msg sb-alien:void (enc-cb e) "waitUntilCompleted")
   (let ((err (msg ptr (enc-cb e) "error")))
     (unless (nullp err) (error "Metal: ~A" (ns-error-text err)))))
+
+(defun end-work (e)
+  "Finish encoding, run it, and wait."
+  (commit-work e)
+  (wait-work e))
 
 (defun arg-word (x)
   (etypecase x
@@ -233,3 +241,13 @@
        (let ((,e (begin-work ,gpu)))
          ,@body
          (end-work ,e)))))
+
+(defmacro with-gpu-work-while ((e gpu) encode &body meanwhile)
+  "Encode ENCODE's dispatches into one command buffer and start it; run
+   MEANWHILE on the CPU while it runs, then wait for it.  MEANWHILE's values."
+  `(with-metal
+     (with-autorelease
+       (let ((,e (begin-work ,gpu)))
+         ,encode
+         (commit-work ,e)
+         (multiple-value-prog1 (progn ,@meanwhile) (wait-work ,e))))))

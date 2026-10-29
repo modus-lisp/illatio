@@ -51,10 +51,11 @@
   (layers #() :type simple-vector)
   (gpu-plist '()))                      ; the GPU's state, when it runs (metal-ds4f.lisp)
 
-(defvar *ds4f-gpu* #+(and sbcl darwin) '(:experts :proj :attn) #-(and sbcl darwin) nil
-  "What of a DS4F prefill the GPU runs (metal-ds4f.lisp): any of :EXPERTS
-   (the routed FFN), :PROJ (the attention and shared expert's Q8_0
-   products), :ATTN (attention); T is all of them, NIL none.")
+(defvar *ds4f-gpu* #+(and sbcl darwin) '(:experts :proj :attn :decode) #-(and sbcl darwin) nil
+  "What of DS4F the GPU runs (metal-ds4f.lisp): any of :EXPERTS (prefill's
+   routed FFN), :PROJ (prefill's attention and shared expert Q8_0
+   products), :ATTN (prefill's attention), :DECODE (a token's routed
+   experts, from the GPU's expert cache); T is all of them, NIL none.")
 
 (defparameter *ds4f-read-all-from* 512
   "From this many tokens a chunk's layer reads all its experts ahead, while
@@ -972,6 +973,14 @@
         (hc-pre m (dl-hc-ffn-fn l) (dl-hc-ffn-scale l) (dl-hc-ffn-base l) streams cur flat)
       (d4-rms! cur norm d eps (dl-ffn-norm l))
       (multiple-value-bind (sel w) (d4-route m l li norm token)
+        (when (ds4f-gpu-p :decode)
+          ;; the routed experts on the GPU, from its expert cache
+          (let ((moe (f32vec d)) (shared (f32vec d)))
+            ;; the shared expert on the CPU while the GPU runs the routed ones
+            #+(and sbcl darwin) (ds4f-gpu-ffn-1! m l li norm sel w moe (lambda () (d4-shared! m l norm clamp shared)))
+            #-(and sbcl darwin) (d4-shared! m l norm clamp shared)
+            (dotimes (i d) (setf (aref moe i) (+ (aref moe i) (aref shared i))))
+            (return-from d4-ffn (values moe post comb))))
         (prefetch-experts m l sel)
         (let ((xq (make-q8kvec d)) (mid (f32vec (* nu ff))) (moe (f32vec d)) (shared (f32vec d)))
           (declare (ignorable shared))

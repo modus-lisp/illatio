@@ -283,3 +283,142 @@
     (sb-sys:with-pinned-objects (scores)
       (sap-copy (sb-sys:vector-sap scores) (gbuf-sap bs) (* 4 n ncomp)))
     scores))
+
+;;; --- decode: an expert cache on the GPU ------------------------------------------------
+;;; A token's six experts a layer come from a cache of expert slots in one GPU
+;;; buffer (as ds4's streaming expert cache), the least recently used given up
+;;; for a miss, a miss read by pread; then one command buffer: gate and up for
+;;; the six (D4_MV_IQ2_XXS, the six at once), the clamped SwiGLU times their
+;;; routing weights, down (D4_MV_Q2_K).  The CPU sums the six in slot order.
+
+(defvar *ds4f-expert-cache-gb* 16
+  "The decode expert cache's size, in GB (an expert is about 7 MB).")
+
+(defstruct (d4xcache (:conc-name dx-)) buf (n 0) slot-of owner used (tick 0) (free 0) (hits 0) (misses 0) (read-time 0))
+
+(defun ds4f-expert-cache (m)
+  (let ((st (ds4f-gpu-state m)))
+    (or (getf (d4gpu-plist* st) :xcache)
+        (let* ((sb (d4gpu-slot-bytes st))
+               (n (max 6 (floor (* *ds4f-expert-cache-gb* 1000000000) sb)))
+               (keys (* (ds4f-n-layer m) (ds4f-n-expert m))))
+          (setf (getf (d4gpu-plist* st) :xcache)
+                (seed-expert-cache
+                 m (make-d4xcache :buf (gpu-buffer (d4gpu-gpu st) (* n sb)) :n n
+                                  :slot-of (make-array keys :element-type 'fixnum :initial-element -1)
+                                  :owner (make-array n :element-type 'fixnum :initial-element -1)
+                                  :used (make-array n :element-type 'fixnum :initial-element 0))))))))
+
+(defvar *ds4f-seed-experts* t
+  "Whether the decode expert cache starts with ds4's most used experts.")
+
+(defun seed-expert-cache (m xc)
+  "XC with as many of +DS4F-HOTLIST+'s experts as it holds read in, the
+   most used first, if *DS4F-SEED-EXPERTS*."
+  (when (and *ds4f-seed-experts* (= (ds4f-n-layer m) 43) (= (ds4f-n-expert m) 256))
+    (let* ((ne (ds4f-n-expert m)) (sb (d4gpu-slot-bytes (ds4f-gpu-state m)))
+           (k (min (dx-n xc) (floor (length +ds4f-hotlist+) 2)))
+           (by-layer (make-array (ds4f-n-layer m) :initial-element '())))
+      (dotimes (s k)
+        (let ((li (aref +ds4f-hotlist+ (* 2 s))) (e (aref +ds4f-hotlist+ (1+ (* 2 s)))))
+          (push (cons e s) (svref by-layer li))
+          (setf (aref (dx-owner xc) s) (+ (* li ne) e) (aref (dx-slot-of xc) (+ (* li ne) e)) s)))
+      (dotimes (li (length by-layer))
+        (let ((v (svref by-layer li)))
+          (when v
+            (read-experts-pieces m (svref (ds4f-layers m) li) (mapcar #'car v)
+                                 (mapcar (lambda (x) (* (cdr x) sb)) v) (dx-buf xc)))))
+      (setf (dx-free xc) k)))
+  xc)
+
+(defun cache-experts (m l li sel)
+  "The cache slots of layer LI's experts SEL, the missing ones read in."
+  (let* ((xc (ds4f-expert-cache m)) (ne (ds4f-n-expert m)) (k (length sel))
+         (slots (make-array k :element-type 'fixnum)) (missing '())
+         (slot-of (dx-slot-of xc)) (owner (dx-owner xc)) (used (dx-used xc))
+         (tick (incf (dx-tick xc))))
+    (declare (type (simple-array fixnum (*)) slot-of owner used))
+    (dotimes (i k)
+      (let ((s (aref slot-of (+ (* li ne) (aref sel i)))))
+        (if (>= s 0)
+            (progn (setf (aref used s) tick (aref slots i) s) (incf (dx-hits xc)))
+            (setf (aref slots i) -1))))
+    (dotimes (i k)
+      (when (minusp (aref slots i))
+        (let ((s (if (< (dx-free xc) (dx-n xc))
+                     (prog1 (dx-free xc) (incf (dx-free xc)))
+                     ;; the least recently used, never one this token holds
+                     (let ((best -1) (bu most-positive-fixnum))
+                       (dotimes (j (dx-n xc) best)
+                         (when (< (aref used j) bu) (setf best j bu (aref used j))))))))
+          (when (>= (aref owner s) 0) (setf (aref slot-of (aref owner s)) -1))
+          (setf (aref owner s) (+ (* li ne) (aref sel i)) (aref slot-of (aref owner s)) s
+                (aref used s) tick (aref slots i) s)
+          (push (cons (aref sel i) s) missing)
+          (incf (dx-misses xc)))))
+    (when missing
+      (let ((t0 (get-internal-real-time)))
+        (read-experts-pieces m l (mapcar #'car missing)
+                             (mapcar (lambda (x) (* (cdr x) (d4gpu-slot-bytes (ds4f-gpu-state m)))) missing)
+                             (dx-buf xc))
+        (incf (dx-read-time xc) (- (get-internal-real-time) t0))))
+    slots))
+
+(defparameter *ds4f-read-piece* (* 1024 1024)
+  "Expert reads go in pieces of this many bytes, on the pool's threads: the
+   SSD reads many at once.")
+
+(defun read-experts-pieces (m l experts offsets buf)
+  "Layer L's EXPERTS (gate, up, down) from the file into BUF at OFFSETS,
+   in pieces of *DS4F-READ-PIECE* across the pool."
+  (let* ((st (ds4f-gpu-state m)) (fd (ds4f-fd m)) (gb (d4gpu-gate-bytes st)) (piece *ds4f-read-piece*)
+         (jobs '()))
+    (destructuring-bind (goff grb grows gcols) (dl-gate-exps l)
+      (declare (ignore gcols))
+      (destructuring-bind (uoff urb urows ucols) (dl-up-exps l)
+        (declare (ignore urows ucols))
+        (destructuring-bind (doff drb drows dcols) (dl-down-exps l)
+          (declare (ignore dcols))
+          (loop for e in experts for at in offsets
+                do (loop for (src dst bytes) in (list (list (+ goff (* e grows grb)) at gb)
+                                                      (list (+ uoff (* e grows urb)) (+ at gb) gb)
+                                                      (list (+ doff (* e drows drb)) (+ at (* 2 gb)) (* drows drb)))
+                         do (loop for o from 0 below bytes by piece
+                                  do (push (list (+ src o) (+ dst o) (min piece (- bytes o))) jobs)))))))
+    (let ((v (coerce jobs 'simple-vector)) (base (gbuf-sap buf)))
+      (parallel-for (j (length v) (ds4f-pool m))
+        (destructuring-bind (src dst bytes) (svref v j)
+          (pread-into fd (sb-sys:sap+ base dst) src bytes))))))
+
+(defun ds4f-gpu-ffn-1! (m l li norm sel w moe &optional meanwhile)
+  "The routed experts SEL (weights W) of layer LI for one token's NORM, on
+   the GPU from the expert cache; their sum, in slot order, into MOE.
+   MEANWHILE, a function, runs on the CPU while the GPU does."
+  (let* ((st (ds4f-gpu-state m)) (gpu (d4gpu-gpu st)) (xc (ds4f-expert-cache m))
+         (d (ds4f-d m)) (ff (ds4f-ff-exp m)) (k (length sel)) (clamp (svref (ds4f-clamps m) li))
+         (sb (d4gpu-slot-bytes st)) (gb (d4gpu-gate-bytes st))
+         (slots (cache-experts m l li sel))
+         (bx (d4gpu-buf st :dx (* 4 d))) (bo (d4gpu-buf st :doffs (* 8 k)))
+         (bw (d4gpu-buf st :dw (* 4 k))) (bg (d4gpu-buf st :dg (* 4 k ff)))
+         (bu (d4gpu-buf st :du (* 4 k ff))) (bm (d4gpu-buf st :dmid (* 4 k ff)))
+         (bd (d4gpu-buf st :ddown (* 4 k d))))
+    (declare (type f32vec norm w moe))
+    (copy-floats-in bx norm d) (copy-floats-in bw w k)
+    (dotimes (i k) (setf (sb-sys:sap-ref-64 (gbuf-sap bo) (* 8 i)) (* (aref slots i) sb)))
+    (let ((grb (second (dl-gate-exps l))) (drb (second (dl-down-exps l))) (buf (dx-buf xc)))
+      (with-gpu-work-while (e gpu)
+          (flet ((mv (kernel ncols nrows rb add x xs y)
+                   (dispatch gpu e kernel (list ncols nrows rb add xs nrows) (list buf bo x y)
+                             (list (ceiling nrows 8) 1 k) 64
+                             :shared (if (string= kernel "d4_mv_iq2_xxs") (+ (* 8 256) 128) 0))))
+            (mv "d4_mv_iq2_xxs" d ff grb 0 bx 0 bg)
+            (mv "d4_mv_iq2_xxs" d ff grb gb bx 0 bu)
+            (dispatch gpu e "d4_swiglu_w" (list k ff clamp) (list bg bu bw bm) (ceiling (* k ff) 256) 256)
+            (mv "d4_mv_q2_k" ff d drb (* 2 gb) bm ff bd))
+        (when meanwhile (funcall meanwhile))))
+    (let ((ds (gbuf-sap bd)))
+      (dotimes (r d moe)
+        (let ((acc 0f0))
+          (declare (type single-float acc))
+          (dotimes (i k) (incf acc (sb-sys:sap-ref-single ds (* 4 (+ (* i d) r)))))
+          (setf (aref moe r) acc))))))

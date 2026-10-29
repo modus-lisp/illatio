@@ -30,7 +30,8 @@
      (:file "metal-qwen35" :if-feature (:and :sbcl :darwin)) ; qwen35 on it (kernels: src/metal/)
      (:file "generate")    ; sampling, prompt reuse, streaming text
      (:file "ds4f")        ; DeepSeek V4 Flash (deepseek4), ported from ds4.c
-     (:file "metal-ds4f" :if-feature (:and :sbcl :darwin)))))) ; its prefill experts on the GPU
+     (:file "ds4f-hotlist") ; its most used experts (ds4's profile)
+     (:file "metal-ds4f" :if-feature (:and :sbcl :darwin)))))) ; it on the GPU: prefill, decode's experts
 
 (defsystem "illatio/openai"
   :description "OpenAI chat completions computed in this image: chat templates
