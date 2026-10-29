@@ -1161,6 +1161,8 @@
              #+sbcl (sb-int:with-float-traps-masked (:overflow :inexact :underflow)
                       (ds4f-prefill-1 ctx chunk (and logits (<= (length rest) *ds4f-chunk*))))
              #-sbcl (ds4f-prefill-1 ctx chunk (and logits (<= (length rest) *ds4f-chunk*)))))
+  ;; decode on the GPU wants the memory more: its expert cache
+  #+(and sbcl darwin) (when (ds4f-gpu-p :decode-all) (release-staging (d4ctx-model ctx)))
   ctx)
 
 (defun ds4f-prefill-1 (ctx tokens logits)

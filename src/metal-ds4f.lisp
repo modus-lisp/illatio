@@ -15,7 +15,7 @@
 (in-package #:illatio)
 
 (defstruct (d4gpu (:constructor %make-d4gpu))
-  gpu stage (slot-bytes 0) (gate-bytes 0) (down-bytes 0) (plist* '())
+  gpu (n-expert 0) (slot-bytes 0) (gate-bytes 0) (down-bytes 0) (plist* '())
   x g u w mid down (rows 0))            ; scratch, sized for ROWS routed rows
 
 (defun ds4f-gpu-state (m)
@@ -26,8 +26,8 @@
                    (gate-bytes (* (third (dl-gate-exps l)) (second (dl-gate-exps l))))
                    (down-bytes (* (third (dl-down-exps l)) (second (dl-down-exps l))))
                    (slot (+ (* 2 gate-bytes) down-bytes)))
-              (%make-d4gpu :gpu gpu :stage (gpu-buffer gpu (* (ds4f-n-expert m) slot))
-                           :slot-bytes slot :gate-bytes gate-bytes :down-bytes down-bytes)))))
+              (%make-d4gpu :gpu gpu :n-expert (ds4f-n-expert m) :slot-bytes slot
+                           :gate-bytes gate-bytes :down-bytes down-bytes)))))
 
 (defun d4gpu-scratch (st m rows)
   "ST's row buffers, grown to hold ROWS routed rows."
@@ -75,12 +75,20 @@
    dst src bytes))
 
 (defun stage-buffer (st parity)
-  "Staging buffer PARITY (0 or 1): two, so a layer's experts can be read
-   while the one before it computes."
-  (if (zerop parity)
-      (d4gpu-stage st)
-      (or (getf (d4gpu-plist* st) :stage1)
-          (setf (getf (d4gpu-plist* st) :stage1) (gpu-buffer (d4gpu-gpu st) (gbuf-bytes (d4gpu-stage st)))))))
+  "Staging buffer PARITY (0 or 1), a slot for each of a layer's experts: two,
+   so a layer's experts can be read while the one before it computes.  Made
+   when a prefill wants them, given back after (RELEASE-STAGING)."
+  (let ((key (if (zerop parity) :stage0 :stage1)))
+    (or (getf (d4gpu-plist* st) key)
+        (setf (getf (d4gpu-plist* st) key)
+              (gpu-buffer (d4gpu-gpu st) (* (d4gpu-n-expert st) (d4gpu-slot-bytes st)))))))
+
+(defun release-staging (m)
+  "Give back M's staging buffers (3.6 GB), for the expert cache's sake."
+  (let ((st (ds4f-gpu-state m)))
+    (dolist (key '(:stage0 :stage1))
+      (let ((b (getf (d4gpu-plist* st) key)))
+        (when b (gpu-free b) (remf (d4gpu-plist* st) key))))))
 
 (defun read-layer-experts (m l parity &key (threads 4))
   "Start reading every expert of layer L into staging buffer PARITY, slot =
@@ -125,7 +133,7 @@
         (declare (ignore ucols urows))
         (destructuring-bind (doff drb drows dcols) (dl-down-exps l)
           (declare (ignore dcols))
-          (let ((fd (ds4f-fd m)) (sbase (gbuf-sap (d4gpu-stage st)))
+          (let ((fd (ds4f-fd m)) (sbase (gbuf-sap (stage-buffer st 0)))
                 (sb (d4gpu-slot-bytes st)) (gb (d4gpu-gate-bytes st)))
             (parallel-for (k (if preloaded 0 ne) pool)   ; read ahead already: slot = expert id
               (let ((e (svref ev k)) (slot (sb-sys:sap+ sbase (* k sb))))
@@ -301,8 +309,22 @@
 ;;; the six (D4_MV_IQ2_XXS, the six at once), the clamped SwiGLU times their
 ;;; routing weights, down (D4_MV_Q2_K).  The CPU sums the six in slot order.
 
-(defvar *ds4f-expert-cache-gb* 16
-  "The decode expert cache's size, in GB (an expert is about 7 MB).")
+(defun physical-memory-gb ()
+  "This machine's memory, in GiB (sysctl hw.memsize)."
+  (sb-alien:with-alien ((v sb-alien:unsigned-long 0) (len sb-alien:unsigned-long 8))
+    (sb-alien:alien-funcall
+     (sb-alien:extern-alien "sysctlbyname" (function sb-alien:int sb-alien:c-string (* t) (* sb-alien:unsigned-long)
+                                                    (* t) sb-alien:unsigned-long))
+     "hw.memsize" (sb-alien:cast (sb-alien:addr v) (* t)) (sb-alien:addr len) nil 0)
+    (ash v -30)))
+
+(defvar *ds4f-expert-cache-gb* nil
+  "The decode expert cache's size, in GB (an expert is about 7 MB); NIL:
+   what the rest of the model leaves of this machine's memory (24 GB of 48;
+   no more than 28, one Metal buffer).")
+
+(defun expert-cache-gb ()
+  (or *ds4f-expert-cache-gb* (max 4 (min 28 (- (physical-memory-gb) 24)))))
 
 (defstruct (d4xcache (:conc-name dx-)) buf (n 0) slot-of owner used pending (tick 0) (free 0)
   (hits 0) (misses 0) (read-time 0) (prefetched 0) (waited 0))
@@ -311,7 +333,7 @@
   (let ((st (ds4f-gpu-state m)))
     (or (getf (d4gpu-plist* st) :xcache)
         (let* ((sb (d4gpu-slot-bytes st))
-               (n (max 6 (floor (* *ds4f-expert-cache-gb* 1000000000) sb)))
+               (n (max 6 (floor (* (expert-cache-gb) 1000000000) sb)))
                (keys (* (ds4f-n-layer m) (ds4f-n-expert m))))
           (setf (getf (d4gpu-plist* st) :xcache)
                 (seed-expert-cache

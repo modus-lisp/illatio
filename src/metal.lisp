@@ -141,6 +141,12 @@
       (let ((sap (msg ptr obj "contents")))
         (%make-gbuf :obj obj :sap sap :bytes bytes)))))
 
+(defun gpu-free (b)
+  "Give back buffer B (GPU-BUFFER's or GPU-WRAP's; a wrapped one's memory
+   stays its owner's)."
+  (with-metal (msg sb-alien:void (gbuf-obj b) "release"))
+  nil)
+
 (defun gpu-wrap (gpu sap bytes)
   "BYTES at SAP (page-aligned, BYTES a whole number of pages) as a buffer,
    without copying: unified memory, the GPU reads it where it is."
