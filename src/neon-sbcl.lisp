@@ -75,6 +75,13 @@
 ;;;   dup  vD.4s, vN.s[i]         4e040400 | i<<19 | N<<5 | D
 ;;;   mla  vD.4s, vN.4s, vM.4s    4ea09400 | M<<16 | N<<5 | D
 ;;;   movi vD.16b, #0x30          4f01e600 | D
+;;; and for the delta rule:
+;;;   ldr  sT, [xN, #4k]          bd400000 | k<<10 | N<<5 | T
+;;;   ldr  sT, [xN, xM]           bc606800 | M<<16 | N<<5 | T
+;;;   add  xD, xN, #4             91001000 | N<<5 | D
+;;;   add  xD, xN, xM             8b000000 | M<<16 | N<<5 | D
+;;;   ldp / stp qA, qB, [xN, #16k] ad400000 / ad000000 | k<<15 | B<<10 | N<<5 | A
+;;;   fsub vD.4s, vN.4s, vM.4s    4ea0d400 | M<<16 | N<<5 | D
 ;;;   shl  vD.16b, vN.16b, #2     4f0a5400 | N<<5 | D     (ushr #2: 6f0e0400)
 ;;;   b.ne  -K instructions       54000001 | (-K mod 2^19)<<5
 ;;;
@@ -117,6 +124,10 @@
 (sb-c:defknown %q6k-unpack-2 (sb-sys:system-area-pointer (unsigned-byte 32))
     (values) ())
 (sb-c:defknown %q6k-gemm-4x4 (sb-sys:system-area-pointer (unsigned-byte 32))
+    (values) ())
+
+;;; The delta rule for sixteen values of one head, one token (see Q35-DELTA!).
+(sb-c:defknown %delta-block (sb-sys:system-area-pointer (unsigned-byte 32))
     (values) ())
 
 (sb-c:defknown %f32-axpy4
@@ -694,6 +705,95 @@
         (list (illatio::a64 #x3c810400 s00 pr) (illatio::a64 #x3c810400 s01 pr)
               (illatio::a64 #x3c810400 s10 pr) (illatio::a64 #x3c810400 s11 pr)))))))
 
+;;; Q35-DELTA!'s two passes for values v0..v0+15 of a head, a lane each: the
+;;; same operations as its portable loop, in its order, never fused.  DESC:
+;;; S at (k=0, v0), the head's q in C (k at +XOFF bytes), XOFF, v's values at
+;;; v0, where o's go, the bytes from one k's row of S to the next, then
+;;; decay, beta and the q scale as floats.
+(define-vop (illatio::%delta-block)
+  (:translate illatio::%delta-block)
+  (:policy :fast-safe)
+  (:args (desc :scs (sap-reg) :target pd) (kd :scs (unsigned-reg) :target kdr))
+  (:arg-types system-area-pointer unsigned-num)
+  (:temporary (:sc unsigned-reg) ps) (:temporary (:sc unsigned-reg) psb)
+  (:temporary (:sc unsigned-reg) pq) (:temporary (:sc unsigned-reg) pqb)
+  (:temporary (:sc unsigned-reg) xoff) (:temporary (:sc unsigned-reg) pcv)
+  (:temporary (:sc unsigned-reg) po) (:temporary (:sc unsigned-reg) stride)
+  (:temporary (:sc unsigned-reg) count)
+  (:temporary (:sc unsigned-reg :from (:argument 0)) pd)
+  (:temporary (:sc unsigned-reg :from (:argument 1)) kdr)
+  (:temporary (:sc double-reg) s0) (:temporary (:sc double-reg) s1)
+  (:temporary (:sc double-reg) s2) (:temporary (:sc double-reg) s3)
+  (:temporary (:sc double-reg) k0) (:temporary (:sc double-reg) k1)
+  (:temporary (:sc double-reg) k2) (:temporary (:sc double-reg) k3)
+  (:temporary (:sc double-reg) d0) (:temporary (:sc double-reg) d1)
+  (:temporary (:sc double-reg) d2) (:temporary (:sc double-reg) d3)
+  (:temporary (:sc double-reg) o0) (:temporary (:sc double-reg) o1)
+  (:temporary (:sc double-reg) o2) (:temporary (:sc double-reg) o3)
+  (:temporary (:sc double-reg) t0) (:temporary (:sc double-reg) t1)
+  (:temporary (:sc double-reg) t2) (:temporary (:sc double-reg) t3)
+  (:temporary (:sc double-reg) dec) (:temporary (:sc double-reg) bb)
+  (:temporary (:sc double-reg) sc) (:temporary (:sc double-reg) ck)
+  (:temporary (:sc double-reg) qs)
+  (:generator 100
+    (move pd desc) (move kdr kd)
+    (illatio::with-a64 (ps psb pq pqb xoff pcv po stride count pd kdr s0 s1 s2 s3 k0 k1 k2 k3
+                        d0 d1 d2 d3 o0 o1 o2 o3 t0 t1 t2 t3 dec bb sc ck qs)
+      (let ((ss (list s0 s1 s2 s3)) (ks (list k0 k1 k2 k3)) (ds (list d0 d1 d2 d3))
+            (os (list o0 o1 o2 o3)) (ts (list t0 t1 t2 t3)))
+        (flet ((each (fn &rest lists) (apply #'mapcar fn lists))
+               (ldp-off (a b n k) (logior #xad400000 (ash k 15) (ash b 10) (ash n 5) a))
+               (stp-off (a b n k) (logior #xad000000 (ash k 15) (ash b 10) (ash n 5) a)))
+          (flet ((load-s () (list (ldp-off s0 s1 ps 0) (ldp-off s2 s3 ps 2)))
+                 (store-s () (list (stp-off s0 s1 ps 0) (stp-off s2 s3 ps 2))))
+            (loop for r in (list psb pqb xoff pcv po stride) for k from 0
+                  do (illatio::word (illatio::a64 (logior #xf9400000 (ash k 10)) r pd)))
+            (loop for r in (list dec bb sc) for k from 6
+                  do (illatio::word (illatio::a64 (logior #xbd400000 (ash (* 2 k) 10)) r pd))
+                     (illatio::word (illatio::a64 #x4e040400 r r)))
+            (dolist (r ks) (illatio::word (illatio::a64 #x6f00e400 r)))
+            (dolist (w (list (illatio::a64-mov-x ps psb) (illatio::a64-mov-x pq pqb)
+                             (illatio::a64-mov-x count kdr)))
+              (illatio::word w))
+            ;; pass 1, each k: S *= decay; sk += S * k[k]
+            (illatio::loop-while-count
+             count
+             (append
+              (list (illatio::a64 #xbc606800 ck pq xoff) (illatio::a64 #x91001000 pq pq)
+                    (illatio::a64 #x4e040400 ck ck))
+              (load-s)
+              (each (lambda (sr) (illatio::a64 #x6e20dc00 sr sr dec)) ss)
+              (store-s)
+              (each (lambda (tr sr) (illatio::a64 #x6e20dc00 tr sr ck)) ts ss)
+              (each (lambda (kr tr) (illatio::a64 #x4e20d400 kr kr tr)) ks ts)
+              (list (illatio::a64 #x8b000000 ps ps stride))))
+            ;; d = (v - sk) * beta
+            (dolist (w (list (illatio::a64-ldp-q t0 t1 pcv) (illatio::a64-ldp-q t2 t3 pcv)))
+              (illatio::word w))
+            (each (lambda (dr tr kr) (illatio::word (illatio::a64 #x4ea0d400 dr tr kr))) ds ts ks)
+            (each (lambda (dr) (illatio::word (illatio::a64 #x6e20dc00 dr dr bb))) ds)
+            (dolist (r os) (illatio::word (illatio::a64 #x6f00e400 r)))
+            (dolist (w (list (illatio::a64-mov-x ps psb) (illatio::a64-mov-x pq pqb)
+                             (illatio::a64-mov-x count kdr)))
+              (illatio::word w))
+            ;; pass 2, each k: S += k[k] * d; o += S * (q[k] * scale)
+            (illatio::loop-while-count
+             count
+             (append
+              (list (illatio::a64 #xbc606800 ck pq xoff) (illatio::a64 #xbc404400 qs pq)
+                    (illatio::a64 #x1e200800 qs qs sc)
+                    (illatio::a64 #x4e040400 ck ck) (illatio::a64 #x4e040400 qs qs))
+              (load-s)
+              (each (lambda (tr dr) (illatio::a64 #x6e20dc00 tr ck dr)) ts ds)
+              (each (lambda (sr tr) (illatio::a64 #x4e20d400 sr sr tr)) ss ts)
+              (store-s)
+              (each (lambda (tr sr) (illatio::a64 #x6e20dc00 tr sr qs)) ts ss)
+              (each (lambda (ov tr) (illatio::a64 #x4e20d400 ov ov tr)) os ts)
+              (list (illatio::a64 #x8b000000 ps ps stride))))
+            (dolist (w (list (logior #xac810000 (ash o1 10) (ash po 5) o0)
+                             (logior #xac810000 (ash o3 10) (ash po 5) o2)))
+              (illatio::word w))))))))
+
 (define-vop (illatio::%f32-axpy4)
   (:translate illatio::%f32-axpy4)
   (:policy :fast-safe)
@@ -762,3 +862,32 @@
                                                 (search " i8mm" line))))))
                       t))
            *neon-mmla*)))
+
+(declaim (inline delta-block-p))
+(defun delta-block-p (vd)
+  "Whether Q35-DELTA! runs its heads sixteen values a call (%DELTA-BLOCK)."
+  (and (neon-dot-p) (zerop (mod vd 16))))
+
+(defun delta-blocks! (S base c kq kk vv o oo vd kd decay b scale)
+  "Q35-DELTA!'s two passes for one head and token, sixteen values a call."
+  (declare (type f32vec S c o) (type fixnum base kq kk vv oo vd kd)
+           (type single-float decay b scale) (optimize speed (safety 0)))
+  (let ((desc (make-array 9 :element-type '(unsigned-byte 64))))
+    (declare (dynamic-extent desc))
+    (sb-sys:with-pinned-objects (S c o desc)
+      (let ((s0 (sb-sys:sap-int (sb-sys:vector-sap S)))
+            (c0 (sb-sys:sap-int (sb-sys:vector-sap c)))
+            (o0 (sb-sys:sap-int (sb-sys:vector-sap o)))
+            (dsap (sb-sys:vector-sap desc)))
+        (declare (type (unsigned-byte 64) s0 c0 o0))
+        (setf (aref desc 1) (+ c0 (* 4 kq))
+              (aref desc 2) (* 4 (- kk kq))
+              (aref desc 5) (* 4 vd)
+              (aref desc 6) (ldb (byte 32 0) (sb-kernel:single-float-bits decay))
+              (aref desc 7) (ldb (byte 32 0) (sb-kernel:single-float-bits b))
+              (aref desc 8) (ldb (byte 32 0) (sb-kernel:single-float-bits scale)))
+        (loop for v0 of-type fixnum from 0 below vd by 16
+              do (setf (aref desc 0) (+ s0 (* 4 (+ base v0)))
+                       (aref desc 3) (+ c0 (* 4 (+ vv v0)))
+                       (aref desc 4) (+ o0 (* 4 (+ oo v0))))
+                 (%delta-block dsap kd))))))

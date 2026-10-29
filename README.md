@@ -16,10 +16,11 @@ operandi --illatio "task"             # or no server at all: the model in operan
 
 ## Status
 
-Two models run, both checked against llama.cpp: Qwen2.5-0.5B-Instruct and
+Three models run, all checked against llama.cpp: Qwen2.5-0.5B-Instruct,
 Qwen3-4B-Instruct-2507 (the `qwen2` and `qwen3` architectures; `llama`
 shares the code path), in Q8_0 and, for Qwen3-4B, Q4_K_M (Q4_K and Q6_K
-weights).  On an Apple M-series laptop, against
+weights), and a 27B Qwen3.5 in Q6_K (`qwen35`: gated delta net and gated
+attention layers).  On an Apple M-series laptop, against
 llama.cpp's CPU backend on the same file.  Qwen2.5-0.5B:
 
 | tok/s | illatio, NEON | illatio, portable | llama.cpp CPU |
@@ -48,6 +49,16 @@ Qwen3-4B in Q4_K_M (2.5 GB):
 | prefill, 1 thread | 12.1 | 1.1 | 14.7 |
 | decode, 8–10 threads | 65.6 | 3.0 | 61.2 |
 | prefill, 8–10 threads | 86.6 | 3.7 | 114 |
+
+The 27B `qwen35` in Q6_K (22 GB; `llama-bench -ngl 0`, prefill at 512
+tokens):
+
+| tok/s | illatio, SBCL | llama.cpp |
+|---|---|---|
+| decode, 1 thread | 1.10 | 1.19 |
+| prefill, 1 thread | 5.0 | 3.2 |
+| decode, 10 threads | 9.3 | 7.8 |
+| prefill, 10 threads | 35.5 | 25.5 |
 
 Other checks:
 
@@ -139,6 +150,21 @@ folds them straight into its stream state.
   integers and the float accumulation order are the same as the scalar
   path's, so batched prefill is bit-identical to feeding tokens one at a
   time (`src/batch.lisp`).
+- **Q6_K batches through I8MM.** A batch rebuilds each pair of Q6_K rows
+  once, as int8 q-32 laid out for SMMLA (2x8 by 8x2 int8 into 2x2 int32),
+  and runs it against the batch's tokens four at a time; the per-(row,
+  token) floats are the one-row kernel's, so prefill stays bit-identical to
+  decoding (`%Q6K-UNPACK-2`, `%Q6K-GEMM-4X4`).
+- **qwen35's recurrence** goes a token at a time inside each channel's
+  convolution and each head's delta-rule state, with everything around it
+  batched (`src/qwen35.lisp`).  A head's state is stored k-major, so sixteen
+  values go a NEON lane each (`%DELTA-BLOCK`), every one of them through
+  ggml's operations in ggml's order.
+- **Weights outside the heap.** `:STATIC` vectors live in mapped memory
+  behind a hand-written array header (on SBCL; modus has its own static
+  vectors), so the collector never scans or moves them and a 22 GB model
+  runs in a 2 GB heap.  A context's caches are static too, freed by
+  `FREE-CONTEXT` or when the context is collected.
 - **The forward pass** mirrors llama.cpp's graph op for op: RMSNorm with its
   sum in double, NEOX RoPE with theta advanced by repeated multiplication as
   ggml does, GQA attention with ggml's softmax, SwiGLU (`src/model.lisp`).
@@ -199,16 +225,16 @@ inspect/collect-vectors.py http://localhost:18931 inspect/vectors/qwen2.5-0.5b-q
 ## Next
 
 - **Speed.**
-  - Prefill could use I8MM's SMMLA, which takes 2×2 tiles of rows by
-    tokens, with weights repacked at load as ggml does.
+  - Q4_K prefill through the same rebuild-then-SMMLA path as Q6_K (the
+    4B Q4_K_M's prefill is still below llama.cpp's), and Q8_0's.
   - Decode is now near what one core can pull from memory.
   - Disk KV checkpoints for a prompt prefix that never changes (ds4 does
     this) would remove most of operandi's first-turn cost.
 - **modus.** The three kernels have `#+modus` arms (`src/neon-modus.lisp`)
   with the portable kernels' bits.  What is left is modus's thread scaling
   (8 threads give 3x) and the serial per-layer ops between the products.
-- **More formats.** Q5_K (Q5_K_M files) and Q8_0-with-K-quant mixes; Q4_K
-  prefill through I8MM.
+- **More formats.** Q5_K (Q5_K_M files) and Q8_0-with-K-quant mixes.
+- **Qwen3.6-35B-A3B** (`qwen35moe`): expert routing on top of `qwen35`.
 - **ds4f.** DeepSeek V4 Flash, ported from ds4's CPU reference path, with
   SSD streaming of routed experts for machines with less RAM than the model.
 

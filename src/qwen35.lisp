@@ -140,7 +140,10 @@
 (defun q35-delta! (pool m c beta g S o &optional (n 1))
   "The delta rule for every V head (a head per unit of work, its tokens in
    order), as build_delta_net_autoregressive: decay, read, correct, write,
-   query."
+   query.  A head's S is stored transposed, k-major (S[k][v] at k*dv + v), so
+   the values v of one k are adjacent: the loops run k outer, v inner, and
+   every v still gets exactly the sequence of operations ggml's v-major loop
+   gives it -- so a block of v's can go a NEON lane each (%DELTA-BLOCK)."
   (declare (type f32vec c beta g S o) (type fixnum n))
   (let* ((kh (model-ssm-k-heads m)) (kd (model-ssm-k-dim m))
          (vh (model-ssm-v-heads m)) (vd (model-ssm-v-dim m))
@@ -149,34 +152,51 @@
          (scale (/ 1f0 (sqrt (coerce kd 'single-float)))))
     (declare (type fixnum kh kd vh vd ch od q-off k-off v-off) (type single-float scale))
     (parallel-for (h vh pool)
-      (locally (declare (optimize speed (safety 0)))
-        (let ((base (* h vd kd)))
-          (declare (type fixnum base))
-          (dotimes (tk n)
-            (let* ((cb (* tk ch))
-                   (kq (+ cb q-off (* (mod h kh) kd))) ; ggml_repeat tiles K heads over V heads
-                   (kk (+ cb k-off (* (mod h kh) kd)))
-                   (vv (+ cb v-off (* h vd)))
-                   (oo (+ (* tk od) (* h vd)))
-                   (decay (exp (aref g (+ (* tk vh) h))))
-                   (b (aref beta (+ (* tk vh) h))))
-              (declare (type fixnum cb kq kk vv oo) (type single-float decay b))
-              (dotimes (v vd)
-                (let ((row (+ base (* v kd))) (sk 0f0))
-                  (declare (type fixnum row) (type single-float sk))
-                  ;; S *= exp(g), and the row's S k with the decayed values
-                  (dotimes (k kd)
-                    (let ((sv (* (aref S (+ row k)) decay)))
-                      (setf (aref S (+ row k)) sv
-                            sk (+ sk (* sv (aref c (+ kk k)))))))
-                  (let ((d (* (- (aref c (+ vv v)) sk) b)) (ov 0f0))
-                    (declare (type single-float d ov))
-                    ;; S += d k^T, then o = S (q * scale)
-                    (dotimes (k kd)
-                      (let ((sv (+ (aref S (+ row k)) (* (aref c (+ kk k)) d))))
-                        (setf (aref S (+ row k)) sv
-                              ov (+ ov (* sv (* (aref c (+ kq k)) scale))))))
-                    (setf (aref o (+ oo v)) ov)))))))))))
+      (let ((sk (make-array vd :element-type 'single-float))
+            (dv (make-array vd :element-type 'single-float))
+            (ov (make-array vd :element-type 'single-float)))
+        (declare (dynamic-extent sk dv ov))
+        (locally (declare (optimize speed (safety 0)) (type f32vec sk dv ov))
+          (let ((base (* h vd kd)))
+            (declare (type fixnum base))
+            (dotimes (tk n)
+              (let* ((cb (* tk ch))
+                     (kq (+ cb q-off (* (mod h kh) kd))) ; ggml_repeat tiles K heads over V heads
+                     (kk (+ cb k-off (* (mod h kh) kd)))
+                     (vv (+ cb v-off (* h vd)))
+                     (oo (+ (* tk od) (* h vd)))
+                     (decay (exp (aref g (+ (* tk vh) h))))
+                     (b (aref beta (+ (* tk vh) h))))
+                (declare (type fixnum cb kq kk vv oo) (type single-float decay b))
+                (if (delta-block-p vd)
+                    (delta-blocks! S base c kq kk vv o oo vd kd decay b scale)
+                    (progn
+                      (fill sk 0f0)
+                      ;; S *= exp(g), and each value's S k with the decayed S
+                      (dotimes (k kd)
+                        (let ((ck (aref c (+ kk k))) (row (+ base (* k vd))))
+                          (declare (type single-float ck) (type fixnum row))
+                          (dotimes (v vd)
+                            (let ((sv (* (aref S (+ row v)) decay)))
+                              (setf (aref S (+ row v)) sv
+                                    (aref sk v) (+ (aref sk v) (* sv ck)))))))
+                      (dotimes (v vd)
+                        (setf (aref dv v) (* (- (aref c (+ vv v)) (aref sk v)) b)
+                              (aref ov v) 0f0))
+                      ;; S += d k^T, then o = S (q * scale)
+                      (dotimes (k kd)
+                        (let ((ck (aref c (+ kk k))) (qs (* (aref c (+ kq k)) scale))
+                              (row (+ base (* k vd))))
+                          (declare (type single-float ck qs) (type fixnum row))
+                          (dotimes (v vd)
+                            (let ((sv (+ (aref S (+ row v)) (* ck (aref dv v)))))
+                              (setf (aref S (+ row v)) sv
+                                    (aref ov v) (+ (aref ov v) (* sv qs)))))))
+                      (replace o ov :start1 oo)))))))))))
+
+#-(and sbcl arm64) (declaim (inline delta-block-p))
+#-(and sbcl arm64) (defun delta-block-p (vd) (declare (ignore vd)) nil)
+#-(and sbcl arm64) (defun delta-blocks! (&rest args) (declare (ignore args)) (error "no NEON delta kernel"))
 
 (defun q35-out-norm! (pool m l o z n)
   "O = rmsnorm(O)*ssm_norm * silu(Z), per V head of each token."
