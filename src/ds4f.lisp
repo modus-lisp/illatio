@@ -51,14 +51,15 @@
   (layers #() :type simple-vector)
   (gpu-plist '()))                      ; the GPU's state, when it runs (metal-ds4f.lisp)
 
-(defvar *ds4f-gpu* #+(and sbcl darwin) '(:experts :proj :attn :decode :decode-all) #-(and sbcl darwin) nil
+(defvar *ds4f-gpu* #+(and sbcl darwin) '(:experts :proj :attn :decode :decode-all :prefill-all) #-(and sbcl darwin) nil
   "What of DS4F the GPU runs (metal-ds4f.lisp): any of :EXPERTS (prefill's
    routed FFN), :PROJ (prefill's attention and shared expert Q8_0
    products), :ATTN (prefill's attention), :DECODE (a token's routed
    experts, from the GPU's expert cache), :DECODE-ATTN (a token's attention
    projections; off: three command buffers a layer cost more, about 1.1 ms,
    than the CPU's products, about 0.9), :DECODE-ALL (a token's every layer
-   on the GPU, metal-ds4f-decode.lisp); T is all of them, NIL none.")
+   on the GPU, metal-ds4f-decode.lisp), :PREFILL-ALL (a prefill chunk's every
+   layer on it, metal-ds4f-prefill.lisp); T is all of them, NIL none.")
 
 (defparameter *ds4f-prefetch-k* 8
   "How many of the next layer's experts decode reads ahead (0: none).")
@@ -1191,6 +1192,9 @@
   ctx)
 
 (defun ds4f-prefill-1 (ctx tokens logits)
+  #+(and sbcl darwin)
+  (when (ds4f-gpu-p :prefill-all)
+    (return-from ds4f-prefill-1 (ds4f-gpu-prefill-1 ctx tokens logits)))
   (unless (ds4f-gpu-p :proj) (ds4f-cpu-q8! (d4ctx-model ctx)))
   (let* ((*q8-f16-scale* *ds4f-q8-f16-scale*)
          (m (d4ctx-model ctx)) (d (ds4f-d m)) (n-hc (ds4f-n-hc m)) (hcd (* n-hc d))

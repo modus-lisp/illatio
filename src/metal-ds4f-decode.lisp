@@ -72,8 +72,9 @@
 (defun enc-mvf (gpu e w x y rows cols)
   (dispatch gpu e "d4_mv_f32" (list cols rows) (list w x y) (ceiling rows 4) 256 :shared 128))
 
-(defun enc-rope (gpu e x cs nh hd nrot)
-  (dispatch gpu e "d4_rope" (list nh hd nrot) (list x cs) (ceiling (* nh (floor nrot 2)) 256) 256))
+(defun enc-rope (gpu e x cs nh hd nrot &optional (ntok 1))
+  "RoPE on NTOK tokens' NH heads at X, CS a table a token."
+  (dispatch gpu e "d4_rope" (list nh hd nrot ntok) (list x cs) (ceiling (* ntok nh (floor nrot 2)) 256) 256))
 
 (defun enc-hc-pre (m gpu e st fn scale base streams out pc)
   "HC-PRE of STREAMS (4 x D): OUT, its POST and COMB into PC."
@@ -86,10 +87,11 @@
               (list mix (gpu-vector m scale) (gpu-vector m base) streams out pc)
               (ceiling d 256) 256 :shared (* 4 32))))
 
-(defun enc-hc-post (m gpu e block streams pc out)
+(defun enc-hc-post (m gpu e block streams pc out &optional (ntok 1))
+  "HC post for NTOK tokens (each's BLOCK, STREAMS, PC and OUT a row)."
   (let ((d (ds4f-d m)) (n (ds4f-n-hc m)))
-    (dispatch gpu e "d4_hc_post" (list d n (ds4f-sinkhorn m) 1f-6) (list block streams pc out)
-              (ceiling (* n d) 256) 256)))
+    (dispatch gpu e "d4_hc_post" (list d n ntok 1f-6) (list block streams pc out)
+              (ceiling (* ntok n d) 256) 256)))
 
 (defun enc-compressor (m gpu e st l li c norm pos ratio wkv wgate ape normw rows-of n-of hd kind)
   "One compressor's step for the token at POS (its window in C), and on a
@@ -161,7 +163,8 @@
           (dispatch gpu e "d4_ix_scores" (list 1 nix ixh)
                     (list ixq ixw (gpu-vector m (dc-ix-comp c)) (arena-put st (list nix)) scores)
                     (list (ceiling nix 32) 1) 128 :shared (* 4 (+ (* 8 128) (* 32 128) (* 8 32))))
-          (dispatch gpu e "d4_topk" (list nix top-k) (list scores idx) 1 1024 :shared (* 4 (+ 32 1024 1024)))))
+          (dispatch gpu e "d4_topk" (list nix top-k nix) (list scores idx (arena-put st (list nix))) 1 1024
+                    :shared (* 4 96))))
       (let ((kc (if (dc-comp c) (gpu-vector m (dc-comp c)) (gpu-vector m (dc-raw c))))
             (ncomp (if indexed top-k nc)))
         (assert (= hd 512) () "d4_attend1 is written for 512-wide heads (128 threads x 4)")

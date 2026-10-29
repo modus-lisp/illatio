@@ -654,8 +654,11 @@ kernel void d4_hc_pre_fin(constant d4_hcpre_args & a [[buffer(0)]],
                           device const float * base [[buffer(3)]], device const float * streams [[buffer(4)]],
                           device float * out [[buffer(5)]], device float * pc [[buffer(6)]],
                           threadgroup float * sh [[threadgroup(0)]],
-                          uint gid [[thread_position_in_grid]], ushort tid [[thread_index_in_threadgroup]],
-                          uint tg [[threadgroup_position_in_grid]]) {
+                          uint2 gid2 [[thread_position_in_grid]], ushort tid [[thread_index_in_threadgroup]],
+                          uint2 tg2 [[threadgroup_position_in_grid]]) {
+    // a token a row of threadgroups (grid y): its mixes, streams, out and PC
+    const uint tg = tg2.x, gid = gid2.x, tok = tg2.y;
+    mix += tok * 32; streams += (uint64_t)tok * a.n * a.d; out += (uint64_t)tok * a.d; pc += tok * 32;
     // the first simdgroup: lane i < 16 holds COMB entry (src = i % 4, dst =
     // i / 4); a dst's row sums over lanes ^1 ^2, a src's column over ^4 ^8
     // (written for 4 streams: the host checks)
@@ -696,24 +699,28 @@ kernel void d4_hc_post(constant d4_hcpre_args & a [[buffer(0)]],
                        device const float * block [[buffer(1)]], device const float * streams [[buffer(2)]],
                        device const float * pc [[buffer(3)]], device float * outs [[buffer(4)]],
                        uint gid [[thread_position_in_grid]]) {
-    if (gid >= a.n * a.d) return;
-    const uint dst = gid / a.d, j = gid % a.d, n = a.n;
+    // GID over tokens x streams x D (decode: one token)
+    const uint hcd = a.n * a.d, tok = gid / hcd, r = gid % hcd;
+    if (tok >= a.iters) return;                 // ITERS: here, the tokens
+    const uint dst = r / a.d, j = r % a.d, n = a.n;
+    block += (uint64_t)tok * a.d; streams += (uint64_t)tok * hcd; pc += tok * 32;
     float v = block[j] * pc[dst];
     for (uint src = 0; src < n; ++src) v += pc[n + dst + src * n] * streams[src * a.d + j];
-    outs[gid] = v;
+    outs[(uint64_t)tok * hcd + r] = v;
 }
 
 // RoPE on the last NROT dims of each of NH heads of HD at X, CS the pairs'
 // (cos, sin) from the CPU (D4-ROPE-CS: a layer's, a position's, inverse or not).
-struct d4_rope_args { uint nh; uint hd; uint nrot; };
+struct d4_rope_args { uint nh; uint hd; uint nrot; uint ntok; };
 
 kernel void d4_rope(constant d4_rope_args & a [[buffer(0)]],
                     device float * x [[buffer(1)]], device const float * cs [[buffer(2)]],
                     uint gid [[thread_position_in_grid]]) {
-    const uint half_rot = a.nrot / 2;
-    if (gid >= a.nh * half_rot) return;
-    const uint h = gid / half_rot, i = 2 * (gid % half_rot);
-    device float * t = x + (uint64_t)h * a.hd + (a.hd - a.nrot);
+    const uint half_rot = a.nrot / 2, per = a.nh * half_rot;
+    if (gid >= a.ntok * per) return;
+    const uint tok = gid / per, h = (gid % per) / half_rot, i = 2 * (gid % half_rot);
+    cs += tok * a.nrot;                         // a token's table, then its heads
+    device float * t = x + ((uint64_t)tok * a.nh + h) * a.hd + (a.hd - a.nrot);
     const float c = cs[i], s = cs[i + 1], x0 = t[i], x1 = t[i + 1];
     t[i] = x0 * c - x1 * s;
     t[i + 1] = x0 * s + x1 * c;
@@ -825,9 +832,11 @@ kernel void d4_kv_fin(constant d4_kv_args & a [[buffer(0)]],
                       device const float * kv0 [[buffer(1)]], device const float * w [[buffer(2)]],
                       device const float * cs [[buffer(3)]], device float * raw [[buffer(4)]],
                       threadgroup float * sh [[threadgroup(0)]],
-                      ushort tid [[thread_index_in_threadgroup]]) {
+                      uint t [[threadgroup_position_in_grid]], ushort tid [[thread_index_in_threadgroup]]) {
+    // a threadgroup a token: row T of KV0 into row SLOT + T of RAW
     threadgroup float * v = sh;                 // hd
     threadgroup float * red = sh + a.hd;        // 32
+    kv0 += (uint64_t)t * a.hd; cs += t * a.nrot;
     const float x = kv0[tid];
     const float ss = d4_tg_sum(x * x, red, tid, a.hd);
     const float scale = 1.f / sqrt(ss / (float)a.hd + a.eps);
@@ -835,7 +844,7 @@ kernel void d4_kv_fin(constant d4_kv_args & a [[buffer(0)]],
     threadgroup_barrier(mem_flags::mem_threadgroup);
     d4_rope_row(v, a.hd, a.nrot, cs, tid);
     d4_round_row(v, a.hd, a.nrot, 0, tid, red);
-    raw[(uint64_t)a.slot * a.hd + tid] = (float)(half)v[tid];
+    raw[(uint64_t)(a.slot + t) * a.hd + tid] = (float)(half)v[tid];
 }
 
 // compressor_decode_one: this token's projected row KV and score SC (plus
@@ -913,9 +922,12 @@ kernel void d4_ixq_fin(constant d4_ixq_args & a [[buffer(0)]],
                        device float * q [[buffer(1)]], device const float * cs [[buffer(2)]],
                        device float * w [[buffer(3)]],
                        threadgroup float * sh [[threadgroup(0)]],
-                       uint h [[threadgroup_position_in_grid]], ushort tid [[thread_index_in_threadgroup]]) {
+                       uint2 hg [[threadgroup_position_in_grid]], ushort tid [[thread_index_in_threadgroup]]) {
+    // threadgroup (head, token)
+    const uint h = hg.x, tok = hg.y;
     threadgroup float * v = sh, * red = sh + 128;
-    device float * qh = q + h * 128;
+    cs += tok * a.nrot; w += tok * a.nh;
+    device float * qh = q + ((uint64_t)tok * a.nh + h) * 128;
     v[tid] = qh[tid];
     threadgroup_barrier(mem_flags::mem_threadgroup);
     d4_rope_row(v, 128, a.nrot, cs, tid);
@@ -926,18 +938,24 @@ kernel void d4_ixq_fin(constant d4_ixq_args & a [[buffer(0)]],
 
 // The indexer's pick: of N scores, the K highest, their rows in order into
 // IDX (the earlier of equal scores first, as TOP-K-ROWS).  1024 threads.
-struct d4_topk_args { uint n; uint k; };
+struct d4_topk_args { uint n; uint k; uint stride; };
 
 static uint d4_key(float f) { const uint u = as_type<uint>(f); return (u & 0x80000000u) ? ~u : (u | 0x80000000u); }
 
 kernel void d4_topk(constant d4_topk_args & a [[buffer(0)]],
                     device const float * scores [[buffer(1)]], device uint * idx [[buffer(2)]],
+                    device const uint * vis [[buffer(3)]],
                     threadgroup uint * sh [[threadgroup(0)]],
-                    ushort tid [[thread_index_in_threadgroup]]) {
+                    uint tok [[threadgroup_position_in_grid]], ushort tid [[thread_index_in_threadgroup]]) {
+    // a threadgroup a token: its row of scores (STRIDE apart), VIS of them;
+    // a token that sees K or fewer takes them all
     threadgroup uint * cnt = sh;                // 32 (simd partials)
-    threadgroup uint * pg = sh + 32;            // 1024: per-thread counts above
-    threadgroup uint * pe = sh + 32 + 1024;     // 1024: per-thread counts equal
-    const uint n = a.n, per = (n + 1023) / 1024, s0 = tid * per, s1 = min(n, s0 + per);
+    threadgroup uint * pg = sh + 32;            // 32: per-simdgroup counts above
+    threadgroup uint * pe = sh + 64;            // 32: per-simdgroup counts equal
+    const uint n = vis[tok];
+    scores += (uint64_t)tok * a.stride; idx += (uint64_t)tok * a.k;
+    if (n <= a.k) { for (uint i = tid; i < n; i += 1024) idx[i] = i; return; }
+    const uint per = (n + 1023) / 1024, s0 = tid * per, s1 = min(n, s0 + per);
     // the largest T with at least K keys >= T, bit by bit
     uint t = 0;
     for (int bit = 31; bit >= 0; --bit) {
@@ -1043,4 +1061,169 @@ kernel void d4_attend1(constant d4_att1_args & a [[buffer(0)]],
     *(device float4 *)(ob + hd) = o1 * red[1];
     *(device float4 *)(ob + 2 * hd) = o2 * red[2];
     *(device float4 *)(ob + 3 * hd) = o3 * red[3];
+}
+
+// --- prefill on the GPU: a chunk's layer, its activations staying there --------------
+
+// KR[i] = RING[(R0 + i) % RCAP] for NROWS rows of HD: the window's rows,
+// oldest first, ahead of the chunk's own.
+struct d4_ring_args { uint hd; uint rcap; uint r0; uint k0; uint nrows; };
+
+kernel void d4_ring_gather(constant d4_ring_args & a [[buffer(0)]],
+                           device const float * ring [[buffer(1)]], device float * kr [[buffer(2)]],
+                           uint gid [[thread_position_in_grid]]) {
+    if (gid >= a.nrows * a.hd) return;
+    const uint i = gid / a.hd, j = gid % a.hd;
+    kr[(uint64_t)(a.k0 + i) * a.hd + j] = ring[(uint64_t)((a.r0 + i) % a.rcap) * a.hd + j];
+}
+
+// RING[(R0 + i) % RCAP] = KR[K0 + i]: the chunk's last rows into the window.
+kernel void d4_ring_store(constant d4_ring_args & a [[buffer(0)]],
+                          device float * ring [[buffer(1)]], device const float * kr [[buffer(2)]],
+                          uint gid [[thread_position_in_grid]]) {
+    if (gid >= a.nrows * a.hd) return;
+    const uint i = gid / a.hd, j = gid % a.hd;
+    ring[(uint64_t)((a.r0 + i) % a.rcap) * a.hd + j] = kr[(uint64_t)(a.k0 + i) * a.hd + j];
+}
+
+// A compressor over a chunk.  Token Q's projected row (WIDTH: for ratio 4 a
+// previous-window half then a current one) and score (plus APE's row Q mod
+// RATIO): the chunk's own (PROJ_KV, PROJ_SC) from POS0, else the window the
+// context carries (ST_*: ratio 4, rows RATIO + Q mod RATIO for the current
+// window, Q mod RATIO for the one before; ratio 128, Q mod RATIO).
+struct d4_cb_args { uint hd; uint ratio; uint width; float eps; uint kind; uint nrot;
+                    uint dst0; uint pos0; uint p0; uint wstart; uint ape_cols; };
+
+static void d4_comp_src(constant d4_cb_args & a, int q, uint col,
+                        device const float * pkv, device const float * psc, device const float * ape,
+                        device const float * st_kv, device const float * st_sc, thread float & kv, thread float & sc) {
+    if (q < 0) { kv = 0.f; sc = -1e30f; return; }
+    const uint uq = (uint)q;
+    if (uq >= a.pos0) {
+        const uint64_t o = (uint64_t)(uq - a.pos0) * a.width + col;
+        kv = pkv[o]; sc = psc[o] + ape[(uq % a.ratio) * a.ape_cols + col];
+    } else {
+        const uint row = (a.ratio == 4 && uq >= a.wstart) ? a.ratio + uq % a.ratio : uq % a.ratio;
+        kv = st_kv[row * a.width + col]; sc = st_sc[row * a.width + col];
+    }
+}
+
+// Every window that ends in the chunk (boundary B at P0 + B * RATIO), as
+// D4_COMP_POOL pools it: compressed row DST0 + B.  A threadgroup a boundary,
+// HD threads; CS its RoPE table (NROT a boundary).
+kernel void d4_comp_pool_chunk(constant d4_cb_args & a [[buffer(0)]],
+                               device const float * pkv [[buffer(1)]], device const float * psc [[buffer(2)]],
+                               device const float * ape [[buffer(3)]], device const float * st_kv [[buffer(4)]],
+                               device const float * st_sc [[buffer(5)]], device const float * w [[buffer(6)]],
+                               device const float * cs [[buffer(7)]], device float * rows [[buffer(8)]],
+                               threadgroup float * sh [[threadgroup(0)]],
+                               uint b [[threadgroup_position_in_grid]], ushort tid [[thread_index_in_threadgroup]]) {
+    threadgroup float * v = sh, * red = sh + a.hd;
+    const uint j = tid, hd = a.hd, r4 = a.ratio == 4;
+    const int p = (int)(a.p0 + b * a.ratio);
+    float mx = -1e30f;
+    for (uint r = 0; r < a.ratio; ++r) {
+        float kv, sc;
+        d4_comp_src(a, p - (int)a.ratio + 1 + (int)r, (r4 ? hd : 0) + j, pkv, psc, ape, st_kv, st_sc, kv, sc);
+        mx = max(mx, sc);
+        if (r4) { d4_comp_src(a, p - 2 * (int)a.ratio + 1 + (int)r, j, pkv, psc, ape, st_kv, st_sc, kv, sc); mx = max(mx, sc); }
+    }
+    float pooled = 0.f;
+    if (mx > -5e29f) {
+        float denom = 0.f, sum = 0.f;
+        for (uint r = 0; r < a.ratio; ++r) {
+            float kv, sc;
+            if (r4) {
+                float kp, sp;
+                d4_comp_src(a, p - 2 * (int)a.ratio + 1 + (int)r, j, pkv, psc, ape, st_kv, st_sc, kp, sp);
+                d4_comp_src(a, p - (int)a.ratio + 1 + (int)r, hd + j, pkv, psc, ape, st_kv, st_sc, kv, sc);
+                const float wp = exp(sp - mx), wc = exp(sc - mx);
+                denom += wp + wc; sum += wp * kp; sum += wc * kv;
+            } else {
+                d4_comp_src(a, p - (int)a.ratio + 1 + (int)r, j, pkv, psc, ape, st_kv, st_sc, kv, sc);
+                const float ww = exp(sc - mx);
+                denom += ww; sum += ww * kv;
+            }
+        }
+        pooled = denom > 0.f ? sum / denom : 0.f;
+    }
+    const float ss = d4_tg_sum(pooled * pooled, red, tid, hd);
+    const float scale = 1.f / sqrt(ss / (float)hd + a.eps);
+    v[j] = (pooled * scale) * w[j];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    d4_rope_row(v, hd, a.nrot, cs + b * a.nrot, tid);
+    d4_round_row(v, hd, a.nrot, a.kind, tid, red);
+    rows[(uint64_t)(a.dst0 + b) * hd + j] = (float)(half)v[j];
+}
+
+// The window the context carries after the chunk (ending at E = POS0 + N - 1,
+// in window [CW, CW + RATIO)), as the CPU's would hold it: the current
+// window's rows for the chunk's tokens in it, and for ratio 4 the window
+// before (or, when E ends a window, that window) as the previous half.  One
+// threadgroup of 1024; the carried rows it reads are read before any write.
+struct d4_cc_args { uint ratio; uint width; uint pos0; uint n; uint wstart; uint ape_cols; uint prev_from; uint set_prev; };
+
+kernel void d4_comp_carry(constant d4_cc_args & a [[buffer(0)]],
+                          device const float * pkv [[buffer(1)]], device const float * psc [[buffer(2)]],
+                          device const float * ape [[buffer(3)]], device float * st_kv [[buffer(4)]],
+                          device float * st_sc [[buffer(5)]],
+                          ushort tid [[thread_index_in_threadgroup]]) {
+    const uint e = a.pos0 + a.n - 1, cw = (e / a.ratio) * a.ratio, width = a.width, r4 = a.ratio == 4;
+    // the previous half's new rows, gathered first (they may read rows being rewritten)
+    float pk[4], ps[4];
+    const uint np = r4 && a.set_prev ? a.ratio * width : 0;
+    for (uint k = 0; k < 4; ++k) {
+        const uint i = tid + k * 1024;
+        if (i < np) {
+            const uint r = i / width, col = i % width, q = a.prev_from + r;
+            if (q >= a.pos0) {
+                const uint64_t o = (uint64_t)(q - a.pos0) * width + col;
+                pk[k] = pkv[o]; ps[k] = psc[o] + ape[(q % a.ratio) * a.ape_cols + col];
+            } else {
+                const uint row = q >= a.wstart ? a.ratio + q % a.ratio : q % a.ratio;
+                pk[k] = st_kv[row * width + col]; ps[k] = st_sc[row * width + col];
+            }
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_device);
+    for (uint k = 0; k < 4; ++k) {
+        const uint i = tid + k * 1024;
+        if (i < np) { st_kv[i] = pk[k]; st_sc[i] = ps[k]; }
+    }
+    // the current window's rows for the chunk's tokens in it
+    const uint q0 = max(cw, a.pos0);
+    const uint nc = (e + 1 - q0) * width;
+    for (uint i = tid; i < nc; i += 1024) {
+        const uint q = q0 + i / width, col = i % width;
+        const uint row = r4 ? a.ratio + q % a.ratio : q % a.ratio;
+        const uint64_t o = (uint64_t)(q - a.pos0) * width + col;
+        st_kv[row * width + col] = pkv[o];
+        st_sc[row * width + col] = psc[o] + ape[(q % a.ratio) * a.ape_cols + col];
+    }
+}
+
+// X[r] = SRC[MAP[r]], rows of D: the tokens an expert serves, gathered.
+struct d4_gather_args { uint d; uint nrows; };
+
+kernel void d4_gather_rows(constant d4_gather_args & a [[buffer(0)]],
+                           device const float * src [[buffer(1)]], device const uint * map [[buffer(2)]],
+                           device float * x [[buffer(3)]], uint gid [[thread_position_in_grid]]) {
+    if (gid >= a.nrows * a.d) return;
+    const uint r = gid / a.d, j = gid % a.d;
+    x[gid] = src[(uint64_t)map[r] * a.d + j];
+}
+
+// MOE[t] = its NU slots' rows of DOWN (MAP[t * NU + slot]), in slot order,
+// plus SHARED[t].
+struct d4_msum2_args { uint d; uint nu; uint ntok; };
+
+kernel void d4_moe_sum_rows(constant d4_msum2_args & a [[buffer(0)]],
+                            device const float * down [[buffer(1)]], device const uint * map [[buffer(2)]],
+                            device const float * shared_ [[buffer(3)]], device float * moe [[buffer(4)]],
+                            uint gid [[thread_position_in_grid]]) {
+    if (gid >= a.ntok * a.d) return;
+    const uint t = gid / a.d, j = gid % a.d;
+    float acc = 0.f;
+    for (uint s = 0; s < a.nu; ++s) acc += down[(uint64_t)map[t * a.nu + s] * a.d + j];
+    moe[gid] = acc + shared_[gid];
 }

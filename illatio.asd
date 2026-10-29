@@ -33,7 +33,8 @@
      (:file "ds4f-kv")      ; its state saved: a long prompt prefilled once
      (:file "ds4f-hotlist") ; its most used experts (ds4's profile)
      (:file "metal-ds4f" :if-feature (:and :sbcl :darwin)) ; it on the GPU: prefill, decode's experts
-     (:file "metal-ds4f-decode" :if-feature (:and :sbcl :darwin)))))) ; a token's every layer on it
+     (:file "metal-ds4f-decode" :if-feature (:and :sbcl :darwin)) ; a token's every layer on it
+     (:file "metal-ds4f-prefill" :if-feature (:and :sbcl :darwin)))))) ; a prefill chunk's
 
 (defsystem "illatio/openai"
   :description "OpenAI chat completions computed in this image: chat templates
