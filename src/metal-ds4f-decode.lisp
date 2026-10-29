@@ -69,9 +69,6 @@
 (defun enc-rms (gpu e x w out n groups eps)
   (dispatch gpu e "d4_rms" (list n eps (if w 1 0)) (list x (or w x) out) groups (min 1024 n) :shared 128))
 
-(defun enc-mvf (gpu e w x y rows cols)
-  (dispatch gpu e "d4_mv_f32" (list cols rows) (list w x y) (ceiling rows 4) 256 :shared 128))
-
 (defun enc-rope (gpu e x cs nh hd nrot &optional (ntok 1))
   "RoPE on NTOK tokens' NH heads at X, CS a table a token."
   (dispatch gpu e "d4_rope" (list nh hd nrot ntok) (list x cs) (ceiling (* ntok nh (floor nrot 2)) 256) 256))
@@ -282,7 +279,7 @@
             (when (and (plusp *ds4f-prefetch-k*) (< (1+ li) nl))
               (let ((pl (f32vec ne)))
                 (copy-floats-out pl (d4gpu-buf st :g-plogits (* 4 ne)) ne)
-                (prefetch-cache-experts m (1+ li) (predict-experts m (1+ li) norm2 token *ds4f-prefetch-k* pl))))
+                (prefetch-cache-experts m (1+ li) (predict-experts m (1+ li) token *ds4f-prefetch-k* pl))))
             (setf pending (list l li slots w))))))
     (arena-reset st)
     (with-gpu-work (e gpu)

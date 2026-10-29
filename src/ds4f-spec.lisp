@@ -92,7 +92,7 @@
   "For GENERATE: TOKEN at CTX's next position and the guesses its greedy
    choices confirm; those (:NO if there is nothing to guess with)."
   (let ((model (context-model ctx)))
-    (unless (and (typep (model-impl model) 'ds4f) (ds4f-gpu-p :prefill-all) (plusp *ds4f-spec-k*))
+    (unless (and (typep (model-impl model) 'ds4f) (ds4f-gpu-p :prefill) (plusp *ds4f-spec-k*))
       (return-from ds4f-speculate :no))
     (let* ((hist (coerce (append (context-tokens ctx) (list tok)) 'simple-vector))
            (draft (ngram-draft hist (min *ds4f-spec-k* more))))

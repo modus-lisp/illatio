@@ -660,28 +660,8 @@ kernel void d4_rms(constant d4_rms_args & a [[buffer(0)]],
     for (uint i = tid; i < a.n; i += nt) orow[i] = a.has_w ? (xr[i] * scale) * w[i] : xr[i] * scale;
 }
 
-// Y = W X, W f32 rows: 4 rows a threadgroup, K split across its 8 simdgroups.
 struct d4_mvf_args { uint ncols; uint nrows; };
 
-kernel void d4_mv_f32(constant d4_mvf_args & a [[buffer(0)]],
-                      device const float * w [[buffer(1)]], device const float * x [[buffer(2)]],
-                      device float * y [[buffer(3)]],
-                      threadgroup float * red [[threadgroup(0)]],
-                      uint tg [[threadgroup_position_in_grid]], ushort tid [[thread_index_in_threadgroup]]) {
-    const uint r0 = tg * 4;
-    float s[4] = {0.f, 0.f, 0.f, 0.f};
-    device const float4 * x4 = (device const float4 *)x;
-    const uint n4 = a.ncols / 4;
-    for (uint i = tid; i < n4; i += 256) {
-        const float4 xv = x4[i];
-        for (short r = 0; r < 4; ++r)
-            if (r0 + r < a.nrows) s[r] += dot(((device const float4 *)(w + (uint64_t)(r0 + r) * a.ncols))[i], xv);
-    }
-    for (short r = 0; r < 4; ++r) {
-        const float t = d4_tg_sum(s[r], red, tid, 256);
-        if (tid == 0 && r0 + r < a.nrows) y[r0 + r] = t;
-    }
-}
 
 // hc_split_sinkhorn_one and the pre-weighted sum: MIX (the N*(N+2) mixes)
 // into PC (POST[N], then COMB[N*N]) and OUT[j] = sum_h STREAMS[h][j] PRE[h].
@@ -1365,7 +1345,8 @@ kernel void d4_group_scatter(constant d4_group_args & a [[buffer(0)]],
     rmap[row] = gid / a.nu; smap[gid] = row; wrow[row] = w[gid];
 }
 
-// Y = W X, W's rows F16 (the file's): D4_MV_F32's shape, half the bytes.
+// Y = W X, W's rows F16 (the file's): 4 rows a threadgroup, K split across
+// its 8 simdgroups.
 kernel void d4_mv_f16(constant d4_mvf_args & a [[buffer(0)]],
                       device const half * w [[buffer(1)]], device const float * x [[buffer(2)]],
                       device float * y [[buffer(3)]],

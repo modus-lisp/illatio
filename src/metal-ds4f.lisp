@@ -1,25 +1,21 @@
-;;;; metal-ds4f.lisp — DeepSeek V4 Flash's prefill experts on the GPU, streamed
-;;;; from the SSD.
+;;;; metal-ds4f.lisp — DeepSeek V4 Flash on the GPU: its weights, its expert
+;;;; pool, the reads from the SSD.
 ;;;
 ;;; The GPU can't read the 86.7 GB mapped file in place -- Metal's buffers stop
 ;;; at 30 GB, and a buffer over a file mapping would have its pages made
-;;; resident while a command runs -- so a layer's routed experts are copied,
-;;; from the mapping (the SSD, or the page cache when they are there), into a
-;;; GPU-visible staging buffer, one slot an expert, as ds4 does with its expert
-;;; cache.  The copies run on the pool's threads, an expert each.  Then one
-;;; command buffer: for each expert, its gate and up products against the
-;;; tokens that chose it (gathered into a block of rows), the clamped SwiGLU
-;;; times each row's routing weight, and its down product.  The CPU sums each
-;;; token's experts in slot order.
+;;; resident while a command runs -- so what it computes with is copied in:
+;;; the non-routed weights once (their raw blocks, the file's own format),
+;;; the routed experts by pread into slots of one pool as they are wanted, as
+;;; ds4 streams them.  The passes that use them are metal-ds4f-decode.lisp
+;;; (a token) and metal-ds4f-prefill.lisp (a prompt chunk).
 
 (in-package #:illatio)
 
 (defstruct (d4gpu (:constructor %make-d4gpu))
-  gpu (n-expert 0) (slot-bytes 0) (gate-bytes 0) (down-bytes 0) (plist* '())
-  x g u w mid down (rows 0))            ; scratch, sized for ROWS routed rows
+  gpu (n-expert 0) (slot-bytes 0) (gate-bytes 0) (down-bytes 0) (plist* '()))
 
 (defun ds4f-gpu-state (m)
-  "The GPU state of DS4F M: a staging slot for each of a layer's experts."
+  "The GPU state of DS4F M: the device, an expert slot's layout, buffers by name."
   (or (getf (ds4f-gpu-plist m) :gpu)
       (setf (getf (ds4f-gpu-plist m) :gpu)
             (let* ((gpu (open-gpu)) (l (svref (ds4f-layers m) 0))
@@ -28,16 +24,6 @@
                    (slot (+ (* 2 gate-bytes) down-bytes)))
               (%make-d4gpu :gpu gpu :n-expert (ds4f-n-expert m) :slot-bytes slot
                            :gate-bytes gate-bytes :down-bytes down-bytes)))))
-
-(defun d4gpu-scratch (st m rows)
-  "ST's row buffers, grown to hold ROWS routed rows."
-  (when (< (d4gpu-rows st) rows)
-    (let ((gpu (d4gpu-gpu st)) (d (ds4f-d m)) (ff (ds4f-ff-exp m)))
-      (setf (d4gpu-x st) (gpu-buffer gpu (* 4 rows d)) (d4gpu-g st) (gpu-buffer gpu (* 4 rows ff))
-            (d4gpu-u st) (gpu-buffer gpu (* 4 rows ff)) (d4gpu-w st) (gpu-buffer gpu (* 4 rows))
-            (d4gpu-mid st) (gpu-buffer gpu (* 4 rows ff)) (d4gpu-down st) (gpu-buffer gpu (* 4 rows d))
-            (d4gpu-rows st) rows)))
-  st)
 
 (defvar *ds4f-nocache* t
   "Whether PREAD-INTO's reads bypass the page cache (F_NOCACHE): the experts
@@ -74,112 +60,10 @@
                                              sb-sys:system-area-pointer sb-alien:unsigned-long))
    dst src bytes))
 
-(defun stage-buffer (st parity)
-  "Staging buffer PARITY (0 or 1), a slot for each of a layer's experts: two,
-   so a layer's experts can be read while the one before it computes.  Made
-   when a prefill wants them, given back after (RELEASE-STAGING)."
-  (let ((key (if (zerop parity) :stage0 :stage1)))
-    (or (getf (d4gpu-plist* st) key)
-        (setf (getf (d4gpu-plist* st) key)
-              (gpu-buffer (d4gpu-gpu st) (* (d4gpu-n-expert st) (d4gpu-slot-bytes st)))))))
-
-(defun release-staging (m)
-  "Give back M's staging buffers (3.6 GB), for the expert cache's sake."
-  (let ((st (ds4f-gpu-state m)))
-    (dolist (key '(:stage0 :stage1))
-      (let ((b (getf (d4gpu-plist* st) key)))
-        (when b (gpu-free b) (remf (d4gpu-plist* st) key))))))
-
-(defun read-layer-experts (m l parity &key (threads 4))
-  "Start reading every expert of layer L into staging buffer PARITY, slot =
-   expert id, on THREADS threads of their own; the threads, to join."
-  (let* ((st (ds4f-gpu-state m)) (buf (stage-buffer st parity)) (fd (ds4f-fd m))
-         (ne (ds4f-n-expert m)) (sb (d4gpu-slot-bytes st)) (gb (d4gpu-gate-bytes st)))
-    (destructuring-bind (goff grb grows gcols) (dl-gate-exps l)
-      (declare (ignore gcols))
-      (destructuring-bind (uoff urb urows ucols) (dl-up-exps l)
-        (declare (ignore urows ucols))
-        (destructuring-bind (doff drb drows dcols) (dl-down-exps l)
-          (declare (ignore dcols))
-          (loop for k below threads
-                collect (let ((k k))
-                          (sb-thread:make-thread
-                           (lambda ()
-                             (multiple-value-bind (s e) (share ne k threads)
-                               (loop for ex from s below e
-                                     do (let ((slot (sb-sys:sap+ (gbuf-sap buf) (* ex sb))))
-                                          (pread-into fd slot (+ goff (* ex grows grb)) gb)
-                                          (pread-into fd (sb-sys:sap+ slot gb) (+ uoff (* ex grows urb)) gb)
-                                          (pread-into fd (sb-sys:sap+ slot (* 2 gb)) (+ doff (* ex drows drb)) (* drows drb))))))
-                           :name "illatio expert read"))))))))
-
-(defun ds4f-gpu-experts! (m l li ev users norms ws n down-out &key preloaded (parity 0))
-  "The routed FFN of a chunk's layer LI on the GPU.  EV: the distinct experts;
-   USERS: for each, its (token . slot)s; NORMS: the tokens' normed inputs;
-   WS: their routing weights.  DOWN-OUT gets each (token, slot)'s down
-   product at (token*N-USED + slot)*D."
-  (let* ((st (ds4f-gpu-state m)) (gpu (d4gpu-gpu st)) (pool (ds4f-pool m))
-         (d (ds4f-d m)) (ff (ds4f-ff-exp m)) (nu (ds4f-n-used m)) (ne (length ev))
-         (clamp (svref (ds4f-clamps m) li))
-         (counts (map 'vector #'length users))
-         (bases (let ((b 0)) (map 'vector (lambda (k) (prog1 b (incf b k))) counts)))
-         (rows (reduce #'+ counts)))
-    (declare (type f32vec norms down-out) (ignore n))
-    (d4gpu-scratch st m rows)
-    ;; the experts into their slots (the reads that stream from the SSD)
-    (destructuring-bind (goff grb grows gcols) (dl-gate-exps l)
-      (declare (ignore gcols))
-      (destructuring-bind (uoff urb urows ucols) (dl-up-exps l)
-        (declare (ignore ucols urows))
-        (destructuring-bind (doff drb drows dcols) (dl-down-exps l)
-          (declare (ignore dcols))
-          (let ((fd (ds4f-fd m)) (sbase (gbuf-sap (stage-buffer st 0)))
-                (sb (d4gpu-slot-bytes st)) (gb (d4gpu-gate-bytes st)))
-            (parallel-for (k (if preloaded 0 ne) pool)   ; read ahead already: slot = expert id
-              (let ((e (svref ev k)) (slot (sb-sys:sap+ sbase (* k sb))))
-                (pread-into fd slot (+ goff (* e grows grb)) gb)
-                (pread-into fd (sb-sys:sap+ slot gb) (+ uoff (* e grows urb)) gb)
-                (pread-into fd (sb-sys:sap+ slot (* 2 gb)) (+ doff (* e drows drb)) (* drows drb)))))
-          ;; each expert's tokens gathered, with their routing weights
-          (let ((xs (gbuf-sap (d4gpu-x st))) (wsap (gbuf-sap (d4gpu-w st))))
-            (sb-sys:with-pinned-objects (norms)
-              (let ((nsap (sb-sys:vector-sap norms)))
-                (parallel-for (k ne pool)
-                  (loop for (tk . slot) across (svref users k) for i from 0
-                        do (let ((row (+ (aref bases k) i)))
-                             (sap-copy (sb-sys:sap+ xs (* 4 row d)) (sb-sys:sap+ nsap (* 4 tk d)) (* 4 d))
-                             (setf (sb-sys:sap-ref-single wsap (* 4 row)) (aref (svref ws tk) slot))))))))
-          (let ((stage (stage-buffer st parity)) (sb (d4gpu-slot-bytes st)) (gb (d4gpu-gate-bytes st))
-                (slot-of (lambda (k) (if preloaded (svref ev k) k))))
-            (with-gpu-work (e gpu)
-              (flet ((mm (kernel woff cols rbytes nr x xoff y yoff ntok)
-                       (dispatch gpu e kernel (list cols nr ntok rbytes cols nr)
-                                 (list (cons stage woff) (cons x xoff) (cons y yoff))
-                                 (list (ceiling ntok 64) (ceiling nr 64) 1) 128 :shared 16384)))
-                (dotimes (k ne)
-                  (let ((nt (aref counts k)) (b (aref bases k)) (s0 (* (funcall slot-of k) sb)))
-                    (mm "d4_mm_iq2_xxs" s0 d grb grows (d4gpu-x st) (* 4 b d) (d4gpu-g st) (* 4 b ff) nt)
-                    (mm "d4_mm_iq2_xxs" (+ s0 gb) d urb grows (d4gpu-x st) (* 4 b d) (d4gpu-u st) (* 4 b ff) nt)))
-                (dispatch gpu e "d4_swiglu_w" (list rows ff clamp)
-                          (list (d4gpu-g st) (d4gpu-u st) (d4gpu-w st) (d4gpu-mid st))
-                          (ceiling (* rows ff) 256) 256)
-                (dotimes (k ne)
-                  (let ((nt (aref counts k)) (b (aref bases k)) (s0 (* (funcall slot-of k) sb)))
-                    (mm "d4_mm_q2_k" (+ s0 (* 2 gb)) ff drb drows (d4gpu-mid st) (* 4 b ff) (d4gpu-down st) (* 4 b d) nt))))))
-          ;; back to (token, slot) order
-          (let ((ds (gbuf-sap (d4gpu-down st))))
-            (sb-sys:with-pinned-objects (down-out)
-              (let ((osap (sb-sys:vector-sap down-out)))
-                (parallel-for (k ne pool)
-                  (loop for (tk . slot) across (svref users k) for i from 0
-                        do (sap-copy (sb-sys:sap+ osap (* 4 (+ (* tk nu) slot) d))
-                                     (sb-sys:sap+ ds (* 4 (+ (aref bases k) i) d)) (* 4 d))))))))))
-    down-out))
-
-;;; --- the attention and shared expert's Q8_0 products, for a chunk ----------------------
-;;; Their raw Q8_0 blocks (6 GB) are read into one GPU buffer the first time;
-;;; a product copies the chunk's rows in, runs D4_MM_Q8_0 and copies the
-;;; result out (unified memory: these are memcpys, not transfers).
+;;; --- the GPU's weights ---------------------------------------------------------------
+;;; The attention's and shared expert's Q8_0 tensors, and the output head's,
+;;; as the file's raw blocks in one GPU buffer (6.3 GB), locked in memory; the
+;;; F16 ones in another (metal-ds4f-prefill.lisp).
 
 (defparameter +ds4f-gpu-q8-tensors+
   '("attn_q_a.weight" "attn_q_b.weight" "attn_kv.weight" "attn_output_a.weight" "attn_output_b.weight"
@@ -207,39 +91,7 @@
             (setf (getf (ds4f-gpu-plist m) :weights) (cons buf table))
             (getf (ds4f-gpu-plist m) :weights))))))
 
-(defun d4gpu-io (st bytes-x bytes-y)
-  "Two scratch buffers of at least BYTES-X and BYTES-Y."
-  (let ((gpu (d4gpu-gpu st)) (x (getf (d4gpu-plist* st) :x)) (y (getf (d4gpu-plist* st) :y)))
-    (unless (and x (>= (gbuf-bytes x) bytes-x)) (setf x (gpu-buffer gpu bytes-x) (getf (d4gpu-plist* st) :x) x))
-    (unless (and y (>= (gbuf-bytes y) bytes-y)) (setf y (gpu-buffer gpu bytes-y) (getf (d4gpu-plist* st) :y) y))
-    (values x y)))
-
-(defun gpu-q8mm! (m li short xs n out &key groups)
-  "OUT = W XS for N tokens, W layer LI's Q8_0 tensor SHORT, on the GPU.  With
-   GROUPS (count gdim rank): row r of W against group r/RANK of each token,
-   as GROUPED-Q8MM!."
-  (destructuring-bind (buf . table) (ds4f-gpu-weights m)
-    (destructuring-bind (woff rbytes rows cols) (gethash (format nil "blk.~D.~A" li short) table)
-      (let* ((st (ds4f-gpu-state m)) (gpu (d4gpu-gpu st))
-             (xw (if groups (* (first groups) (second groups)) cols)))
-        (declare (type f32vec xs out))
-        (multiple-value-bind (x y) (d4gpu-io st (* 4 n xw) (* 4 n rows))
-          (sb-sys:with-pinned-objects (xs out)
-            (sap-copy (gbuf-sap x) (sb-sys:vector-sap xs) (* 4 n xw))
-            (with-gpu-work (e gpu)
-              (if groups
-                  (destructuring-bind (count gdim rank) groups
-                    (dotimes (g count)
-                      (dispatch gpu e "d4_mm_q8_0" (list gdim rank n rbytes xw rows)
-                                (list (cons buf (+ woff (* g rank rbytes))) (cons x (* 4 g gdim)) (cons y (* 4 g rank)))
-                                (list (ceiling n 64) (ceiling rank 64) 1) 128 :shared 16384)))
-                  (dispatch gpu e "d4_mm_q8_0" (list cols rows n rbytes cols rows)
-                            (list (cons buf woff) x y)
-                            (list (ceiling n 64) (ceiling rows 64) 1) 128 :shared 16384)))
-            (sap-copy (sb-sys:vector-sap out) (gbuf-sap y) (* 4 n rows))))
-        out))))
-
-;;; --- attention for a chunk ------------------------------------------------------------
+;;; --- scratch buffers by name ----------------------------------------------------------
 
 (defun d4gpu-buf (st key bytes)
   "Scratch buffer KEY of ST, at least BYTES."
@@ -255,61 +107,7 @@
 (defun copy-u32-in (buf v)
   (dotimes (i (length v)) (setf (sb-sys:sap-ref-32 (gbuf-sap buf) (* 4 i)) (aref v i))))
 
-(defun gpu-attend! (m l n q kr nkr kc nkc raws nraw ncomp idx maxc heads)
-  "D4_ATTEND for N tokens: Q (N x heads x 512, RoPE'd), raw rows KR (NKR),
-   compressed rows KC (NKC); per token its raw window (RAWS start, NRAW
-   rows) and its NCOMP compressed rows, listed in IDX (MAXC a token).  The
-   attention output into HEADS."
-  (let* ((st (ds4f-gpu-state m)) (gpu (d4gpu-gpu st))
-         (nh (ds4f-n-head m)) (hd (ds4f-head-dim m)) (qn (* n nh hd))
-         (bq (d4gpu-buf st :aq (* 4 qn))) (bkr (d4gpu-buf st :akr (* 4 (max 1 nkr) hd)))
-         (bkc (d4gpu-buf st :akc (* 4 (max 1 nkc) hd)))
-         (bra (d4gpu-buf st :araws (* 4 n))) (bnr (d4gpu-buf st :anraw (* 4 n)))
-         (bnc (d4gpu-buf st :ancomp (* 4 n))) (bix (d4gpu-buf st :aidx (* 4 (max 1 (* n maxc)))))
-         (bsk (d4gpu-buf st :asinks (* 4 nh))) (bo (d4gpu-buf st :aout (* 4 qn))))
-    (assert (= hd 512) () "d4_attend is written for 512-wide heads")
-    (assert (= nh 64) () "d4_attend is written for 64 heads")
-    (copy-floats-in bq q qn)
-    (copy-floats-in bkr kr (* nkr hd))
-    (when (plusp nkc) (copy-floats-in bkc kc (* nkc hd)))
-    (copy-u32-in bra raws) (copy-u32-in bnr nraw) (copy-u32-in bnc ncomp)
-    (when (plusp maxc) (copy-u32-in bix idx))
-    (copy-floats-in bsk (dl-sinks l) nh)
-    (with-gpu-work (e gpu)
-      (dispatch gpu e "d4_attend" (list nh hd (/ 1f0 (sqrt (float hd 1f0))) (max 1 maxc) 0 0)
-                (list bq bkr bkc bra bnr bnc bix bsk bo)
-                n 512 :shared (* 4 (+ (* 8 512) (* 64 8) (* 8 64) 128))))
-    (sb-sys:with-pinned-objects (heads)
-      (sap-copy (sb-sys:vector-sap heads) (gbuf-sap bo) (* 4 qn)))
-    heads))
-
-(defun gpu-ix-scores! (m n q w k ncomp vis scores)
-  "D4_IX_SCORES for N tokens: their indexer queries Q (N x heads x 128,
-   RoPE'd and FP4-rounded) and scaled head weights W (N x heads) against the
-   NCOMP indexer rows K; token t sees VIS[t] of them.  SCORES, N x NCOMP,
-   -inf past what a token sees."
-  (let* ((st (ds4f-gpu-state m)) (gpu (d4gpu-gpu st))
-         (nh (ds4f-ix-heads m)) (hd (ds4f-ix-dim m)) (qn (* n nh hd))
-         (bq (d4gpu-buf st :iq (* 4 qn))) (bw (d4gpu-buf st :iw (* 4 n nh)))
-         (bk (d4gpu-buf st :ik (* 4 ncomp hd))) (bv (d4gpu-buf st :ivis (* 4 n)))
-         (bs (d4gpu-buf st :iscores (* 4 n ncomp))))
-    (assert (= hd 128) () "d4_ix_scores is written for 128-wide indexer heads")
-    (copy-floats-in bq q qn) (copy-floats-in bw w (* n nh))
-    (copy-floats-in bk k (* ncomp hd)) (copy-u32-in bv vis)
-    (with-gpu-work (e gpu)
-      (dispatch gpu e "d4_ix_scores" (list n ncomp nh) (list bq bw bk bv bs)
-                (list (ceiling ncomp 32) (ceiling n 8)) 128
-                :shared (* 4 (+ (* 8 128) (* 32 128) (* 8 32)))))
-    (sb-sys:with-pinned-objects (scores)
-      (sap-copy (sb-sys:vector-sap scores) (gbuf-sap bs) (* 4 n ncomp)))
-    scores))
-
-;;; --- decode: an expert cache on the GPU ------------------------------------------------
-;;; A token's six experts a layer come from a cache of expert slots in one GPU
-;;; buffer (as ds4's streaming expert cache), the least recently used given up
-;;; for a miss, a miss read by pread; then one command buffer: gate and up for
-;;; the six (D4_MV_IQ2_XXS, the six at once), the clamped SwiGLU times their
-;;; routing weights, down (D4_MV_Q2_K).  The CPU sums the six in slot order.
+;;; --- the expert pool --------------------------------------------------------------
 
 (defvar *ds4f-expert-cache-gb* nil
   "The expert pool's size, in GB (an expert is about 7 MB); NIL: what the
@@ -594,68 +392,26 @@
              (cond ((funcall keep s) (setf (aref (dx-used xc) s) tick (aref (dx-fresh xc) s) 0))
                    ((and (= 1 (aref (dx-fresh xc) s)) (zerop (aref pin s))) (cache-release xc s))))))
 
-(defun predict-experts (m li x token k &optional logits-in)
-  "A guess at layer LI's experts for the token whose previous layer's FFN
-   input is X: its hash table's, else the top K of its router on X (or its
-   router's LOGITS-IN, the GPU's)."
+(defun predict-experts (m li token k router-logits)
+  "A guess at layer LI's experts for a token: its hash table's, else the top
+   K of its ROUTER-LOGITS (the GPU's, on the previous layer's FFN input)."
   (let* ((l (svref (ds4f-layers m) li)) (nu (ds4f-n-used m)))
     (if (dl-tid2eid l)
         (loop for i below nu collect (aref (dl-tid2eid l) (+ (* token nu) i)))
         (let* ((ne (ds4f-n-expert m)) (logits (f32vec ne)) (b (dl-probs-b l)))
           (declare (type f32vec logits))
-          (if logits-in (replace logits logits-in) (f32mv! (ds4f-pool m) (dl-gate-inp l) x logits))
+          (replace logits router-logits)
           (dotimes (i ne) (setf (aref logits i) (+ (sqrt (d4-softplus (aref logits i))) (if b (aref b i) 0f0))))
           (loop repeat k
                 collect (let ((best (let ((bi 0)) (dotimes (i ne bi) (when (> (aref logits i) (aref logits bi)) (setf bi i))))))
                           (setf (aref logits best) most-negative-single-float)
                           best))))))
 
-(defun ds4f-gpu-ffn-1! (m l li norm sel w moe &optional meanwhile)
-  "The routed experts SEL (weights W) of layer LI for one token's NORM, on
-   the GPU from the expert cache; their sum, in slot order, into MOE.
-   MEANWHILE, a function, runs on the CPU while the GPU does."
-  (let* ((st (ds4f-gpu-state m)) (gpu (d4gpu-gpu st)) (xc (ds4f-expert-cache m))
-         (d (ds4f-d m)) (ff (ds4f-ff-exp m)) (k (length sel)) (clamp (svref (ds4f-clamps m) li))
-         (sb (d4gpu-slot-bytes st)) (gb (d4gpu-gate-bytes st))
-         (slots (cache-experts m l li sel))
-         (bx (d4gpu-buf st :dx (* 4 d))) (bo (d4gpu-buf st :doffs (* 8 2 k)))
-         (bw (d4gpu-buf st :dw (* 4 k))) (bgu (d4gpu-buf st :dgu (* 4 2 k ff)))
-         (bm (d4gpu-buf st :dmid (* 4 k ff))) (bd (d4gpu-buf st :ddown (* 4 k d))))
-    (declare (type f32vec norm w moe))
-    (copy-floats-in bx norm d) (copy-floats-in bw w k)
-    ;; the experts' gates, then their ups: one dispatch for the 2K products
-    (dotimes (i k)
-      (setf (sb-sys:sap-ref-64 (gbuf-sap bo) (* 8 i)) (* (aref slots i) sb)
-            (sb-sys:sap-ref-64 (gbuf-sap bo) (* 8 (+ k i))) (+ (* (aref slots i) sb) gb)))
-    (let ((grb (second (dl-gate-exps l))) (drb (second (dl-down-exps l))) (buf (dx-buf xc)))
-      (with-gpu-work-while (e gpu)
-          (flet ((mv (kernel ncols nrows rb add x xs y z)
-                   (dispatch gpu e kernel (list ncols nrows rb add xs nrows) (list buf bo x y)
-                             (list (ceiling nrows 8) 1 z) 64
-                             :shared (if (string= kernel "d4_mv_iq2_xxs") (+ (* 8 256) 128) 0))))
-            (mv "d4_mv_iq2_xxs" d ff grb 0 bx 0 bgu (* 2 k))
-            (dispatch gpu e "d4_swiglu_w" (list k ff clamp) (list bgu (cons bgu (* 4 k ff)) bw bm)
-                      (ceiling (* k ff) 256) 256)
-            (mv "d4_mv_q2_k" ff d drb (* 2 gb) bm ff bd k))
-        (when meanwhile (funcall meanwhile))))
-    (let ((ds (gbuf-sap bd)) (d d) (k k))
-      (declare (type fixnum d k) (optimize speed (safety 0)))
-      (dotimes (r d moe)
-        (let ((acc 0f0))
-          (declare (type single-float acc))
-          (dotimes (i k) (incf acc (sb-sys:sap-ref-single ds (the fixnum (* 4 (the fixnum (+ (the fixnum (* i d)) r)))))))
-          (setf (aref moe r) acc))))))
-
-;;; --- decode: attention's Q8_0 projections on the GPU -------------------------------------
-;;; From the Q8_0 weights buffer prefill uses, D4_MV_Q8_0 a product, in three
-;;; command buffers a layer, cut where the CPU's work comes between: Q-A and
-;;; KV (both of the normed input); Q-B, while the CPU runs the KV row's path
-;;; (its norm, RoPE, FP8, the cache, the compressors, the indexer); the
-;;; grouped output projection then OUT-B.  X goes in as f32, not Q8_0 (the
-;;; CPU's matvec quantizes it).
+;;; --- small things the GPU paths share --------------------------------------------------
 
 (defun q8mv-enc (m gpu e li short x y &key (group-rows nil) (group-stride 0))
-  "Encode into E layer LI's Q8_0 tensor SHORT times buffer X into buffer Y."
+  "Encode into E layer LI's Q8_0 tensor SHORT times buffer X into buffer Y
+   (D4_MV_Q8_0: X in f32), row r of a grouped one against group r/GROUP-ROWS."
   (destructuring-bind (buf . table) (ds4f-gpu-weights m)
     (destructuring-bind (woff rbytes rows cols) (gethash (format nil "blk.~D.~A" li short) table)
       (dispatch gpu e "d4_mv_q8_0" (list cols rows rbytes (or group-rows rows) group-stride)
@@ -665,34 +421,3 @@
   (declare (type f32vec v))
   (sb-sys:with-pinned-objects (v) (sap-copy (sb-sys:vector-sap v) (gbuf-sap buf) (* 4 n))))
 
-(defun gpu-attn-in! (m li norm qr kv0)
-  "QR = Q-A NORM and KV0 = KV NORM, layer LI, on the GPU."
-  (let* ((st (ds4f-gpu-state m)) (gpu (d4gpu-gpu st)) (d (ds4f-d m)) (lq (ds4f-lora-q m)) (hd (ds4f-head-dim m))
-         (bn (d4gpu-buf st :vnorm (* 4 d))) (bqr (d4gpu-buf st :vqr (* 4 lq))) (bkv (d4gpu-buf st :vkv (* 4 hd))))
-    (copy-floats-in bn norm d)
-    (with-gpu-work (e gpu)
-      (q8mv-enc m gpu e li "attn_q_a.weight" bn bqr)
-      (q8mv-enc m gpu e li "attn_kv.weight" bn bkv))
-    (copy-floats-out qr bqr lq) (copy-floats-out kv0 bkv hd)))
-
-(defun gpu-attn-qb! (m li qr-norm q meanwhile)
-  "Q = Q-B QR-NORM, layer LI, on the GPU, MEANWHILE run on the CPU."
-  (let* ((st (ds4f-gpu-state m)) (gpu (d4gpu-gpu st)) (lq (ds4f-lora-q m)) (nq (* (ds4f-n-head m) (ds4f-head-dim m)))
-         (bqr (d4gpu-buf st :vqrn (* 4 lq))) (bq (d4gpu-buf st :vq (* 4 nq))))
-    (copy-floats-in bqr qr-norm lq)
-    (with-gpu-work-while (e gpu)
-        (q8mv-enc m gpu e li "attn_q_b.weight" bqr bq)
-      (funcall meanwhile))
-    (copy-floats-out q bq nq)))
-
-(defun gpu-attn-out! (m li heads out)
-  "OUT = OUT-B (the grouped OUT-A HEADS), layer LI, on the GPU."
-  (let* ((st (ds4f-gpu-state m)) (gpu (d4gpu-gpu st)) (d (ds4f-d m)) (hd (ds4f-head-dim m)) (nh (ds4f-n-head m))
-         (groups (ds4f-out-groups m)) (rank (ds4f-lora-o m)) (gdim (* hd (floor nh groups)))
-         (bh (d4gpu-buf st :vheads (* 4 nh hd))) (bl (d4gpu-buf st :vlow (* 4 groups rank)))
-         (bo (d4gpu-buf st :vout (* 4 d))))
-    (copy-floats-in bh heads (* nh hd))
-    (with-gpu-work (e gpu)
-      (q8mv-enc m gpu e li "attn_output_a.weight" bh bl :group-rows rank :group-stride gdim)
-      (q8mv-enc m gpu e li "attn_output_b.weight" bl bo))
-    (copy-floats-out out bo d)))

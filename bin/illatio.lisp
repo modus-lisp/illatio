@@ -38,7 +38,8 @@ flags:
   --seed S            sampling seed
   -c, --ctx N         context size in tokens (default 8192)
   -t, --threads N     worker threads (default: the performance cores)
-  --gpu               run on the GPU (Metal; qwen35 models in Q6_K so far)
+  --gpu               run a qwen35 model on the GPU (Metal); DeepSeek V4
+                      Flash always uses it on a Mac
   -s, --system TEXT   system prompt for --chat
   -h, --help          this
 ")
