@@ -25,6 +25,10 @@
 
 (sb-alien:define-alien-type ptr sb-sys:system-area-pointer)
 
+;; at load, so the foreign functions below resolve; SBCL reopens these when a
+;; saved core starts
+(load-metal-frameworks)
+
 (defmacro with-metal (&body body)
   `(sb-int:with-float-traps-masked (:overflow :invalid :inexact :divide-by-zero :underflow)
      ,@body))
@@ -41,12 +45,13 @@
 
 (defmacro msg (ret obj selector &rest args)
   "[OBJ SELECTOR args...]: each arg is (alien-type value).  The selector is
-   looked up once, when first used."
+   looked up every time (a hash lookup in libobjc): an address kept from one
+   process would be wrong in a core image's next one."
   (let ((types (mapcar #'first args)))
     `(sb-alien:alien-funcall
       (sb-alien:extern-alien "objc_msgSend"
                              (function ,ret sb-sys:system-area-pointer sb-sys:system-area-pointer ,@types))
-      ,obj (load-time-value (progn (load-metal-frameworks) (sel ,selector)))
+      ,obj (sel ,selector)
       ,@(mapcar #'second args))))
 
 (defun nullp (p) (zerop (sb-sys:sap-int p)))

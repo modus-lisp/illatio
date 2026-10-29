@@ -126,6 +126,10 @@
 
 (defvar *flash* t "Whether a prefill's attention is ATTEND_FA (flash style).")
 
+(defvar *flash-decode-from* 4096
+  "Decode attends with ATTEND_FA past this many positions (ATTEND's scores
+   live in threadgroup memory, room for about 8000).")
+
 (defvar *mm-64* t "Whether a prefill's products take 64-token tiles (MM_Q6K_64).")
 
 (defun gpu-forward (ctx token logits)
@@ -198,7 +202,9 @@
                                      (gctx-rope st) (gctx-q st) (gctx-gate st)
                                      (svref (gctx-kc st) li) (svref (gctx-vc st) li))
                                (list (+ nh nkv) n) hd)
-                     (if (and *flash* (> n 1))
+                     ;; decode's ATTEND keeps a score per position in threadgroup
+                     ;; memory (32 KB), so a long context goes the flash way too
+                     (if (and *flash* (or (> n 1) (> (+ pos0 n) *flash-decode-from*)))
                          (dispatch gpu e "attend_fa" (list nh nkv n (/ 1f0 (sqrt (coerce hd 'single-float))) pos0)
                                    (list (gctx-q st) (svref (gctx-kc st) li) (svref (gctx-vc st) li) (gctx-att st))
                                    (list nh (ceiling n 8)) 32 :shared (* 4 (+ (* 8 256) (* 8 32) 64)))

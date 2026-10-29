@@ -234,6 +234,16 @@
            (render-qwen3-chat messages tools))
           ((and (search "<|im_start|>" template) (search "<tool_call>" template))
            (render-qwen-chat messages tools))
+          ;; No template in the file (some finetunes ship without one): a
+          ;; Qwen model gets Qwen3's ChatML, which is what llama-server falls
+          ;; back to (ChatML) with Qwen3's <think> handling of the history
+          ((and (string= template "")
+                (member (model-arch model) '("qwen2" "qwen3" "qwen35") :test #'equal))
+           (unless (getf (model-notes model) :template-warned)
+             (setf (getf (model-notes model) :template-warned) t)
+             (format *error-output* "~&illatio: ~A has no chat template; using Qwen3's ChatML~%"
+                     (model-name model)))
+           (render-qwen3-chat messages tools))
           (t (error "no renderer for ~A's chat template yet" (model-name model))))))
 
 ;;; --- the model's answer, as a message ---------------------------------------

@@ -33,6 +33,7 @@ flags:
   --seed S            sampling seed
   -c, --ctx N         context size in tokens (default 8192)
   -t, --threads N     worker threads (default: the performance cores)
+  --gpu               run on the GPU (Metal; qwen35 models in Q6_K so far)
   -s, --system TEXT   system prompt for --chat
   -h, --help          this
 ")
@@ -58,6 +59,7 @@ flags:
                    ((member a '("-t" "--threads") :test #'string=) (setf (getf opts :threads) (int (val))))
                    ((member a '("-s" "--system") :test #'string=) (setf (getf opts :system) (val)))
                    ((string= a "--chat") (setf (getf opts :mode) :chat))
+                   ((string= a "--gpu") (setf (getf opts :gpu) t))
                    ((string= a "--serve")
                     (setf (getf opts :mode) :serve)
                     (when (and args (find #\: (first args)) (not (eql 0 (search "-" (first args)))))
@@ -88,9 +90,16 @@ flags:
   (let ((path (model-path opts))
         (t0 (get-internal-real-time)))
     (format *error-output* "~&illatio: loading ~A~%" (file-namestring path))
-    (let ((m (load-model path :threads (or (getf opts :threads) (default-thread-count)))))
-      (format *error-output* "illatio: ~A, ~D layers, ~D threads, ~,1Fs~%"
-              (model-name m) (illatio::model-n-layer m) (illatio::pool-size (illatio::model-pool m))
+    (let ((m (if (getf opts :gpu)
+                 #+(and sbcl darwin) (illatio::load-model-gpu path)
+                 #-(and sbcl darwin) (die "--gpu needs Metal (SBCL on macOS)")
+                 (load-model path :threads (or (getf opts :threads) (default-thread-count))))))
+      (format *error-output* "illatio: ~A, ~D layers, ~:[~D threads~;~*~A~], ~,1Fs~%"
+              (model-name m) (illatio::model-n-layer m)
+              (getf opts :gpu) (illatio::pool-size (illatio::model-pool m))
+              #+(and sbcl darwin) (and (getf opts :gpu)
+                                       (illatio::gpu-name (illatio::gmodel-gpu (illatio::model-gpu m))))
+              #-(and sbcl darwin) nil
               (/ (- (get-internal-real-time) t0) internal-time-units-per-second))
       m)))
 

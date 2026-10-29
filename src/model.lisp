@@ -48,7 +48,8 @@
   token-embd output-norm output
   (layers #() :type simple-vector)
   pool
-  gpu)                                  ; a GMODEL when the GPU runs it (metal-qwen35.lisp)
+  gpu                                   ; a GMODEL when the GPU runs it (metal-qwen35.lisp)
+  (notes '()))                          ; a plist: things said once (warnings)
 
 (defun arch-key (g arch key) (meta g (format nil "~A.~A" arch key)))
 
