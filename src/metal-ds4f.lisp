@@ -39,12 +39,22 @@
             (d4gpu-rows st) rows)))
   st)
 
+(defvar *ds4f-nocache* t
+  "Whether PREAD-INTO's reads bypass the page cache (F_NOCACHE): the experts
+   they read have the GPU's caches, and the 86.7 GB file can't fit in the
+   page cache anyway, so a copy there only presses on everything else.")
+
 (defun ds4f-fd (m)
   "A descriptor open on DS4F M's file, for PREAD-INTO."
   (or (getf (ds4f-gpu-plist m) :fd)
       (setf (getf (ds4f-gpu-plist m) :fd)
-            (or (sb-unix:unix-open (namestring (gguf-path (ds4f-gguf m))) sb-unix:o_rdonly 0)
-                (error "cannot open ~A" (gguf-path (ds4f-gguf m)))))))
+            (let ((fd (or (sb-unix:unix-open (namestring (gguf-path (ds4f-gguf m))) sb-unix:o_rdonly 0)
+                          (error "cannot open ~A" (gguf-path (ds4f-gguf m))))))
+              (when *ds4f-nocache*
+                (sb-alien:alien-funcall
+                 (sb-alien:extern-alien "fcntl" (function sb-alien:int sb-alien:int sb-alien:int sb-alien:int))
+                 fd 48 1))                ; F_NOCACHE
+              fd))))
 
 (defun pread-into (fd dst offset bytes)
   "BYTES of FD at OFFSET into DST: straight from the disk (or the page
@@ -398,27 +408,30 @@
          (d (ds4f-d m)) (ff (ds4f-ff-exp m)) (k (length sel)) (clamp (svref (ds4f-clamps m) li))
          (sb (d4gpu-slot-bytes st)) (gb (d4gpu-gate-bytes st))
          (slots (cache-experts m l li sel))
-         (bx (d4gpu-buf st :dx (* 4 d))) (bo (d4gpu-buf st :doffs (* 8 k)))
-         (bw (d4gpu-buf st :dw (* 4 k))) (bg (d4gpu-buf st :dg (* 4 k ff)))
-         (bu (d4gpu-buf st :du (* 4 k ff))) (bm (d4gpu-buf st :dmid (* 4 k ff)))
-         (bd (d4gpu-buf st :ddown (* 4 k d))))
+         (bx (d4gpu-buf st :dx (* 4 d))) (bo (d4gpu-buf st :doffs (* 8 2 k)))
+         (bw (d4gpu-buf st :dw (* 4 k))) (bgu (d4gpu-buf st :dgu (* 4 2 k ff)))
+         (bm (d4gpu-buf st :dmid (* 4 k ff))) (bd (d4gpu-buf st :ddown (* 4 k d))))
     (declare (type f32vec norm w moe))
     (copy-floats-in bx norm d) (copy-floats-in bw w k)
-    (dotimes (i k) (setf (sb-sys:sap-ref-64 (gbuf-sap bo) (* 8 i)) (* (aref slots i) sb)))
+    ;; the experts' gates, then their ups: one dispatch for the 2K products
+    (dotimes (i k)
+      (setf (sb-sys:sap-ref-64 (gbuf-sap bo) (* 8 i)) (* (aref slots i) sb)
+            (sb-sys:sap-ref-64 (gbuf-sap bo) (* 8 (+ k i))) (+ (* (aref slots i) sb) gb)))
     (let ((grb (second (dl-gate-exps l))) (drb (second (dl-down-exps l))) (buf (dx-buf xc)))
       (with-gpu-work-while (e gpu)
-          (flet ((mv (kernel ncols nrows rb add x xs y)
+          (flet ((mv (kernel ncols nrows rb add x xs y z)
                    (dispatch gpu e kernel (list ncols nrows rb add xs nrows) (list buf bo x y)
-                             (list (ceiling nrows 8) 1 k) 64
+                             (list (ceiling nrows 8) 1 z) 64
                              :shared (if (string= kernel "d4_mv_iq2_xxs") (+ (* 8 256) 128) 0))))
-            (mv "d4_mv_iq2_xxs" d ff grb 0 bx 0 bg)
-            (mv "d4_mv_iq2_xxs" d ff grb gb bx 0 bu)
-            (dispatch gpu e "d4_swiglu_w" (list k ff clamp) (list bg bu bw bm) (ceiling (* k ff) 256) 256)
-            (mv "d4_mv_q2_k" ff d drb (* 2 gb) bm ff bd))
+            (mv "d4_mv_iq2_xxs" d ff grb 0 bx 0 bgu (* 2 k))
+            (dispatch gpu e "d4_swiglu_w" (list k ff clamp) (list bgu (cons bgu (* 4 k ff)) bw bm)
+                      (ceiling (* k ff) 256) 256)
+            (mv "d4_mv_q2_k" ff d drb (* 2 gb) bm ff bd k))
         (when meanwhile (funcall meanwhile))))
-    (let ((ds (gbuf-sap bd)))
+    (let ((ds (gbuf-sap bd)) (d d) (k k))
+      (declare (type fixnum d k) (optimize speed (safety 0)))
       (dotimes (r d moe)
         (let ((acc 0f0))
           (declare (type single-float acc))
-          (dotimes (i k) (incf acc (sb-sys:sap-ref-single ds (* 4 (+ (* i d) r)))))
+          (dotimes (i k) (incf acc (sb-sys:sap-ref-single ds (the fixnum (* 4 (the fixnum (+ (the fixnum (* i d)) r)))))))
           (setf (aref moe r) acc))))))
