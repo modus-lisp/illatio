@@ -2,7 +2,8 @@
 
 (defsystem "illatio"
   :description "Language-model inference in pure Common Lisp: GGUF weights,
-                quantized CPU kernels, BPE tokenizer, sampler.  No FFI."
+                quantized CPU and Metal kernels, BPE tokenizer, sampler,
+                DeepSeek V4 Flash streamed from the SSD."
   :version "0.0.1"
   :author "ynniv"
   :license "MIT"
