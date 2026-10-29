@@ -69,11 +69,11 @@ On the GPU (`load-model-gpu`; `-ngl 99` for llama.cpp) it passes the same
 llama.cpp vectors at the same noise floor as the CPU.
 
 DeepSeek V4 Flash, ds4's IQ2_XXS/Q2_K build (`ds4f`), streamed from the
-SSD on a 48 GB M4 Pro with the GPU: decode 8.3 tok/s with a warm expert
-cache, 6.9 at 6K tokens of context; prefill 58 tok/s on a 6,352-token
-prompt (110 s; ds4's own: 104 tok/s), and a prompt prefilled before is
-taken from disk: the same 6,352 tokens with another question after them
-in 38 s.  On the CPU alone: decode
+SSD on a 48 GB M4 Pro with the GPU: decode 9.8 tok/s with a warm expert
+pool, 7.1 at 6K tokens of context (ds4's own SSD streaming: 4.2); prefill
+105 tok/s on a 6,352-token prompt (61 s; ds4's: 104), and a prompt
+prefilled before is taken from disk at its message boundaries: the same
+system prompt with a new question after it prefills only the question.  On the CPU alone: decode
 3.5, prefill 7.  It chats and calls tools through the CLI and the OpenAI
 endpoint.
 
@@ -240,10 +240,15 @@ folds them straight into its stream state.
   router -- so the GPU never idles long enough to clock down; the CPU only
   routes, from the GPU's logits.  The caches are the context's own vectors,
   wrapped where they lie, shared with the CPU's prefill.  The experts come
-  from a cache of expert slots (24 GB of a 48 GB machine, least recently
-  used given up, seeded with ds4's hotlist), misses read in 1 MB pieces in
-  parallel (about 5 GB/s), and the next layer's experts are guessed (its
-  router on this layer's input finds 82% of them) and read ahead.  Its tokenizer
+  from one pool of expert slots prefill and decode share (22 GB: what the
+  GPU's working set leaves; locked in memory), work in flight first: slots
+  in use pinned, demand reads ahead of reads ahead, a prefill's layer
+  passing through slots it gives back but for the experts its last tokens
+  chose.  Misses are read in 1 MB pieces in parallel (about 5 GB/s), the
+  next layer's experts guessed (its router on this layer's input finds 82%
+  of them) and read ahead, and a prefill's routing runs on the GPU too, its
+  experts one indexed product a layer.  No weight is held twice: the CPU's
+  copies of what the GPU runs are loaded only if a CPU path wants them.  Its tokenizer
   (joyai-llm) and chat format (tool schemas, DSML tool calls, reasoning)
   are ds4's.
 - **The forward pass** mirrors llama.cpp's graph op for op: RMSNorm with its
@@ -337,11 +342,10 @@ inspect/collect-vectors.py http://localhost:18931 inspect/vectors/qwen2.5-0.5b-q
   (8 threads give 3x) and the serial per-layer ops between the products.
 - **More formats.** Q5_K (Q5_K_M files) and Q8_0-with-K-quant mixes.
 - **Qwen3.6-35B-A3B** (`qwen35moe`): expert routing on top of `qwen35`.
-- **ds4f.** Prefill's routed experts as one indexed product a layer (now
-  512 small ones), the output head on the GPU, decode's F32 products from
-  the F16 weights prefill already uses, the decode cache's misses (12 a
-  token), and the expert cache's size on bigger machines (one Metal buffer
-  stops it at 28 GB).
+- **ds4f.** Speculative decoding from the context (draft tokens from its
+  n-grams, verified a few at a time: each layer's experts read once for
+  several tokens), and the decode pool's misses (about 11 a token, read
+  while the GPU waits).
 
 ## License
 
