@@ -342,10 +342,14 @@ inspect/collect-vectors.py http://localhost:18931 inspect/vectors/qwen2.5-0.5b-q
   (8 threads give 3x) and the serial per-layer ops between the products.
 - **More formats.** Q5_K (Q5_K_M files) and Q8_0-with-K-quant mixes.
 - **Qwen3.6-35B-A3B** (`qwen35moe`): expert routing on top of `qwen35`.
-- **ds4f.** Speculative decoding from the context (draft tokens from its
-  n-grams, verified a few at a time: each layer's experts read once for
-  several tokens), and the decode pool's misses (about 11 a token, read
-  while the GPU waits).
+- **ds4f.** Decode is mostly expert reads now (about 70 ms of a 100 ms
+  token): fewer misses (a better guess at the next layer's experts, a
+  pool that keeps what decode reuses), or reads overlapped with more of the
+  GPU's work.  Speculative decoding from the context is in and exact
+  (`src/ds4f-spec.lisp`, `*ds4f-spec-k*`), but off: a guessed token's
+  experts are read all the same, so a step saves at most the dense
+  weights' second reading, and a verifying pass costs more than that yet
+  (it wants multi-token matvecs and the next layer read ahead).
 
 ## License
 
