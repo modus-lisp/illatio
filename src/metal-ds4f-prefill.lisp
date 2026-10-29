@@ -249,6 +249,50 @@
               (ceiling (* n d) 256) 256)
     (enc-hc-post m gpu e moe sb (pbuf st :p-pcf (* n 32)) sa n)))
 
+(defun tid2eid-buffer (m st li l)
+  "Layer LI's hash table (token -> its experts), in a GPU buffer."
+  (let ((key (intern (format nil "P-TID2EID-~D" li) :keyword)))
+    (or (getf (d4gpu-plist* st) key)
+        (let* ((v (dl-tid2eid l)) (b (gpu-buffer (d4gpu-gpu st) (* 4 (length v)))))
+          (dotimes (i (length v)) (setf (sb-sys:sap-ref-32 (gbuf-sap b) (* 4 i)) (ldb (byte 32 0) (aref v i))))
+          (setf (getf (d4gpu-plist* st) key) b)))))
+
+(defun enc-ffn-routed (m gpu e st l li n toks offs sb sa)
+  "The chunk's FFN past its router, routing included, on the GPU: each
+   token's experts and weights (D4_ROUTE), the rows grouped by expert, the
+   experts as one indexed product each for gate, up and down (D4_MM_ID,
+   from the pool slots OFFS), the sums in slot order with the shared
+   expert, HC post: SB into SA."
+  (let* ((d (ds4f-d m)) (ff (ds4f-ff-exp m)) (nu (ds4f-n-used m)) (ne (ds4f-n-expert m)) (rows (* n nu))
+         (clamp (svref (ds4f-clamps m) li)) (xc (ds4f-expert-cache m)) (pool (dx-buf xc))
+         (gb (d4gpu-gate-bytes st)) (grb (second (dl-gate-exps l))) (grows (third (dl-gate-exps l)))
+         (drb (second (dl-down-exps l))) (drows (third (dl-down-exps l)))
+         (sel (pbuf st :p-sel rows)) (w (pbuf st :p-w rows)) (counts (pbuf st :p-counts ne))
+         (rank (pbuf st :p-rank rows)) (bases (pbuf st :p-bases ne)) (rmap (pbuf st :p-rmap rows))
+         (smap (pbuf st :p-smap rows)) (wrow (pbuf st :p-wrow rows)) (x (pbuf st :p-x (* rows d)))
+         (g (pbuf st :p-g (* rows ff))) (u (pbuf st :p-u (* rows ff))) (mid (pbuf st :p-mid (* rows ff)))
+         (down (pbuf st :p-down (* rows d))) (moe (pbuf st :p-moe (* n d))))
+    (dispatch gpu e "d4_route"
+              (list ne nu (if (dl-tid2eid l) 1 0) (ds4f-expert-scale m) (if (dl-probs-b l) 1 0))
+              (list (pbuf st :p-logits (* n ne)) (if (dl-probs-b l) (gpu-vector m (dl-probs-b l)) counts)
+                    (if (dl-tid2eid l) (tid2eid-buffer m st li l) counts) toks sel w)
+              n ne :shared (* 4 (+ (* 2 ne) 64 nu)))
+    (dispatch gpu e "d4_group_zero" (list 0) (list counts) (ceiling ne 256) (min ne 256))
+    (dispatch gpu e "d4_group_count" (list rows ne nu) (list sel counts rank) (ceiling rows 256) 256)
+    (dispatch gpu e "d4_group_scan" (list rows ne nu) (list counts bases) 1 ne :shared (* 4 32))
+    (dispatch gpu e "d4_group_scatter" (list rows ne nu) (list sel rank bases w rmap smap wrow) (ceiling rows 256) 256)
+    (dispatch gpu e "d4_gather_rows" (list d rows) (list (pbuf st :p-norm2 (* n d)) rmap x) (ceiling (* rows d) 256) 256)
+    (flet ((mm-id (kernel ncols nrows rb add xin yout)
+             (dispatch gpu e kernel (list ncols nrows rb ncols nrows add) (list pool offs counts bases xin yout)
+                       (list (ceiling n 64) (ceiling nrows 64) ne) 128 :shared 16384)))
+      (mm-id "d4_mm_id_iq2_xxs" d grows grb 0 x g)
+      (mm-id "d4_mm_id_iq2_xxs" d grows grb gb x u)
+      (dispatch gpu e "d4_swiglu_w" (list rows ff clamp) (list g u wrow mid) (ceiling (* rows ff) 256) 256)
+      (mm-id "d4_mm_id_q2_k" ff drows drb (* 2 gb) mid down))
+    (dispatch gpu e "d4_moe_sum_rows" (list d nu n) (list down smap (pbuf st :p-sout (* n d)) moe)
+              (ceiling (* n d) 256) 256)
+    (enc-hc-post m gpu e moe sb (pbuf st :p-pcf (* n 32)) sa n)))
+
 (defun ds4f-gpu-prefill-1 (ctx tokens logits)
   "DS4F-PREFILL-1 on the GPU: the chunk TOKENS at the next positions."
   (let* ((m (d4ctx-model ctx)) (st (ds4f-gpu-state m)) (gpu (d4gpu-gpu st))
@@ -264,7 +308,29 @@
           (dotimes (j d)
             (let ((v (f16-at wf (+ o (* 2 j)))))
               (dotimes (h n-hc) (setf (sb-sys:sap-ref-single sap (* 4 (+ (* tk hcd) (* h d) j))) v)))))))
-    (dotimes (li (ds4f-n-layer m))
+    (when (>= n *ds4f-read-all-from*)
+      ;; a long chunk: one command buffer a layer, routing and all, each
+      ;; layer's experts read under the layer before
+      (let* ((xc (ds4f-expert-cache m)) (all (loop for k below ne collect k)) (nl (ds4f-n-layer m))
+             (toks (put-u32s (pbuf st :p-tok n) (map '(vector (unsigned-byte 32)) #'identity tokv)))
+             (offs (pbuf st :p-offs (* 2 ne))) (sbytes (d4gpu-slot-bytes st))
+             (next (pool-take-layer m 0 all nil)))
+        (dotimes (li nl)
+          (let ((l (svref (ds4f-layers m) li)) (c (svref (d4ctx-caches ctx) li)) (taken next))
+            (cache-wait m xc (coerce taken 'list))
+            (dotimes (k ne) (setf (sb-sys:sap-ref-64 (gbuf-sap offs) (* 8 k)) (* (aref taken k) sbytes)))
+            (setf next (and (< (1+ li) nl) (pool-take-layer m (1+ li) all nil)))
+            (with-gpu-work (e gpu)
+              (enc-attention-chunk m gpu e st l li c pos0 n sa sb)
+              (enc-ffn-head-chunk m gpu e st l li n sb)
+              (enc-ffn-routed m gpu e st l li n toks offs sb sa))
+            ;; the slots back but for the experts the prompt's last tokens chose
+            (let ((tail (and logits (let ((h (make-hash-table)) (sap (gbuf-sap (pbuf st :p-sel (* n nu)))))
+                                      (loop for i from (* nu (max 0 (- n *ds4f-keep-tail*))) below (* n nu)
+                                            do (setf (gethash (sb-sys:sap-ref-32 sap (* 4 i)) h) t))
+                                      h))))
+              (pool-done-layer m taken (lambda (s) (and tail (gethash (mod (aref (dx-owner xc) s) ne) tail)))))))))
+    (dotimes (li (if (>= n *ds4f-read-all-from*) 0 (ds4f-n-layer m)))
       (let* ((l (svref (ds4f-layers m) li)) (c (svref (d4ctx-caches ctx) li))
              ;; a long chunk wants nearly all of a layer's experts: slots for them all, read under the attention
              (all (and (>= n *ds4f-read-all-from*) (pool-take-layer m li (loop for k below ne collect k) nil))))

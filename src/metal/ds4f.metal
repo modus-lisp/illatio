@@ -145,34 +145,29 @@ struct d4_mm_args { uint ncols; uint nrows; uint ntok; uint row_bytes; uint x_st
 // (four simdgroups of 32 by 32), weights dequantized to halves in
 // threadgroup memory 32 columns at a time.  A block holds 16*NL weights.
 template <typename block_q, short nl, void (*deq)(device const block_q *, short, thread half4x4 &)>
-kernel void d4_mm(constant d4_mm_args & a [[buffer(0)]],
-                  device const char  * src0 [[buffer(1)]],
-                  device const float * src1 [[buffer(2)]],
-                  device       float * dst  [[buffer(3)]],
-                  threadgroup  char  * shmem [[threadgroup(0)]],
-                  uint3  tgpig [[threadgroup_position_in_grid]],
-                  ushort tiitg [[thread_index_in_threadgroup]],
-                  ushort sgitg [[simdgroup_index_in_threadgroup]]) {
+static inline void d4_mm_body(uint ncols, uint nrows, uint ntok, uint row_bytes, uint x_stride, uint y_stride,
+                              device const char * src0, device const float * src1, device float * dst,
+                              threadgroup char * shmem, uint3 tgpig, ushort tiitg, ushort sgitg) {
     threadgroup half * sa = (threadgroup half *)(shmem);
     threadgroup half * sb = (threadgroup half *)(shmem + 4096);
     constexpr int NR0 = 64, NR1 = 64, NK = 32, NL0 = NK/16, NL1 = NK/8;
     const int r0 = tgpig.y*NR0, r1 = tgpig.x*NR1;
-    const short nr0 = ((int)a.nrows - r0 < NR0) ? ((int)a.nrows - r0) : NR0;
-    const short nr1 = ((int)a.ntok  - r1 < NR1) ? ((int)a.ntok  - r1) : NR1;
+    const short nr0 = ((int)nrows - r0 < NR0) ? ((int)nrows - r0) : NR0;
+    const short nr1 = ((int)ntok  - r1 < NR1) ? ((int)ntok  - r1) : NR1;
     const short lr0 = ((short)tiitg/NL0) < nr0 ? ((short)tiitg/NL0) : nr0 - 1;
     const short t0 = (short)tiitg/NL1, t1 = t0 + 32;
     const short lr1a = t0 < nr1 ? t0 : nr1 - 1;
     const short lr1b = t1 < nr1 ? t1 : nr1 - 1;
     const short il0 = (tiitg % NL0);
     short il = il0;
-    device const block_q * x = (device const block_q *)(src0 + (ulong)a.row_bytes*(r0 + lr0)) + il0/nl;
+    device const block_q * x = (device const block_q *)(src0 + (ulong)row_bytes*(r0 + lr0)) + il0/nl;
     const short iy = 8*(tiitg % NL1);
-    device const float * ya = src1 + (ulong)a.x_stride*(r1 + lr1a) + iy;
-    device const float * yb = src1 + (ulong)a.x_stride*(r1 + lr1b) + iy;
+    device const float * ya = src1 + (ulong)x_stride*(r1 + lr1a) + iy;
+    device const float * yb = src1 + (ulong)x_stride*(r1 + lr1b) + iy;
     simdgroup_half8x8 ma[4], mb[4];
     simdgroup_float8x8 mc[16];
     for (short i = 0; i < 16; i++) mc[i] = make_filled_simdgroup_matrix<float, 8>(0.f);
-    for (uint loop_k = 0; loop_k < a.ncols; loop_k += NK) {
+    for (uint loop_k = 0; loop_k < ncols; loop_k += NK) {
         half4x4 temp_a;
         deq(x, il, temp_a);
         threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -201,9 +196,9 @@ kernel void d4_mm(constant d4_mm_args & a [[buffer(0)]],
             lsma += 8*64; lsmb += 8*64;
         }
     }
-    if (r0 + NR0 <= (int)a.nrows && r1 + NR1 <= (int)a.ntok) {
-        device float * C = dst + (r0 + 32*(sgitg & 1)) + (ulong)(r1 + 32*(sgitg >> 1)) * a.y_stride;
-        for (short i = 0; i < 16; i++) simdgroup_store(mc[i], C + 8*(i%4) + 8*a.y_stride*(i/4), a.y_stride, 0, false);
+    if (r0 + NR0 <= (int)nrows && r1 + NR1 <= (int)ntok) {
+        device float * C = dst + (r0 + 32*(sgitg & 1)) + (ulong)(r1 + 32*(sgitg >> 1)) * y_stride;
+        for (short i = 0; i < 16; i++) simdgroup_store(mc[i], C + 8*(i%4) + 8*y_stride*(i/4), y_stride, 0, false);
     } else {
         threadgroup_barrier(mem_flags::mem_threadgroup);
         threadgroup float * temp_str = ((threadgroup float *) shmem) + 32*(sgitg&1) + (32*(sgitg >> 1))*NR0;
@@ -211,7 +206,7 @@ kernel void d4_mm(constant d4_mm_args & a [[buffer(0)]],
         threadgroup_barrier(mem_flags::mem_threadgroup);
         if (sgitg == 0) {
             for (int j = tiitg; j < nr1; j += 32) {
-                device float * D = dst + r0 + (ulong)(r1 + j)*a.y_stride;
+                device float * D = dst + r0 + (ulong)(r1 + j)*y_stride;
                 threadgroup float * C = ((threadgroup float *) shmem) + j*NR0;
                 for (int i = 0; i < nr0; i++) D[i] = C[i];
             }
@@ -219,11 +214,54 @@ kernel void d4_mm(constant d4_mm_args & a [[buffer(0)]],
     }
 }
 
+
+template <typename block_q, short nl, void (*deq)(device const block_q *, short, thread half4x4 &)>
+kernel void d4_mm(constant d4_mm_args & a [[buffer(0)]],
+                  device const char  * src0 [[buffer(1)]],
+                  device const float * src1 [[buffer(2)]],
+                  device       float * dst  [[buffer(3)]],
+                  threadgroup  char  * shmem [[threadgroup(0)]],
+                  uint3  tgpig [[threadgroup_position_in_grid]],
+                  ushort tiitg [[thread_index_in_threadgroup]],
+                  ushort sgitg [[simdgroup_index_in_threadgroup]]) {
+    d4_mm_body<block_q, nl, deq>(a.ncols, a.nrows, a.ntok, a.row_bytes, a.x_stride, a.y_stride,
+                                 src0, src1, dst, shmem, tgpig, tiitg, sgitg);
+}
+
+// The routed experts of a chunk at once (ggml's mul_mm_id, as ds4 runs
+// them): grid z an expert, its COUNTS[z] rows of X from row BASES[z]
+// (grouped by expert), its weights at POOL + OFFS[z] + ADD; tiles past an
+// expert's rows do nothing.
+struct d4_mmid_args { uint ncols; uint nrows; uint row_bytes; uint x_stride; uint y_stride; uint add; };
+
+template <typename block_q, short nl, void (*deq)(device const block_q *, short, thread half4x4 &)>
+kernel void d4_mm_id(constant d4_mmid_args & a [[buffer(0)]],
+                     device const char  * pool [[buffer(1)]],
+                     device const ulong * offs [[buffer(2)]],
+                     device const uint  * counts [[buffer(3)]],
+                     device const uint  * bases [[buffer(4)]],
+                     device const float * x [[buffer(5)]],
+                     device       float * y [[buffer(6)]],
+                     threadgroup  char  * shmem [[threadgroup(0)]],
+                     uint3  tgpig [[threadgroup_position_in_grid]],
+                     ushort tiitg [[thread_index_in_threadgroup]],
+                     ushort sgitg [[simdgroup_index_in_threadgroup]]) {
+    const uint z = tgpig.z, count = counts[z];
+    if (tgpig.x * 64 >= count) return;
+    const uint base = bases[z];
+    d4_mm_body<block_q, nl, deq>(a.ncols, a.nrows, count, a.row_bytes, a.x_stride, a.y_stride,
+                                 pool + offs[z] + a.add, x + (ulong)base * a.x_stride, y + (ulong)base * a.y_stride,
+                                 shmem, uint3(tgpig.x, tgpig.y, 0), tiitg, sgitg);
+}
+
 typedef decltype(d4_mm<d4_block_q8_0, 2, d4_deq_q8_0>) d4_mm_t;
 template [[host_name("d4_mm_q8_0")]]    kernel d4_mm_t d4_mm<d4_block_q8_0, 2, d4_deq_q8_0>;
 template [[host_name("d4_mm_f16")]]     kernel d4_mm_t d4_mm<half4x4, 1, d4_deq_f16>;
 template [[host_name("d4_mm_q2_k")]]    kernel d4_mm_t d4_mm<d4_block_q2_K, 16, d4_deq_q2_K>;
 template [[host_name("d4_mm_iq2_xxs")]] kernel d4_mm_t d4_mm<d4_block_iq2_xxs, 16, d4_deq_iq2_xxs>;
+typedef decltype(d4_mm_id<d4_block_q2_K, 16, d4_deq_q2_K>) d4_mm_id_t;
+template [[host_name("d4_mm_id_q2_k")]]    kernel d4_mm_id_t d4_mm_id<d4_block_q2_K, 16, d4_deq_q2_K>;
+template [[host_name("d4_mm_id_iq2_xxs")]] kernel d4_mm_id_t d4_mm_id<d4_block_iq2_xxs, 16, d4_deq_iq2_xxs>;
 
 struct d4_swiglu_args { uint n; uint ff; float clamp; };
 
@@ -1226,4 +1264,103 @@ kernel void d4_moe_sum_rows(constant d4_msum2_args & a [[buffer(0)]],
     float acc = 0.f;
     for (uint s = 0; s < a.nu; ++s) acc += down[(uint64_t)map[t * a.nu + s] * a.d + j];
     moe[gid] = acc + shared_[gid];
+}
+
+// --- a prefill chunk's routing on the GPU ------------------------------------------------
+
+// D4-ROUTE for each token (a threadgroup, a thread an expert): the hash
+// table's experts (HASH), else the top NU of sqrt(softplus(logit)) + bias,
+// the earlier expert first of equal ones (the CPU's insertion order, its
+// slot order); weights the unbiased probabilities, renormalized, scaled.
+struct d4_route_args { uint ne; uint nu; uint hash; float scale; uint has_bias; };
+
+kernel void d4_route(constant d4_route_args & a [[buffer(0)]],
+                     device const float * logits [[buffer(1)]], device const float * bias [[buffer(2)]],
+                     device const int * tid2eid [[buffer(3)]], device const uint * tokens [[buffer(4)]],
+                     device uint * sel [[buffer(5)]], device float * wout [[buffer(6)]],
+                     threadgroup float * sh [[threadgroup(0)]],
+                     uint t [[threadgroup_position_in_grid]], ushort e [[thread_index_in_threadgroup]]) {
+    threadgroup float * probs = sh;                 // NE
+    threadgroup float * sv = sh + a.ne;             // NE: the scores the pick runs over
+    threadgroup float * rv = sh + 2 * a.ne;         // 32: simdgroup maxima
+    threadgroup uint * ri = (threadgroup uint *)(sh + 2 * a.ne + 32);   // 32: their experts
+    threadgroup uint * picked = (threadgroup uint *)(sh + 2 * a.ne + 64); // NU
+    const float l = logits[(uint64_t)t * a.ne + e];
+    // precise:: (closer to the CPU's, which rounds a double result; an ulp
+    // apart still: the weights agree to about 1e-7, the experts exactly)
+    const float sp = l > 20.f ? l : (l < -20.f ? precise::exp(l) : precise::log(1.f + precise::exp(l)));
+    const float p = precise::sqrt(sp);
+    probs[e] = p;
+    sv[e] = p + (a.has_bias ? bias[e] : 0.f);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (a.hash) {
+        if (e < a.nu) picked[e] = (uint)tid2eid[(uint64_t)tokens[t] * a.nu + e];
+    } else {
+        for (uint k = 0; k < a.nu; ++k) {
+            // the largest, the earlier of equal ones: reduce (value, -index)
+            float v = sv[e]; uint idx = e;
+            for (ushort off = 16; off > 0; off /= 2) {
+                const float ov = simd_shuffle_down(v, off); const uint oi = simd_shuffle_down(idx, off);
+                if (ov > v || (ov == v && oi < idx)) { v = ov; idx = oi; }
+            }
+            if (e % 32 == 0) { rv[e / 32] = v; ri[e / 32] = idx; }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            if (e == 0) {
+                float bv = rv[0]; uint bi = ri[0];
+                for (uint s = 1; s < a.ne / 32; ++s)
+                    if (rv[s] > bv || (rv[s] == bv && ri[s] < bi)) { bv = rv[s]; bi = ri[s]; }
+                picked[k] = bi;
+                sv[bi] = -INFINITY;
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (e == 0) {
+        float sum = 0.f;
+        for (uint i = 0; i < a.nu; ++i) sum += probs[picked[i]];
+        if (sum < 6.103515625e-5f) sum = 6.103515625e-5f;
+        for (uint i = 0; i < a.nu; ++i) {
+            sel[t * a.nu + i] = picked[i];
+            wout[t * a.nu + i] = precise::divide(probs[picked[i]], sum) * a.scale;
+        }
+    }
+}
+
+// The chunk's (token, slot) rows grouped by expert: each one's rank among
+// its expert's (COUNT, atomically), the experts' first rows (SCAN), then each
+// row's token and weight, and the way back from (token, slot) (SCATTER).
+struct d4_group_args { uint n; uint ne; uint nu; };
+
+kernel void d4_group_zero(device atomic_uint * counts [[buffer(1)]], uint e [[thread_position_in_grid]]) {
+    atomic_store_explicit(counts + e, 0u, memory_order_relaxed);
+}
+
+kernel void d4_group_count(constant d4_group_args & a [[buffer(0)]],
+                           device const uint * sel [[buffer(1)]], device atomic_uint * counts [[buffer(2)]],
+                           device uint * rank [[buffer(3)]], uint gid [[thread_position_in_grid]]) {
+    if (gid >= a.n) return;
+    rank[gid] = atomic_fetch_add_explicit(counts + sel[gid], 1u, memory_order_relaxed);
+}
+
+kernel void d4_group_scan(constant d4_group_args & a [[buffer(0)]],
+                          device const uint * counts [[buffer(1)]], device uint * bases [[buffer(2)]],
+                          threadgroup uint * sh [[threadgroup(0)]], ushort e [[thread_index_in_threadgroup]]) {
+    const uint c = e < a.ne ? counts[e] : 0u;
+    const uint x = simd_prefix_exclusive_sum(c);
+    if (e % 32 == 31) sh[e / 32] = x + c;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    uint before = x;
+    for (uint s = 0; s < e / 32; ++s) before += sh[s];
+    if (e < a.ne) bases[e] = before;
+}
+
+kernel void d4_group_scatter(constant d4_group_args & a [[buffer(0)]],
+                             device const uint * sel [[buffer(1)]], device const uint * rank [[buffer(2)]],
+                             device const uint * bases [[buffer(3)]], device const float * w [[buffer(4)]],
+                             device uint * rmap [[buffer(5)]], device uint * smap [[buffer(6)]],
+                             device float * wrow [[buffer(7)]], uint gid [[thread_position_in_grid]]) {
+    if (gid >= a.n) return;
+    const uint row = bases[sel[gid]] + rank[gid];
+    rmap[row] = gid / a.nu; smap[gid] = row; wrow[row] = w[gid];
 }
