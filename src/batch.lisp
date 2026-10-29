@@ -45,9 +45,20 @@
                             (make-array (* (ceiling max-n 3) cols) :element-type '(signed-byte 64))
                             (make-array 0 :element-type '(signed-byte 64)))))
 
-(defun quantize-batch! (xs n out)
+(defun each-token (pool n fn)
+  "(FN tk) for tk below N, a range of tokens to each of POOL's threads (all
+   on this one without a POOL)."
+  (declare (type function fn) (type fixnum n))
+  (if pool
+      (pool-run pool (lambda (i c)
+                       (multiple-value-bind (s e) (share n i c)
+                         (loop for tk from s below e do (funcall fn tk)))))
+      (dotimes (tk n) (funcall fn tk))))
+
+(defun quantize-batch! (xs n out &optional pool)
   "Quantize rows 0..N-1 of XS (N rows of COLS floats, row-major) into OUT,
-   each row exactly as QUANTIZE-Q8! would."
+   each row exactly as QUANTIZE-Q8! would (a row is quantized on its own, so
+   POOL's threads give the same bits)."
   (declare (type f32vec xs) (type fixnum n) (optimize speed (safety 0)))
   (let* ((cols (q8batch-cols out))
          (nb (floor cols 32))
@@ -55,11 +66,10 @@
     (declare (type fixnum cols nb))
     (setf (q8batch-n out) n (q8batch-quads-ok out) nil)
     (when (q8batch-qk out)
-      (dotimes (tk n)
-        (quantize-q8k! xs (q8batch-qk out) (* tk cols) cols (* tk cols))))
+      (let ((qk (q8batch-qk out)))
+        (each-token pool n (lambda (tk) (quantize-q8k! xs qk (* tk cols) cols (* tk cols))))))
     (unless qv (return-from quantize-batch! out))
-    (dotimes (tk n)
-      (quantize-q8! xs qv (* tk cols) cols (* tk cols) (* tk nb)))
+    (each-token pool n (lambda (tk) (quantize-q8! xs qv (* tk cols) cols (* tk cols) (* tk nb))))
     (unless (neon-active-p)
       (let ((words (q8batch-words out)) (q (q8vec-quants qv)))
         (declare (type i64vec words) (type i8vec q))
@@ -80,7 +90,7 @@
   #+(and sbcl arm64) (neon-mmla-p)
   #-(and sbcl arm64) nil)
 
-(defun batch-quads (xb)
+(defun batch-quads (xb pool)
   "XB's Q8_K activations packed for the four-token Q6_K kernel, made the
    first time a batch asks."
   (let* ((cols (q8batch-cols xb)) (n (q8batch-n xb)) (nq (ceiling n 4))
@@ -89,7 +99,9 @@
       (setf (q8batch-quads xb) (make-u8vec bytes)
             (q8batch-quads-d xb) (f32vec floats)))
     (unless (q8batch-quads-ok xb)
-      #+(and sbcl arm64) (pack-quads! (q8batch-qk xb) n cols (q8batch-quads xb) (q8batch-quads-d xb))
+      #+(and sbcl arm64)
+      (let ((qk (q8batch-qk xb)) (quads (q8batch-quads xb)) (qd (q8batch-quads-d xb)))
+        (each-token pool nq (lambda (q) (pack-quads! qk n cols quads qd q))))
       (setf (q8batch-quads-ok xb) t))
     (q8batch-quads xb)))
 
@@ -122,7 +134,7 @@
     (let ((rows (kmat-rows w)) (cols (kmat-cols w)) (n (q8batch-n xb)) (qk (q8batch-qk xb)))
       (declare (type fixnum rows cols n))
       (if (and (>= n 2) (eq (kmat-type w) :q6_k) (q6k-quads-p))
-          (let ((quads (batch-quads xb)) (qd (q8batch-quads-d xb)) (pairs (floor rows 2)))
+          (let ((quads (batch-quads xb pool)) (qd (q8batch-quads-d xb)) (pairs (floor rows 2)))
             ;; two rows by four tokens a kernel call; an odd last row on its own
             (pool-run pool (lambda (i c)
                              (multiple-value-bind (s e) (share pairs i c)
@@ -239,7 +251,7 @@
     (loop for li below (model-n-layer m)
           for l = (svref (model-layers m) li)
           do (dotimes (tk n) (rmsnorm! x (layer-attn-norm l) h eps (* tk d)))
-             (quantize-batch! h n xb)
+             (quantize-batch! h n xb pool)
              (matmul! pool (layer-wq l) xb q (layer-bq l))
              (matmul! pool (layer-wk l) xb k (layer-bk l))
              (matmul! pool (layer-wv l) xb v (layer-bv l))
@@ -252,15 +264,15 @@
                (parallel-for (job (* n nh) pool)
                  (multiple-value-bind (tk hh) (floor job nh)
                    (attend-head! ctx li q (+ (* tk qd) (* hh hd)) att (+ pos0 tk 1) hh))))
-             (quantize-batch! att n ab)
+             (quantize-batch! att n ab pool)
              (matmul! pool (layer-wo l) ab h)
              (add! x h (* n d))          ; elementwise, so whole rows at once
              (dotimes (tk n) (rmsnorm! x (layer-ffn-norm l) h eps (* tk d)))
-             (quantize-batch! h n xb)
+             (quantize-batch! h n xb pool)
              (matmul! pool (layer-wgate l) xb fa)
              (matmul! pool (layer-wup l) xb fb)
              (swiglu-par! pool fa fb (* n f))
-             (quantize-batch! fa n fbq)
+             (quantize-batch! fa n fbq pool)
              (matmul! pool (layer-wdown l) fbq h)
              (add! x h (* n d)))
     (incf (context-pos ctx) n)

@@ -334,23 +334,25 @@
 ;;; same.  Their scales go beside: per super-block [y0 y1 y0 y1 y2 y3 y2 y3].
 ;;; A missing token (past N) is zeros.
 
-(defun quad-group-order ()
-  (loop for c below 2 append (loop for x below 4 append (list (+ (* c 8) x) (+ (* c 8) 4 x)))))
+(defparameter +quad-group-order+
+  (coerce (loop for c below 2 append (loop for x below 4 append (list (+ (* c 8) x) (+ (* c 8) 4 x))))
+          '(simple-array fixnum (16))))
 
 #+(and sbcl arm64)
-(defun pack-quads! (xv n cols quads qd)
-  "Lay out tokens 0..N-1 of XV (token t at t*COLS) for %Q6K-DOT-2X4."
+(defun pack-quads! (xv n cols quads qd q)
+  "Lay out quad Q of tokens 0..N-1 of XV (token t at t*COLS) for %Q6K-DOT-2X4."
   (declare (type q8kvec xv) (type fixnum n cols) (type u8vec quads) (type f32vec qd)
            (optimize speed (safety 0)))
-  (let* ((nb (floor cols +qk-k+)) (nq (ceiling n 4))
-         (order (coerce (quad-group-order) '(simple-array fixnum (16))))
+  (declare (type fixnum q))
+  (let* ((nb (floor cols +qk-k+))
+         (order +quad-group-order+)
          (qs (q8kvec-qs xv)) (yd (q8kvec-d xv)))
-    (declare (type fixnum nb nq) (type (simple-array fixnum (16)) order))
-    (fill quads 0 :end (* nq 4 cols))
-    (fill qd 0f0 :end (* nq nb 8))
+    (declare (type fixnum nb) (type (simple-array fixnum (16)) order))
+    (fill quads 0 :start (* q 4 cols) :end (* (1+ q) 4 cols))
+    (fill qd 0f0 :start (* q nb 8) :end (* (1+ q) nb 8))
     (sb-sys:with-pinned-objects (qs quads)
       (let ((src (sb-sys:vector-sap qs)) (dst (sb-sys:vector-sap quads)))
-        (dotimes (q nq)
+        (progn
           (dotimes (b nb)
             (dotimes (gi 16)
               (let ((g (aref order gi))
@@ -371,51 +373,80 @@
     nil))
 
 #+(and sbcl arm64)
+(defconstant +unpacked-sb-bytes+ (+ (* 16 48) 16)
+  "A super-block of a row pair, rebuilt by %Q6K-UNPACK-2.")
+
+#+(and sbcl arm64)
 (defun kmat-quads-dot-neon! (w quads qd n out start end rows)
   "OUT[t*ROWS + r] for Q6_K rows START..END-1 (an even count from an even
-   START) against the N tokens PACK-QUADS! laid out: two rows by four tokens
-   a kernel call, a tile of rows past every quad before the next tile."
+   START) against the N tokens PACK-QUADS! laid out.  With more than one
+   quad, four rows at a time are rebuilt once (%Q6K-UNPACK-2) and run against
+   every quad (%Q6K-GEMM-4X4); a pair left over, or a batch of one quad, goes
+   two rows by four tokens a call (%Q6K-DOT-2X4), rebuilding as it goes."
   (declare (type kmat w) (type u8vec quads) (type f32vec qd out)
            (type fixnum n start end rows) (optimize speed (safety 0)))
   (let* ((nb (kmat-nb w)) (cols (* nb +qk-k+)) (nq (ceiling n 4))
          (qstride (* nb 192)) (sstride (* nb 16)) (dstride (* nb 4))
-         (tile (max 2 (logandc2 (kmat-tile-rows w) 1)))
          (qs (kmat-qs w)) (sc (kmat-sc w)) (dd (kmat-dd w))
+         (gemm-end (if (>= nq 2) (- end (mod (- end start) 4)) start))
+         (ubytes (* nb +unpacked-sb-bytes+))
+         (u (make-array (if (>= nq 2) (* 2 ubytes) 0) :element-type '(unsigned-byte 8)))
          (desc (make-array 9 :element-type '(unsigned-byte 64)))
-         (res (make-array 8 :element-type 'single-float)))
-    (declare (type fixnum nb cols nq qstride sstride dstride tile)
+         (res (make-array (max 8 (* 16 nq)) :element-type 'single-float)))
+    (declare (type fixnum nb cols nq qstride sstride dstride gemm-end ubytes)
+             (type (simple-array (unsigned-byte 8) (*)) u)
              (type (simple-array (unsigned-byte 64) (9)) desc)
-             (type (simple-array single-float (8)) res))
-    (sb-sys:with-pinned-objects (qs sc dd quads qd desc res)
+             (type (simple-array single-float (*)) res))
+    (sb-sys:with-pinned-objects (qs sc dd quads qd desc res u)
       (let ((q0 (sb-sys:sap-int (sb-sys:vector-sap qs)))
             (s0 (sb-sys:sap-int (sb-sys:vector-sap sc)))
             (d0 (sb-sys:sap-int (sb-sys:vector-sap dd)))
             (x0 (sb-sys:sap-int (sb-sys:vector-sap quads)))
             (y0 (sb-sys:sap-int (sb-sys:vector-sap qd)))
+            (u0 (sb-sys:sap-int (sb-sys:vector-sap u)))
+            (r0 (sb-sys:sap-int (sb-sys:vector-sap res)))
             (dsap (sb-sys:vector-sap desc)))
-        (declare (type (unsigned-byte 64) q0 s0 d0 x0 y0))
-        (setf (aref desc 8) (sb-sys:sap-int (sb-sys:vector-sap res)))
-        (loop for t0 of-type fixnum from start below end by tile
-              do (let ((t1 (min end (+ t0 tile))))
-                   (declare (type fixnum t1))
+        (declare (type (unsigned-byte 64) q0 s0 d0 x0 y0 u0 r0))
+        (flet ((row-pair (r)
+                 (setf (aref desc 0) (+ q0 (* r qstride))
+                       (aref desc 1) (+ q0 (* (1+ r) qstride))
+                       (aref desc 2) (+ s0 (* r sstride))
+                       (aref desc 3) (+ s0 (* (1+ r) sstride))
+                       (aref desc 4) (+ d0 (* r dstride))
+                       (aref desc 5) (+ d0 (* (1+ r) dstride))))
+               (put (tk r a b)
+                 (declare (type fixnum tk r) (type single-float a b))
+                 (when (< tk n)
+                   (setf (aref out (+ (* tk rows) r)) a
+                         (aref out (+ (* tk rows) r 1)) b))))
+          (declare (inline row-pair put))
+          ;; four rows at a time, rebuilt once for all the quads
+          (loop for r of-type fixnum from start below gemm-end by 4
+                do (row-pair r) (setf (aref desc 6) u0) (%q6k-unpack-2 dsap nb)
+                   (row-pair (+ r 2)) (setf (aref desc 6) (+ u0 ubytes)) (%q6k-unpack-2 dsap nb)
+                   (setf (aref desc 0) u0 (aref desc 1) (+ u0 ubytes)
+                         (aref desc 2) x0 (aref desc 3) y0 (aref desc 4) r0 (aref desc 5) nq)
+                   (%q6k-gemm-4x4 dsap nb)
+                   (dotimes (q nq)
+                     (dotimes (rp 2)
+                       (dotimes (p 2)
+                         (let ((k (+ (* q 16) (* rp 8) (* p 4))) (tk (+ (* q 4) (* p 2))) (rr (+ r (* 2 rp))))
+                           (declare (type fixnum k tk rr))
+                           (put tk rr (aref res k) (aref res (+ k 2)))
+                           (put (1+ tk) rr (aref res (+ k 1)) (aref res (+ k 3))))))))
+          ;; the rest two rows by four tokens a call
+          (setf (aref desc 8) r0)
+          (loop for r of-type fixnum from gemm-end below end by 2
+                do (row-pair r)
                    (dotimes (q nq)
                      (setf (aref desc 6) (+ x0 (* q 4 cols))
                            (aref desc 7) (+ y0 (* q nb 32)))
-                     (loop for r of-type fixnum from t0 below t1 by 2
-                           do (setf (aref desc 0) (+ q0 (* r qstride))
-                                    (aref desc 1) (+ q0 (* (1+ r) qstride))
-                                    (aref desc 2) (+ s0 (* r sstride))
-                                    (aref desc 3) (+ s0 (* (1+ r) sstride))
-                                    (aref desc 4) (+ d0 (* r dstride))
-                                    (aref desc 5) (+ d0 (* (1+ r) dstride)))
-                              (%q6k-dot-2x4 dsap nb)
-                              ;; RES: per pair [A.t0 A.t1 B.t0 B.t1]
-                              (dotimes (j 4)
-                                (let ((tk (+ (* q 4) j)) (k (+ (* 4 (floor j 2)) (mod j 2))))
-                                  (declare (type fixnum tk k))
-                                  (when (< tk n)
-                                    (setf (aref out (+ (* tk rows) r)) (aref res k)
-                                          (aref out (+ (* tk rows) r 1)) (aref res (+ k 2))))))))))))
+                     (%q6k-dot-2x4 dsap nb)
+                     (dotimes (p 2)
+                       (let ((k (* p 4)) (tk (+ (* q 4) (* p 2))))
+                         (declare (type fixnum k tk))
+                         (put tk r (aref res k) (aref res (+ k 2)))
+                         (put (1+ tk) r (aref res (+ k 1)) (aref res (+ k 3))))))))))
     out))
 
 (defun kmat-row-dot (w row xv xo)

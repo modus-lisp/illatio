@@ -69,6 +69,13 @@
 ;;;   sub  vD.16b, vN.16b, vM.16b 6e208400 | M<<16 | N<<5 | D
 ;;;   movi vD.16b, #32            4f01e400 | D
 ;;;   str  qT, [xN, #16]          3d800400 | N<<5 | T
+;;;   mov  xD, xN                 aa0003e0 | N<<16 | D
+;;;   stp  qA, qB, [xN], #32      ac810000 | B<<10 | N<<5 | A
+;;;   str  qT, [xN], #16          3c810400 | N<<5 | T
+;;;   dup  vD.4s, vN.s[i]         4e040400 | i<<19 | N<<5 | D
+;;;   mla  vD.4s, vN.4s, vM.4s    4ea09400 | M<<16 | N<<5 | D
+;;;   movi vD.16b, #0x30          4f01e600 | D
+;;;   shl  vD.16b, vN.16b, #2     4f0a5400 | N<<5 | D     (ushr #2: 6f0e0400)
 ;;;   b.ne  -K instructions       54000001 | (-K mod 2^19)<<5
 ;;;
 ;;; SDOT is FEAT_DotProd: every Apple M-series and the Pi 5's A76 have it, the
@@ -105,6 +112,13 @@
 (sb-c:defknown %q6k-dot-2x4 (sb-sys:system-area-pointer (unsigned-byte 32))
     (values) ())
 
+;;; A Q6_K row pair rebuilt once for a whole batch (see %Q6K-UNPACK-2), then
+;;; two such pairs against every token quad (see %Q6K-GEMM-4X4).
+(sb-c:defknown %q6k-unpack-2 (sb-sys:system-area-pointer (unsigned-byte 32))
+    (values) ())
+(sb-c:defknown %q6k-gemm-4x4 (sb-sys:system-area-pointer (unsigned-byte 32))
+    (values) ())
+
 (sb-c:defknown %f32-axpy4
     (sb-sys:system-area-pointer sb-sys:system-area-pointer single-float (unsigned-byte 32))
     (values) ())
@@ -121,6 +135,26 @@
 (defun a64-mla-lane (d n m i)
   "mla vD.4s, vN.4s, vM.s[I]"
   (logior #x6f800000 (if (oddp i) (ash 1 21) 0) (if (>= i 2) (ash 1 11) 0) (ash m 16) (ash n 5) d))
+
+(defun q6k-rebuild-words (v q h shift hi hb m4 m30 c32)
+  "Instruction words rebuilding a 16-weight Q6_K group as int8 q-32 into V:
+   (low or high nibble of Q) | (2 bits of H at SHIFT) << 4, minus 32.  The two
+   bits are moved to bits 4-5 and masked there (M30 is 0x30 a byte)."
+  (append
+   (ecase shift
+     (0 (list (a64 #x4f0c5400 hb h) (a64 #x4e201c00 hb hb m30)))
+     (2 (list (a64 #x4f0a5400 hb h) (a64 #x4e201c00 hb hb m30)))
+     (4 (list (a64 #x4e201c00 hb h m30)))
+     (6 (list (a64 #x6f0e0400 hb h) (a64 #x4e201c00 hb hb m30))))
+   (list (if hi (a64 #x6f0c0400 v q) (a64 #x4e201c00 v q m4))
+         (a64 #x4ea01c00 v v hb)
+         (a64 #x6e208400 v v c32))))
+
+(defun a64-dup-lane (d n i) (logior #x4e040400 (ash i 19) (ash n 5) d))
+(defun a64-mov-x (d n) (logior #xaa0003e0 (ash n 16) d))
+(defun a64-loop (count words)
+  "WORDS, then decrement COUNT and branch back to them while it is not zero."
+  (append words (list (a64 #xf1000400 count count) (a64-bne-back (1+ (length words))))))
 
 (in-package #:sb-vm)
 
@@ -465,17 +499,18 @@
       (illatio::word (illatio::a64 #x6f00e400 s0))
       (illatio::word (illatio::a64 #x6f00e400 s1))
       (illatio::word (illatio::a64 #x4f00e5e0 m4))                  ; 0x0f
-      (illatio::word (illatio::a64 #x4f00e460 m3))                  ; 0x03
+      (illatio::word (illatio::a64 #x4f01e600 m3))                  ; 0x30
       (illatio::word (illatio::a64 #x4f01e400 c32))                 ; 32
       (flet ((rebuild (v q h shift hi)
-               ;; V = (low or high nibble of Q) | (2 bits of H at SHIFT) << 4, minus 32
+               ;; V = (low or high nibble of Q) | (2 bits of H at SHIFT) << 4, minus 32;
+               ;; the two bits are moved to bits 4-5 and masked there (0x30)
                (append
-                (if (zerop shift)
-                    (list (illatio::a64 #x4e201c00 hb h m3))
-                    (list (illatio::a64 (ecase shift (2 #x6f0e0400) (4 #x6f0c0400) (6 #x6f0a0400)) hb h)
-                          (illatio::a64 #x4e201c00 hb hb m3)))
-                (list (illatio::a64 #x4f0c5400 hb hb)
-                      (if hi (illatio::a64 #x6f0c0400 v q) (illatio::a64 #x4e201c00 v q m4))
+                (ecase shift
+                  (0 (list (illatio::a64 #x4f0c5400 hb h) (illatio::a64 #x4e201c00 hb hb m3)))
+                  (2 (list (illatio::a64 #x4f0a5400 hb h) (illatio::a64 #x4e201c00 hb hb m3)))
+                  (4 (list (illatio::a64 #x4e201c00 hb h m3)))
+                  (6 (list (illatio::a64 #x6f0e0400 hb h) (illatio::a64 #x4e201c00 hb hb m3))))
+                (list (if hi (illatio::a64 #x6f0c0400 v q) (illatio::a64 #x4e201c00 v q m4))
                       (illatio::a64 #x4ea01c00 v v hb)
                       (illatio::a64 #x6e208400 v v c32)))))
         (illatio::loop-while-count
@@ -523,6 +558,141 @@
       (illatio::word (illatio::a64 (logior #xf9400000 (ash 8 10)) pqa pd)) ; the results' address
       (illatio::word (illatio::a64 #x3d800000 s0 pqa))
       (illatio::word (illatio::a64 #x3d800400 s1 pqa)))))
+
+;;; Rebuild rows A and B of a Q6_K matrix for a batch, into U: per super-block,
+;;; per group in the order %Q6K-DOT-2X4 takes them, 48 bytes -- the two SMMLA
+;;; operands (A's and B's halves zipped) and the scale vector [sA sA sB sB] as
+;;; int32 -- then 16 bytes, [dA dA dB dB].  The rebuilding is %Q6K-DOT-2X4's,
+;;; done once a batch instead of once every four tokens.
+(define-vop (illatio::%q6k-unpack-2)
+  (:translate illatio::%q6k-unpack-2)
+  (:policy :fast-safe)
+  (:args (desc :scs (sap-reg) :target pd) (nb :scs (unsigned-reg) :target count))
+  (:arg-types system-area-pointer unsigned-num)
+  (:temporary (:sc unsigned-reg) pqa) (:temporary (:sc unsigned-reg) pqb)
+  (:temporary (:sc unsigned-reg) psa) (:temporary (:sc unsigned-reg) psb)
+  (:temporary (:sc unsigned-reg) pda) (:temporary (:sc unsigned-reg) pdb)
+  (:temporary (:sc unsigned-reg) pu)
+  (:temporary (:sc unsigned-reg :from (:argument 0)) pd)
+  (:temporary (:sc unsigned-reg :from (:argument 1)) count)
+  (:temporary (:sc double-reg) m4) (:temporary (:sc double-reg) m30)
+  (:temporary (:sc double-reg) c32)
+  (:temporary (:sc double-reg) ha0) (:temporary (:sc double-reg) ha1)
+  (:temporary (:sc double-reg) hb0) (:temporary (:sc double-reg) hb1)
+  (:temporary (:sc double-reg) qa) (:temporary (:sc double-reg) qb)
+  (:temporary (:sc double-reg) sba) (:temporary (:sc double-reg) sbb)
+  (:temporary (:sc double-reg) saa) (:temporary (:sc double-reg) sab)
+  (:temporary (:sc double-reg) sbaa) (:temporary (:sc double-reg) sbab)
+  (:temporary (:sc double-reg) va) (:temporary (:sc double-reg) vb)
+  (:temporary (:sc double-reg) hb)
+  (:temporary (:sc double-reg) w1) (:temporary (:sc double-reg) w2)
+  (:generator 300
+    (move pd desc) (move count nb)
+    (illatio::with-a64 (pqa pqb psa psb pda pdb pu pd count m4 m30 c32 ha0 ha1 hb0 hb1 qa qb
+                        sba sbb saa sab sbaa sbab va vb hb w1 w2)
+      (loop for r in (list pqa pqb psa psb pda pdb pu) for k from 0
+            do (illatio::word (illatio::a64 (logior #xf9400000 (ash k 10)) r pd)))
+      (illatio::word (illatio::a64 #x4f00e5e0 m4))                  ; 0x0f
+      (illatio::word (illatio::a64 #x4f01e600 m30))                 ; 0x30
+      (illatio::word (illatio::a64 #x4f01e400 c32))                 ; 32
+      (illatio::loop-while-count
+       count
+       (append
+        (list (illatio::a64 #x3cc10400 sba psa) (illatio::a64 #x3cc10400 sbb psb))
+        (loop for c below 2
+              append (append
+                      (list (illatio::a64 (if (zerop c) #x0f08a400 #x4f08a400) va sba)
+                            (illatio::a64 #x0f10a400 saa va) (illatio::a64 #x4f10a400 sab va)
+                            (illatio::a64 (if (zerop c) #x0f08a400 #x4f08a400) vb sbb)
+                            (illatio::a64 #x0f10a400 sbaa vb) (illatio::a64 #x4f10a400 sbab vb)
+                            (illatio::a64-ldp-q ha0 ha1 pqa) (illatio::a64-ldp-q hb0 hb1 pqb))
+                      (loop for x below 4
+                            append (append
+                                    (list (illatio::a64 #x3cc10400 qa pqa) (illatio::a64 #x3cc10400 qb pqb))
+                                    (loop for hi in '(nil t)
+                                          for shift = (+ (* 2 (floor x 2)) (if hi 4 0))
+                                          append (append
+                                                  (illatio::q6k-rebuild-words va qa (if (evenp x) ha0 ha1) shift hi hb m4 m30 c32)
+                                                  (illatio::q6k-rebuild-words vb qb (if (evenp x) hb0 hb1) shift hi hb m4 m30 c32)
+                                                  (list (illatio::a64 #x4ec03800 w1 va vb)
+                                                        (illatio::a64 #x4ec07800 w2 va vb)
+                                                        (logior #xac810000 (ash w2 10) (ash pu 5) w1)
+                                                        (illatio::a64-dup-lane va (if hi sab saa) x)
+                                                        (illatio::a64-dup-lane vb (if hi sbab sbaa) x)
+                                                        (illatio::a64 #x4ec03800 w1 va vb)
+                                                        (illatio::a64 #x3c810400 w1 pu))))))))
+        (list (illatio::a64 #xbc404400 va pda) (illatio::a64 #xbc404400 vb pdb)
+              (illatio::a64 #x4e040400 va va) (illatio::a64 #x4e040400 vb vb)
+              (illatio::a64 #x4ec03800 w1 va vb)
+              (illatio::a64 #x3c810400 w1 pu)))))))
+
+;;; Two rebuilt row pairs (U0, U1) against NQ token quads: per group, each
+;;; pair's operands once, SMMLA against both token pairs, the scale vector
+;;; times the four integers.  Per super-block and (row, token) the one-row
+;;; kernel's floats, as in %Q6K-DOT-2X4.  Results: per quad, sixteen floats --
+;;; for U0 then U1, for token pair 0 then 1, [A.t A.t' B.t B.t'].
+(define-vop (illatio::%q6k-gemm-4x4)
+  (:translate illatio::%q6k-gemm-4x4)
+  (:policy :fast-safe)
+  (:args (desc :scs (sap-reg) :target pd) (nb :scs (unsigned-reg) :target nbs))
+  (:arg-types system-area-pointer unsigned-num)
+  (:temporary (:sc unsigned-reg) pu0) (:temporary (:sc unsigned-reg) pu1)
+  (:temporary (:sc unsigned-reg) pb0) (:temporary (:sc unsigned-reg) pb1)
+  (:temporary (:sc unsigned-reg) px) (:temporary (:sc unsigned-reg) py)
+  (:temporary (:sc unsigned-reg) pr) (:temporary (:sc unsigned-reg) cq)
+  (:temporary (:sc unsigned-reg) count)
+  (:temporary (:sc unsigned-reg :from (:argument 0)) pd)
+  (:temporary (:sc unsigned-reg :from (:argument 1)) nbs)
+  (:temporary (:sc double-reg) s00) (:temporary (:sc double-reg) s01)
+  (:temporary (:sc double-reg) s10) (:temporary (:sc double-reg) s11)
+  (:temporary (:sc double-reg) a00) (:temporary (:sc double-reg) a01)
+  (:temporary (:sc double-reg) a10) (:temporary (:sc double-reg) a11)
+  (:temporary (:sc double-reg) w1a) (:temporary (:sc double-reg) w2a)
+  (:temporary (:sc double-reg) sva)
+  (:temporary (:sc double-reg) w1b) (:temporary (:sc double-reg) w2b)
+  (:temporary (:sc double-reg) svb)
+  (:temporary (:sc double-reg) x1) (:temporary (:sc double-reg) x2)
+  (:temporary (:sc double-reg) dda) (:temporary (:sc double-reg) ddb)
+  (:generator 300
+    (move pd desc) (move nbs nb)
+    (illatio::with-a64 (pu0 pu1 pb0 pb1 px py pr cq count pd nbs s00 s01 s10 s11 a00 a01 a10 a11
+                        w1a w2a sva w1b w2b svb x1 x2 dda ddb)
+      (loop for r in (list pb0 pb1 px py pr cq) for k from 0
+            do (illatio::word (illatio::a64 (logior #xf9400000 (ash k 10)) r pd)))
+      (illatio::loop-while-count
+       cq
+       (append
+        (list (illatio::a64-mov-x pu0 pb0) (illatio::a64-mov-x pu1 pb1) (illatio::a64-mov-x count nbs)
+              (illatio::a64 #x6f00e400 s00) (illatio::a64 #x6f00e400 s01)
+              (illatio::a64 #x6f00e400 s10) (illatio::a64 #x6f00e400 s11))
+        (illatio::a64-loop
+         count
+         (append
+          (list (illatio::a64 #x6f00e400 a00) (illatio::a64 #x6f00e400 a01)
+                (illatio::a64 #x6f00e400 a10) (illatio::a64 #x6f00e400 a11))
+          (loop repeat 16
+                append (append
+                        (list (illatio::a64-ldp-q w1a w2a pu0) (illatio::a64 #x3cc10400 sva pu0)
+                              (illatio::a64-ldp-q w1b w2b pu1) (illatio::a64 #x3cc10400 svb pu1))
+                        (loop for (acca accb) in (list (list a00 a10) (list a01 a11))
+                              append (list (illatio::a64-ldp-q x1 x2 px)
+                                           (illatio::a64 #x6f00e400 dda) (illatio::a64 #x6f00e400 ddb)
+                                           (illatio::a64 #x4e80a400 dda w1a x1) (illatio::a64 #x4e80a400 ddb w1b x1)
+                                           (illatio::a64 #x4e80a400 dda w2a x2) (illatio::a64 #x4e80a400 ddb w2b x2)
+                                           (illatio::a64 #x4ea09400 acca dda sva)
+                                           (illatio::a64 #x4ea09400 accb ddb svb)))))
+          ;; [dA dA dB dB] of each pair of rows, times the token pairs' y.d
+          (list (illatio::a64 #x3cc10400 w1a pu0) (illatio::a64 #x3cc10400 w1b pu1)
+                (illatio::a64-ldp-q x1 x2 py)
+                (illatio::a64 #x6e20dc00 w2a w1a x1) (illatio::a64 #x6e20dc00 sva w1a x2)
+                (illatio::a64 #x6e20dc00 w2b w1b x1) (illatio::a64 #x6e20dc00 svb w1b x2))
+          (loop for (acc dq sum) in (list (list a00 w2a s00) (list a01 sva s01)
+                                          (list a10 w2b s10) (list a11 svb s11))
+                append (list (illatio::a64 #x4e21d800 acc acc)
+                             (illatio::a64 #x6e20dc00 acc dq acc)
+                             (illatio::a64 #x4e20d400 sum sum acc)))))
+        (list (illatio::a64 #x3c810400 s00 pr) (illatio::a64 #x3c810400 s01 pr)
+              (illatio::a64 #x3c810400 s10 pr) (illatio::a64 #x3c810400 s11 pr)))))))
 
 (define-vop (illatio::%f32-axpy4)
   (:translate illatio::%f32-axpy4)
