@@ -70,8 +70,10 @@ llama.cpp vectors at the same noise floor as the CPU.
 
 DeepSeek V4 Flash, ds4's IQ2_XXS/Q2_K build (`ds4f`), streamed from the
 SSD on a 48 GB M4 Pro with the GPU: decode 8.3 tok/s with a warm expert
-cache, 6.9 at 6K tokens of context (ds4's own SSD streaming: 4.2), prefill
-26 tok/s at 2K tokens and 20 at 6K (a 6,352-token prompt in 5.2 minutes).  On the CPU alone: decode
+cache, 6.9 at 6K tokens of context; prefill 58 tok/s on a 6,352-token
+prompt (110 s; ds4's own: 104 tok/s), and a prompt prefilled before is
+taken from disk: the same 6,352 tokens with another question after them
+in 38 s.  On the CPU alone: decode
 3.5, prefill 7.  It chats and calls tools through the CLI and the OpenAI
 endpoint.
 
@@ -228,7 +230,9 @@ folds them straight into its stream state.
   are copied in by pread, as ds4 streams them: for a prompt, all of a
   layer's experts into a staging buffer while its attention runs, then
   64-token matrix products, with attention, its Q8_0 projections and the
-  indexer's scores on the GPU too.  Decode runs every layer on the GPU
+  indexer's scores on the GPU too -- every layer of a 2048-token chunk, its
+  activations staying there (`src/metal-ds4f-prefill.lisp`; each window the
+  compressors close in the chunk pooled at once).  Decode runs every layer on the GPU
   (`src/metal-ds4f-decode.lisp`), one command buffer a layer -- the
   previous layer's experts, then this layer's attention block whole (HC,
   norms, projections, RoPE, the FP8/FP4 round trips, the raw ring, the
@@ -333,10 +337,11 @@ inspect/collect-vectors.py http://localhost:18931 inspect/vectors/qwen2.5-0.5b-q
   (8 threads give 3x) and the serial per-layer ops between the products.
 - **More formats.** Q5_K (Q5_K_M files) and Q8_0-with-K-quant mixes.
 - **Qwen3.6-35B-A3B** (`qwen35moe`): expert routing on top of `qwen35`.
-- **ds4f.** The decode cache's misses (12 a token, read while the GPU
-  waits), the F32 products from F16 weights (half their bandwidth and 1 GB),
-  and the expert cache's size on bigger machines (one Metal buffer stops it
-  at 28 GB).
+- **ds4f.** Prefill's routed experts as one indexed product a layer (now
+  512 small ones), the output head on the GPU, decode's F32 products from
+  the F16 weights prefill already uses, the decode cache's misses (12 a
+  token), and the expert cache's size on bigger machines (one Metal buffer
+  stops it at 28 GB).
 
 ## License
 
