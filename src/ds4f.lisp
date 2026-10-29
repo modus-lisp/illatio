@@ -624,6 +624,28 @@
 
 ;;; --- the FFN -----------------------------------------------------------------------
 
+(defun prefetch-file-range (w start bytes)
+  "Ask the OS to read bytes START..START+BYTES of the file vector W now
+   (madvise WILLNEED): one large read in the background, where touching the
+   pages would fault them in 16 KB at a time as the kernels reach them."
+  #+sbcl
+  (let* ((base (sb-sys:sap-int (sb-sys:vector-sap w)))
+         (from (logandc2 (+ base start) 16383))
+         (to (+ base start bytes)))
+    (sb-alien:alien-funcall
+     (sb-alien:extern-alien "madvise" (function sb-alien:int sb-alien:unsigned-long sb-alien:unsigned-long sb-alien:int))
+     from (- to from) 3))                ; MADV_WILLNEED
+  #-sbcl (progn w start bytes))
+
+(defun prefetch-experts (m l sel)
+  "Every routed matrix of the experts SEL, read ahead."
+  (dolist (tensor (list (dl-gate-exps l) (dl-up-exps l) (dl-down-exps l)))
+    (destructuring-bind (off row-bytes rows cols) tensor
+      (declare (ignore cols))
+      (loop for e across sel
+            do (prefetch-file-range (ds4f-file m) (+ off (* e rows row-bytes)) (* rows row-bytes))))))
+
+
 (defun d4-route (m l li x token)
   "(values experts weights): the hash table's experts in the first layers,
    else the top N-USED of sqrt(softplus(router)) + bias; weights from the
@@ -659,6 +681,7 @@
         (hc-pre m (dl-hc-ffn-fn l) (dl-hc-ffn-scale l) (dl-hc-ffn-base l) streams cur flat)
       (d4-rms! cur norm d eps (dl-ffn-norm l))
       (multiple-value-bind (sel w) (d4-route m l li norm token)
+        (prefetch-experts m l sel)
         (let ((xq (make-q8kvec d)) (mid (f32vec (* nu ff))) (moe (f32vec d)) (shared (f32vec d)))
           (quantize-q8k! norm xq)
           ;; gate and up: silu(clamp(g)) * clamp(u) * weight, per expert
