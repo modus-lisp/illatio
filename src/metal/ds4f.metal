@@ -538,3 +538,44 @@ kernel void d4_mv_q2_k(constant d4_mv_args & a [[buffer(0)]],
         if (tiisg == 0) out[first_row + row] = s;
     }
 }
+
+// --- a token's Q8_0 projections (decode) ---------------------------------------------
+
+struct d4_mvq8_args { uint ncols; uint nrows; uint row_bytes; uint group_rows; uint group_stride; };
+
+// Y = W X for one token, W's Q8_0 rows; row r reads X from (r / GROUP_ROWS)
+// * GROUP_STRIDE (the grouped output projection; GROUP_ROWS = NROWS for a
+// plain one).  A simdgroup takes 4 rows, its 32 lanes 8 blocks a step (4
+// lanes a block, 8 quants each), as ggml's kernel_mul_mv_q8_0_f32 walks K;
+// 2 simdgroups a threadgroup.
+kernel void d4_mv_q8_0(constant d4_mvq8_args & a [[buffer(0)]],
+                       device const char * w [[buffer(1)]],
+                       device const float * x [[buffer(2)]],
+                       device float * y [[buffer(3)]],
+                       uint tg [[threadgroup_position_in_grid]],
+                       ushort tiisg [[thread_index_in_simdgroup]],
+                       ushort sgitg [[simdgroup_index_in_threadgroup]]) {
+    const int first_row = (tg * 2 + sgitg) * 4;
+    if (first_row >= (int)a.nrows) return;
+    const int nb = a.ncols / 32;
+    const short ix = tiisg / 4, il = tiisg % 4;
+    device const float * xr = x + (uint64_t)(first_row / a.group_rows) * a.group_stride;
+    float sumf[4] = {0.f, 0.f, 0.f, 0.f};
+    for (int ib = ix; ib < nb; ib += 8) {
+        device const float4 * xb = (device const float4 *)(xr + ib * 32 + il * 8);
+        const float4 y0 = xb[0], y1 = xb[1];
+        for (short row = 0; row < 4; ++row) {
+            device const d4_block_q8_0 * blk =
+                (device const d4_block_q8_0 *)(w + (uint64_t)(first_row + row) * a.row_bytes) + ib;
+            device const int8_t * qs = blk->qs + il * 8;
+            const float sq = qs[0] * y0[0] + qs[1] * y0[1] + qs[2] * y0[2] + qs[3] * y0[3]
+                           + qs[4] * y1[0] + qs[5] * y1[1] + qs[6] * y1[2] + qs[7] * y1[3];
+            sumf[row] += sq * (float)blk->d;
+        }
+    }
+    for (short row = 0; row < 4 && first_row + row < (int)a.nrows; ++row) {
+        const float s = simd_sum(sumf[row]);
+        if (tiisg == 0) y[first_row + row] = s;
+    }
+}
+

@@ -55,7 +55,12 @@
   "What of DS4F the GPU runs (metal-ds4f.lisp): any of :EXPERTS (prefill's
    routed FFN), :PROJ (prefill's attention and shared expert Q8_0
    products), :ATTN (prefill's attention), :DECODE (a token's routed
-   experts, from the GPU's expert cache); T is all of them, NIL none.")
+   experts, from the GPU's expert cache), :DECODE-ATTN (a token's attention
+   projections; off: three command buffers a layer cost more, about 1.1 ms,
+   than the CPU's products, about 0.9); T is all of them, NIL none.")
+
+(defparameter *ds4f-prefetch-k* 8
+  "How many of the next layer's experts decode reads ahead (0: none).")
 
 (defparameter *ds4f-read-all-from* 512
   "From this many tokens a chunk's layer reads all its experts ahead, while
@@ -658,37 +663,50 @@
       ;; Q through its LoRA, normed per head; KV normed
       (let ((qr (f32vec (ds4f-lora-q m))) (qr-norm (f32vec (ds4f-lora-q m)))
             (q (f32vec (* nh hd))) (kv0 (f32vec hd)) (kv (f32vec hd)))
-        (q8mv! pool (dl-q-a l) norm qr)
-        (d4-rms! qr qr-norm (ds4f-lora-q m) eps (dl-q-a-norm l))
-        (q8mv! pool (dl-q-b l) qr-norm q)
-        (dotimes (h nh) (d4-rms! q q hd eps nil (* h hd) (* h hd)))
-        (q8mv! pool (dl-kv l) norm kv0)
-        (d4-rms! kv0 kv hd eps (dl-kv-norm l))
-        (d4-rope! m q nh hd pos li)
-        (d4-rope! m kv 1 hd pos li)
-        (fp8-kv-round! kv 0 hd (ds4f-n-rot m))
-        (push-raw! m c kv)
-        (when (plusp ratio)
-          (let ((row (compress-step m (dl-comp-kv l) (dl-comp-gate l) (dl-comp-ape l) (dl-comp-norm l)
-                                    norm (dc-st-kv c) (dc-st-score c) hd ratio li pos)))
-            (when row
-              (push-comp! (dc-comp c) #'dc-n-comp hd row c)
-              (incf (dc-n-comp c))))
-          (when (= ratio 4)
-            (let ((row (compress-step m (dl-ixc-kv l) (dl-ixc-gate l) (dl-ixc-ape l) (dl-ixc-norm l)
-                                      norm (dc-ix-kv c) (dc-ix-score c) (ds4f-ix-dim m) ratio li pos)))
-              (when row
-                (push-comp! (dc-ix-comp c) #'dc-n-ix (ds4f-ix-dim m) row c)
-                (incf (dc-n-ix c))))))
-        (let* ((allowed (and (= ratio 4) (indexer-allowed m l c norm qr-norm li pos)))
-               (heads (d4-attend! m l q c allowed (f32vec (* nh hd)))))
-          (d4-rope! m heads nh hd pos li :inverse t)
-          ;; out: 8 groups of 8 heads, each to rank LORA-O, then to the embedding
-          (let* ((groups (ds4f-out-groups m)) (rank (ds4f-lora-o m)) (gdim (* hd (floor nh groups)))
-                 (low (f32vec (* groups rank))) (out (f32vec d)))
-            (grouped-q8mv! pool (dl-out-a l) heads groups gdim rank low)
-            (q8mv! pool (dl-out-b l) low out)
-            (values out post comb)))))))
+        (let ((gpu (ds4f-gpu-p :decode-attn)) (allowed nil))
+          (flet ((kv-path ()
+                   ;; the KV row: normed, RoPE'd, through FP8, into the cache and the compressors
+                   (d4-rms! kv0 kv hd eps (dl-kv-norm l))
+                   (d4-rope! m kv 1 hd pos li)
+                   (fp8-kv-round! kv 0 hd (ds4f-n-rot m))
+                   (push-raw! m c kv)
+                   (when (plusp ratio)
+                     (let ((row (compress-step m (dl-comp-kv l) (dl-comp-gate l) (dl-comp-ape l) (dl-comp-norm l)
+                                               norm (dc-st-kv c) (dc-st-score c) hd ratio li pos)))
+                       (when row
+                         (push-comp! (dc-comp c) #'dc-n-comp hd row c)
+                         (incf (dc-n-comp c))))
+                     (when (= ratio 4)
+                       (let ((row (compress-step m (dl-ixc-kv l) (dl-ixc-gate l) (dl-ixc-ape l) (dl-ixc-norm l)
+                                                 norm (dc-ix-kv c) (dc-ix-score c) (ds4f-ix-dim m) ratio li pos)))
+                         (when row
+                           (push-comp! (dc-ix-comp c) #'dc-n-ix (ds4f-ix-dim m) row c)
+                           (incf (dc-n-ix c))))))
+                   (setf allowed (and (= ratio 4) (indexer-allowed m l c norm qr-norm li pos)))))
+            (if gpu
+                ;; the projections on the GPU, the KV row's path on the CPU while Q-B runs
+                (progn
+                  #+(and sbcl darwin) (gpu-attn-in! m li norm qr kv0)
+                  (d4-rms! qr qr-norm (ds4f-lora-q m) eps (dl-q-a-norm l))
+                  #+(and sbcl darwin) (gpu-attn-qb! m li qr-norm q #'kv-path))
+                (progn
+                  (q8mv! pool (dl-q-a l) norm qr)
+                  (d4-rms! qr qr-norm (ds4f-lora-q m) eps (dl-q-a-norm l))
+                  (q8mv! pool (dl-q-b l) qr-norm q)
+                  (q8mv! pool (dl-kv l) norm kv0)
+                  (kv-path))))
+          (dotimes (h nh) (d4-rms! q q hd eps nil (* h hd) (* h hd)))
+          (d4-rope! m q nh hd pos li)
+          (let ((heads (d4-attend! m l q c allowed (f32vec (* nh hd)))))
+            (d4-rope! m heads nh hd pos li :inverse t)
+            ;; out: 8 groups of 8 heads, each to rank LORA-O, then to the embedding
+            (let* ((groups (ds4f-out-groups m)) (rank (ds4f-lora-o m)) (gdim (* hd (floor nh groups)))
+                   (low (f32vec (* groups rank))) (out (f32vec d)))
+              (if gpu
+                  #+(and sbcl darwin) (gpu-attn-out! m li heads out) #-(and sbcl darwin) nil
+                  (progn (grouped-q8mv! pool (dl-out-a l) heads groups gdim rank low)
+                         (q8mv! pool (dl-out-b l) low out)))
+              (values out post comb))))))))
 
 (defun grouped-q8mv! (pool w x groups gdim rank out)
   "matvec_q8_0_grouped_rows: row r of W (GROUPS * RANK rows of GDIM) against
@@ -977,7 +995,13 @@
           ;; the routed experts on the GPU, from its expert cache
           (let ((moe (f32vec d)) (shared (f32vec d)))
             ;; the shared expert on the CPU while the GPU runs the routed ones
-            #+(and sbcl darwin) (ds4f-gpu-ffn-1! m l li norm sel w moe (lambda () (d4-shared! m l norm clamp shared)))
+            #+(and sbcl darwin)
+            (ds4f-gpu-ffn-1! m l li norm sel w moe
+                             (lambda ()
+                               ;; the next layer's experts guessed and read ahead
+                               (when (and (plusp *ds4f-prefetch-k*) (< (1+ li) (ds4f-n-layer m)))
+                                 (prefetch-cache-experts m (1+ li) (predict-experts m (1+ li) norm token *ds4f-prefetch-k*)))
+                               (d4-shared! m l norm clamp shared)))
             #-(and sbcl darwin) (d4-shared! m l norm clamp shared)
             (dotimes (i d) (setf (aref moe i) (+ (aref moe i) (aref shared i))))
             (return-from d4-ffn (values moe post comb))))
