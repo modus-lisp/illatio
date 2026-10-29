@@ -1393,8 +1393,11 @@ struct d4_hmix_args { uint d; uint n; float eps; };
 kernel void d4_head_mix(constant d4_hmix_args & a [[buffer(0)]],
                         device const float * pre [[buffer(1)]], device const float * scale [[buffer(2)]],
                         device const float * base [[buffer(3)]], device const float * streams [[buffer(4)]],
-                        device float * out [[buffer(5)]], uint j [[thread_position_in_grid]]) {
+                        device float * out [[buffer(5)]], uint2 jt [[thread_position_in_grid]]) {
+    // grid y a token: its PRE (16 apart), STREAMS, OUT
+    const uint j = jt.x, t = jt.y;
     if (j >= a.d) return;
+    pre += t * 16; streams += (uint64_t)t * a.n * a.d; out += (uint64_t)t * a.d;
     float acc = 0.f;
     for (uint h = 0; h < a.n; ++h) {
         const float z = pre[h] * scale[0] + base[h];

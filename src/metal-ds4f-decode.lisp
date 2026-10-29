@@ -85,13 +85,13 @@
       (declare (ignore rbytes))
       (dispatch gpu e "d4_mv_f16" (list cols rows) (list (cons buf woff) x y) (ceiling rows 4) 256 :shared 128))))
 
-(defun enc-head (m gpu e st streams)
+(defun enc-head (m gpu e st streams &optional out)
   "output_logits_one on the GPU, from STREAMS (a buffer, or (buffer . offset)):
-   the logits into buffer :G-OUT."
+   the logits into OUT ((buffer . offset); buffer :G-OUT by default)."
   (let* ((d (ds4f-d m)) (n (ds4f-n-hc m)) (hcd (* n d)) (eps (ds4f-eps m))
          (flat (d4gpu-buf st :g-hflat (* 4 hcd))) (pre (d4gpu-buf st :g-hpre (* 4 16)))
          (embd (d4gpu-buf st :g-hembd (* 4 d))) (norm (d4gpu-buf st :g-hnorm (* 4 d)))
-         (out (d4gpu-buf st :g-out (* 4 (ds4f-n-vocab m)))))
+         (out (or out (d4gpu-buf st :g-out (* 4 (ds4f-n-vocab m))))))
     (enc-rms gpu e streams nil flat hcd 1 eps)
     (enc-mv16 m gpu e "output_hc_fn.weight" flat pre)
     (dispatch gpu e "d4_head_mix" (list d n (ds4f-hc-eps m))

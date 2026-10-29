@@ -88,19 +88,43 @@
                     (gpu-vector m (if (eq which :attn) (dl-hc-attn-base l) (dl-hc-ffn-base l))) streams out pc)
               (list (ceiling d 256) n) 256 :shared (* 4 32))))
 
+(defvar *prefill-keep-proj* nil
+  "When true (a verify pass), each layer's compressor projections are kept
+   in buffers of its own, so the carried window can be redone for fewer
+   tokens (ENC-COMP-CARRY).")
+
+(defun comp-proj-bufs (st li kind n width)
+  "The compressor KIND's projection buffers (kv, score) for layer LI."
+  (flet ((key (base) (if *prefill-keep-proj* (intern (format nil "~A-~D" base li) :keyword) (intern base :keyword))))
+    (values (pbuf st (key (if (= kind 0) "P-CKV" "P-IKV")) (* n width))
+            (pbuf st (key (if (= kind 0) "P-CSC" "P-ISC")) (* n width)))))
+
+(defun enc-comp-carry (m gpu e l c pos0 n kind pkv psc)
+  "The window compressor KIND of layer L carries after N tokens from POS0
+   (their projections PKV, PSC), brought up to date in C."
+  (let* ((ratio (dl-ratio l)) (coff (if (= ratio 4) 2 1))
+         (hd (if (= kind 0) (ds4f-head-dim m) (ds4f-ix-dim m))) (width (* coff hd))
+         (ape (if (= kind 0) (dl-comp-ape l) (dl-ixc-ape l)))
+         (st-kv (if (= kind 0) (dc-st-kv c) (dc-ix-kv c))) (st-sc (if (= kind 0) (dc-st-score c) (dc-ix-score c)))
+         (wstart (* ratio (floor pos0 ratio))) (e-pos (+ pos0 n -1))
+         (cw (* ratio (floor e-pos ratio))) (ends (zerop (mod (1+ e-pos) ratio)))
+         (set-prev (and (= ratio 4) (or ends (> cw wstart))))
+         (prev-from (cond ((not set-prev) 0) (ends cw) (t (- cw ratio)))))
+    (dispatch gpu e "d4_comp_carry" (list ratio width pos0 n wstart (f32mat-cols ape) prev-from (if set-prev 1 0))
+              (list pkv psc (gmat m ape) (gpu-vector m st-kv) (gpu-vector m st-sc)) 1 1024)))
+
 (defun enc-compressor-chunk (m gpu e st l li c norm pos0 n kind)
   "A compressor (KIND 0 the attention's, 1 the indexer's) over the chunk:
    its projections, every window ending in it pooled, the carried window
    brought up to date; how many rows it pushed."
   (let* ((ratio (dl-ratio l)) (coff (if (= ratio 4) 2 1))
          (hd (if (= kind 0) (ds4f-head-dim m) (ds4f-ix-dim m))) (width (* coff hd))
-         (pkv (pbuf st (if (= kind 0) :p-ckv :p-ikv) (* n width)))
-         (psc (pbuf st (if (= kind 0) :p-csc :p-isc) (* n width)))
          (ape (if (= kind 0) (dl-comp-ape l) (dl-ixc-ape l)))
          (st-kv (if (= kind 0) (dc-st-kv c) (dc-ix-kv c))) (st-sc (if (= kind 0) (dc-st-score c) (dc-ix-score c)))
          (rows (if (= kind 0) (dc-comp c) (dc-ix-comp c))) (dst0 (if (= kind 0) (dc-n-comp c) (dc-n-ix c)))
          (wstart (* ratio (floor pos0 ratio))) (e-pos (+ pos0 n -1))
          (p0 (+ wstart ratio -1)) (nb (if (> p0 e-pos) 0 (1+ (floor (- e-pos p0) ratio)))))
+   (multiple-value-bind (pkv psc) (comp-proj-bufs st li kind n width)
     (enc-f16mm m gpu e li (if (= kind 0) "attn_compressor_kv.weight" "indexer_compressor_kv.weight") norm pkv n)
     (enc-f16mm m gpu e li (if (= kind 0) "attn_compressor_gate.weight" "indexer_compressor_gate.weight") norm psc n)
     (when (plusp nb)
@@ -112,12 +136,8 @@
                         (gpu-vector m (if (= kind 0) (dl-comp-norm l) (dl-ixc-norm l))) cs (gpu-vector m rows))
                   nb hd :shared (* 4 (+ hd 32)))))
     ;; the window the context carries on
-    (let* ((cw (* ratio (floor e-pos ratio))) (ends (zerop (mod (1+ e-pos) ratio)))
-           (set-prev (and (= ratio 4) (or ends (> cw wstart))))
-           (prev-from (cond ((not set-prev) 0) (ends cw) (t (- cw ratio)))))
-      (dispatch gpu e "d4_comp_carry" (list ratio width pos0 n wstart (f32mat-cols ape) prev-from (if set-prev 1 0))
-                (list pkv psc (gmat m ape) (gpu-vector m st-kv) (gpu-vector m st-sc)) 1 1024))
-    nb))
+    (enc-comp-carry m gpu e l c pos0 n kind pkv psc)
+    nb)))
 
 (defun enc-attention-chunk (m gpu e st l li c pos0 n sa sb)
   "Layer LI's attention block for the chunk's N tokens from POS0: streams SA into SB."
@@ -212,6 +232,10 @@
     (dispatch gpu e "d4_swiglu_w" (list n ff (svref (ds4f-clamps m) li)) (list sg su ones smid) (ceiling (* n ff) 256) 256)
     (enc-q8mm m gpu e li "ffn_down_shexp.weight" smid sout n)))
 
+(defparameter *ds4f-small-n* 16
+  "A chunk of this many tokens or fewer runs its experts as decode does, a
+   matvec a row (the matrix product's 64-row tiles waste most of their work).")
+
 (defparameter *ds4f-keep-tail* 16
   "A prompt's last this many tokens' experts stay in the pool after its prefill.")
 
@@ -225,7 +249,7 @@
          (bases (let ((b 0)) (map 'vector (lambda (k) (prog1 b (incf b k))) counts)))
          (rows (reduce #'+ counts))
          (rmap (pbuf st :p-rmap rows)) (smap (pbuf st :p-smap (* n nu))) (wv (pbuf st :p-wrow rows))
-         (x (pbuf st :p-x (* rows d))) (g (pbuf st :p-g (* rows ff))) (u (pbuf st :p-u (* rows ff)))
+         (x (pbuf st :p-x (* rows d))) (g (pbuf st :p-g (* 2 rows ff))) (u (pbuf st :p-u (* rows ff)))
          (mid (pbuf st :p-mid (* rows ff))) (down (pbuf st :p-down (* rows d))) (moe (pbuf st :p-moe (* n d)))
          (stage (dx-buf (ds4f-expert-cache m))) (sbytes (d4gpu-slot-bytes st)) (gb (d4gpu-gate-bytes st))
          (grb (second (dl-gate-exps l))) (grows (third (dl-gate-exps l)))
@@ -238,6 +262,25 @@
                        (sb-sys:sap-ref-32 (gbuf-sap smap) (* 4 (+ (* tk nu) slot))) r
                        (sb-sys:sap-ref-single (gbuf-sap wv) (* 4 r)) (aref (svref ws tk) slot)))))
     (dispatch gpu e "d4_gather_rows" (list d rows) (list (pbuf st :p-norm2 (* n d)) rmap x) (ceiling (* rows d) 256) 256)
+    (when (<= n *ds4f-small-n*)
+      ;; a few tokens: as decode, a matvec a (token, slot) row, from its expert's slot
+      (let* ((offs (pbuf st :p-roffs (* 2 2 rows))) (osap (gbuf-sap offs)))
+        (dotimes (k ne)
+          (dotimes (i (aref counts k))
+            (let ((r (+ (aref bases k) i)) (o (* (aref slots k) sbytes)))
+              (setf (sb-sys:sap-ref-64 osap (* 8 r)) o (sb-sys:sap-ref-64 osap (* 8 (+ rows r))) (+ o gb)))))
+        (flet ((mv (kernel ncols nrows rb add offs-at xin xs yout z)
+                 (dispatch gpu e kernel (list ncols nrows rb add xs nrows) (list stage (cons offs offs-at) xin yout)
+                           (list (ceiling nrows 8) 1 z) 64
+                           :shared (if (string= kernel "d4_mv_iq2_xxs") (+ (* 8 256) 128) 0))))
+          ;; a row's gate and up from its own input (the offsets of the ups after the gates')
+          (mv "d4_mv_iq2_xxs" d grows grb 0 0 x d g rows)
+          (mv "d4_mv_iq2_xxs" d grows grb 0 (* 8 rows) x d u rows)
+          (dispatch gpu e "d4_swiglu_w" (list rows ff clamp) (list g u wv mid) (ceiling (* rows ff) 256) 256)
+          (mv "d4_mv_q2_k" ff drows drb (* 2 gb) 0 mid ff down rows)))
+      (dispatch gpu e "d4_moe_sum_rows" (list d nu n) (list down smap (pbuf st :p-sout (* n d)) moe)
+                (ceiling (* n d) 256) 256)
+      (return-from enc-ffn-tail-chunk (enc-hc-post m gpu e moe sb (pbuf st :p-pcf (* n 32)) sa n)))
     (dotimes (k ne)
       (let ((nt (aref counts k)) (b (aref bases k)) (s0 (* (aref slots k) sbytes)))
         (enc-mm gpu e "d4_mm_iq2_xxs" stage s0 grb grows d x g nt :xoff (* 4 b d) :yoff (* 4 b ff))
@@ -294,8 +337,9 @@
               (ceiling (* n d) 256) 256)
     (enc-hc-post m gpu e moe sb (pbuf st :p-pcf (* n 32)) sa n)))
 
-(defun ds4f-gpu-prefill-1 (ctx tokens logits)
-  "DS4F-PREFILL-1 on the GPU: the chunk TOKENS at the next positions."
+(defun ds4f-gpu-prefill-1 (ctx tokens logits &key all-logits)
+  "DS4F-PREFILL-1 on the GPU: the chunk TOKENS at the next positions.  With
+   ALL-LOGITS, every token's logits: a vector, a row of N-VOCAB a token."
   (let* ((m (d4ctx-model ctx)) (st (ds4f-gpu-state m)) (gpu (d4gpu-gpu st))
          (d (ds4f-d m)) (n-hc (ds4f-n-hc m)) (hcd (* n-hc d)) (pos0 (d4ctx-pos ctx))
          (n (length tokens)) (tokv (coerce tokens 'simple-vector)) (wf (ds4f-file m))
@@ -331,38 +375,59 @@
                                             do (setf (gethash (sb-sys:sap-ref-32 sap (* 4 i)) h) t))
                                       h))))
               (pool-done-layer m taken (lambda (s) (and tail (gethash (mod (aref (dx-owner xc) s) ne) tail)))))))))
-    (dotimes (li (if (>= n *ds4f-read-all-from*) 0 (ds4f-n-layer m)))
-      (let* ((l (svref (ds4f-layers m) li)) (c (svref (d4ctx-caches ctx) li))
-             ;; a long chunk wants nearly all of a layer's experts: slots for them all, read under the attention
-             (all (and (>= n *ds4f-read-all-from*) (pool-take-layer m li (loop for k below ne collect k) nil))))
-        (with-gpu-work (e gpu)
-          (enc-attention-chunk m gpu e st l li c pos0 n sa sb)
-          (enc-ffn-head-chunk m gpu e st l li n sb))
-        ;; the routing, on the CPU
-        (let* ((lg (f32vec (* n ne))) (row (f32vec ne)) (norm (f32vec d))
-               (sels (make-array n)) (ws (make-array n)) (groups (make-hash-table)))
-          (copy-floats-out lg (pbuf st :p-logits (* n ne)) (* n ne))
-          (dotimes (tk n)
-            (replace row lg :start2 (* tk ne) :end2 (* (1+ tk) ne))
-            (multiple-value-bind (sel w) (d4-route m l li norm (svref tokv tk) row)
-              (setf (svref sels tk) sel (svref ws tk) w)
-              (dotimes (slot nu) (push (cons tk slot) (gethash (aref sel slot) groups)))))
-          (let* ((experts (sort (loop for k being the hash-keys of groups collect k) #'<))
-                 (users (map 'simple-vector (lambda (k) (coerce (reverse (gethash k groups)) 'simple-vector)) experts))
-                 (ev (coerce experts 'simple-vector)) (xc (ds4f-expert-cache m))
-                 (taken (or all (pool-take-layer m li experts t)))
-                 (slots (if all (map '(vector fixnum) (lambda (k) (aref all k)) ev) taken))
-                 (tail (and logits (let ((h (make-hash-table)))
-                                     (loop for tk from (max 0 (- n *ds4f-keep-tail*)) below n
-                                           do (loop for x across (svref sels tk) do (setf (gethash x h) t)))
-                                     h))))
-            (cache-wait m xc (coerce slots 'list))
-            (with-gpu-work (e gpu)
-              (enc-ffn-tail-chunk m gpu e st l li n ev users ws slots sb sa))
-            (pool-done-layer m taken
-                             (lambda (s) (and tail (gethash (mod (aref (dx-owner xc) s) ne) tail))))))))
+    (when (< n *ds4f-read-all-from*)
+      ;; a short chunk (a message, a speculative step): as decode, one
+      ;; command buffer a layer -- the layer before's experts, then this
+      ;; layer's attention and its FFN to the router -- the routing between on
+      ;; the CPU, each layer's chosen experts taken from the pool (read now)
+      (let ((xc (ds4f-expert-cache m)) (pending nil))
+        (flet ((done (p)
+                 (destructuring-bind (pl pli ev users ws slots taken tail) p
+                   (declare (ignore pl pli ev users ws slots))
+                   (pool-done-layer m taken (lambda (s) (and tail (gethash (mod (aref (dx-owner xc) s) ne) tail)))))))
+          (dotimes (li (ds4f-n-layer m))
+            (let ((l (svref (ds4f-layers m) li)) (c (svref (d4ctx-caches ctx) li)))
+              (with-gpu-work (e gpu)
+                (when pending
+                  (destructuring-bind (pl pli ev users ws slots taken tail) pending
+                    (declare (ignore taken tail))
+                    (enc-ffn-tail-chunk m gpu e st pl pli n ev users ws slots sb sa)))
+                (enc-attention-chunk m gpu e st l li c pos0 n sa sb)
+                (enc-ffn-head-chunk m gpu e st l li n sb))
+              (when pending (done pending))
+              ;; the routing, on the CPU
+              (let* ((lg (f32vec (* n ne))) (row (f32vec ne)) (norm (f32vec d))
+                     (sels (make-array n)) (ws (make-array n)) (groups (make-hash-table)))
+                (copy-floats-out lg (pbuf st :p-logits (* n ne)) (* n ne))
+                (dotimes (tk n)
+                  (replace row lg :start2 (* tk ne) :end2 (* (1+ tk) ne))
+                  (multiple-value-bind (sel w) (d4-route m l li norm (svref tokv tk) row)
+                    (setf (svref sels tk) sel (svref ws tk) w)
+                    (dotimes (slot nu) (push (cons tk slot) (gethash (aref sel slot) groups)))))
+                (let* ((experts (sort (loop for k being the hash-keys of groups collect k) #'<))
+                       (users (map 'simple-vector (lambda (k) (coerce (reverse (gethash k groups)) 'simple-vector)) experts))
+                       (ev (coerce experts 'simple-vector))
+                       (taken (pool-take-layer m li experts t))
+                       (tail (and logits (let ((h (make-hash-table)))
+                                           (loop for tk from (max 0 (- n *ds4f-keep-tail*)) below n
+                                                 do (loop for x across (svref sels tk) do (setf (gethash x h) t)))
+                                           h))))
+                  (cache-wait m xc (coerce taken 'list))
+                  (setf pending (list l li ev users ws taken taken tail))))))
+          (with-gpu-work (e gpu)
+            (destructuring-bind (pl pli ev users ws slots taken tail) pending
+              (declare (ignore taken tail))
+              (enc-ffn-tail-chunk m gpu e st pl pli n ev users ws slots sb sa)))
+          (done pending))))
     (incf (d4ctx-pos ctx) n)
-    (when logits
-      (with-gpu-work (e gpu) (enc-head m gpu e st (cons sa (* 4 (1- n) hcd))))
-      (copy-floats-out (d4ctx-logits ctx) (d4gpu-buf st :g-out 0) (ds4f-n-vocab m)))
-    ctx))
+    (cond (all-logits
+           (let* ((nv (ds4f-n-vocab m)) (out (pbuf st :p-allout (* n nv))) (rows (f32vec (* n nv))))
+             ;; a row at a time, by decode's own head: the same logits it would give
+             (with-gpu-work (e gpu)
+               (dotimes (tk n) (enc-head m gpu e st (cons sa (* 4 tk hcd)) (cons out (* 4 tk nv)))))
+             (copy-floats-out rows out (* n nv))
+             rows))
+          (t (when logits
+               (with-gpu-work (e gpu) (enc-head m gpu e st (cons sa (* 4 (1- n) hcd))))
+               (copy-floats-out (d4ctx-logits ctx) (d4gpu-buf st :g-out 0) (ds4f-n-vocab m)))
+             ctx))))

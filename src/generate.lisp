@@ -121,6 +121,26 @@
                                             "<｜end▁of▁sentence｜>")
                               collect (gethash name (vocab-ids v))))))))
 
+(defvar *speculate-hooks* '()
+  "Functions (CTX TOKEN MORE) by which a model may speculate when decoding is
+   greedy: TOKEN at the next position, and up to MORE tokens past it of its
+   own guessing that its greedy choices confirm (ds4f-spec.lisp), CTX's
+   state and logits then past the last; those tokens, or :NO when the model
+   doesn't speculate (and nothing was done).")
+
+(defun forward-speculating (ctx tok more greedy)
+  "FORWARD CTX TOKEN, or, decoding greedily, a model's speculation: the
+   further tokens CTX has taken (their logits its own greedy picks)."
+  (let ((got (if (and greedy (plusp more))
+                 (loop for f in *speculate-hooks*
+                       for r = (funcall f ctx tok more)
+                       unless (eq r :no) return r
+                       finally (return :no))
+                 :no)))
+    (if (eq got :no)
+        (progn (forward ctx tok) '())
+        got)))
+
 (defun generate (ctx prompt &key (max-tokens 256) (sampler (make-sampler :temperature 0))
                                  (stop '()) on-text (stop-tokens (stop-tokens (context-model ctx))))
   "Continue PROMPT (a string or token ids) in CTX.  ON-TEXT, if given, is
@@ -140,12 +160,16 @@
           (reason :length)
           (max-stop (reduce #'max stop :key #'length :initial-value 0)))
       (flet ((text-so-far () (utf8-decode (coerce bytes '(simple-array (unsigned-byte 8) (*))))))
-        (loop repeat (min max-tokens room)
-              do (let ((tok (sample sampler (context-logits ctx))))
+        (loop with limit = (min max-tokens room) and queue = '() and n = 0
+              while (< n limit)
+              do (let* ((confirmed (and queue t))
+                        (tok (if queue (pop queue) (sample sampler (context-logits ctx)))))
                    (when (member tok stop-tokens) (setf reason :stop) (return))
-                   (push tok out)
+                   (push tok out) (incf n)
                    (loop for b across (token-bytes (model-vocab m) tok) do (vector-push-extend b bytes))
-                   (forward ctx tok)
+                   ;; a token the model confirmed while speculating is in its state already
+                   (unless confirmed
+                     (setf queue (forward-speculating ctx tok (- limit n) (zerop (sampler-temperature sampler)))))
                    (setf (context-tokens ctx) (append (context-tokens ctx) (list tok)))
                    (let ((text (and stop (text-so-far))))
                      (when (and stop (some (lambda (s) (search s text)) stop))
