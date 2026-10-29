@@ -15,7 +15,7 @@
 (in-package #:illatio)
 
 (defstruct (d4gpu (:constructor %make-d4gpu))
-  gpu stage (slot-bytes 0) (gate-bytes 0) (down-bytes 0)
+  gpu stage (slot-bytes 0) (gate-bytes 0) (down-bytes 0) (plist* '())
   x g u w mid down (rows 0))            ; scratch, sized for ROWS routed rows
 
 (defun ds4f-gpu-state (m)
@@ -103,7 +103,7 @@
           (let ((stage (d4gpu-stage st)) (sb (d4gpu-slot-bytes st)) (gb (d4gpu-gate-bytes st)))
             (with-gpu-work (e gpu)
               (flet ((mm (kernel woff cols rbytes nr x xoff y yoff ntok)
-                       (dispatch gpu e kernel (list cols nr ntok rbytes)
+                       (dispatch gpu e kernel (list cols nr ntok rbytes cols nr)
                                  (list (cons stage woff) (cons x xoff) (cons y yoff))
                                  (list (ceiling ntok 64) (ceiling nr 64) 1) 128 :shared 16384)))
                 (dotimes (k ne)
@@ -125,3 +125,108 @@
                         do (sap-copy (sb-sys:sap+ osap (* 4 (+ (* tk nu) slot) d))
                                      (sb-sys:sap+ ds (* 4 (+ (aref bases k) i) d)) (* 4 d))))))))))
     down-out))
+
+;;; --- the attention and shared expert's Q8_0 products, for a chunk ----------------------
+;;; Their raw Q8_0 blocks (6 GB) are read into one GPU buffer the first time;
+;;; a product copies the chunk's rows in, runs D4_MM_Q8_0 and copies the
+;;; result out (unified memory: these are memcpys, not transfers).
+
+(defparameter +ds4f-gpu-q8-tensors+
+  '("attn_q_a.weight" "attn_q_b.weight" "attn_kv.weight" "attn_output_a.weight" "attn_output_b.weight"
+    "ffn_gate_shexp.weight" "ffn_up_shexp.weight" "ffn_down_shexp.weight"))
+
+(defun ds4f-gpu-weights (m)
+  "(values buffer table): the Q8_0 tensors of +DS4F-GPU-Q8-TENSORS+ for every
+   layer, in one GPU buffer; TABLE maps a name to (offset row-bytes rows cols)."
+  (let ((st (ds4f-gpu-state m)))
+    (or (getf (ds4f-gpu-plist m) :weights)
+        (let* ((g (ds4f-gguf m)) (table (make-hash-table :test 'equal)) (total 0) (jobs '()))
+          (dotimes (li (ds4f-n-layer m))
+            (dolist (short +ds4f-gpu-q8-tensors+)
+              (let* ((name (format nil "blk.~D.~A" li short)) (ti (gguf-tensor g name))
+                     (dims (tensor-info-dims ti)) (bytes (tensor-bytes ti)) (rows (reduce #'* (rest dims))))
+                (setf (gethash name table) (list total (floor bytes rows) rows (first dims)))
+                (push (list total (+ (gguf-data-offset g) (tensor-info-offset ti)) bytes) jobs)
+                (incf total (* 64 (ceiling bytes 64))))))
+          (let ((buf (gpu-buffer (d4gpu-gpu st) total)) (fd (ds4f-fd m)) (jobs (coerce jobs 'simple-vector)))
+            (parallel-for (k (length jobs) (ds4f-pool m))
+              (destructuring-bind (at off bytes) (svref jobs k)
+                (pread-into fd (sb-sys:sap+ (gbuf-sap buf) at) off bytes)))
+            (setf (getf (ds4f-gpu-plist m) :weights) (cons buf table))
+            (getf (ds4f-gpu-plist m) :weights))))))
+
+(defun d4gpu-io (st bytes-x bytes-y)
+  "Two scratch buffers of at least BYTES-X and BYTES-Y."
+  (let ((gpu (d4gpu-gpu st)) (x (getf (d4gpu-plist* st) :x)) (y (getf (d4gpu-plist* st) :y)))
+    (unless (and x (>= (gbuf-bytes x) bytes-x)) (setf x (gpu-buffer gpu bytes-x) (getf (d4gpu-plist* st) :x) x))
+    (unless (and y (>= (gbuf-bytes y) bytes-y)) (setf y (gpu-buffer gpu bytes-y) (getf (d4gpu-plist* st) :y) y))
+    (values x y)))
+
+(defun gpu-q8mm! (m li short xs n out &key groups)
+  "OUT = W XS for N tokens, W layer LI's Q8_0 tensor SHORT, on the GPU.  With
+   GROUPS (count gdim rank): row r of W against group r/RANK of each token,
+   as GROUPED-Q8MM!."
+  (destructuring-bind (buf . table) (ds4f-gpu-weights m)
+    (destructuring-bind (woff rbytes rows cols) (gethash (format nil "blk.~D.~A" li short) table)
+      (let* ((st (ds4f-gpu-state m)) (gpu (d4gpu-gpu st))
+             (xw (if groups (* (first groups) (second groups)) cols)))
+        (declare (type f32vec xs out))
+        (multiple-value-bind (x y) (d4gpu-io st (* 4 n xw) (* 4 n rows))
+          (sb-sys:with-pinned-objects (xs out)
+            (sap-copy (gbuf-sap x) (sb-sys:vector-sap xs) (* 4 n xw))
+            (with-gpu-work (e gpu)
+              (if groups
+                  (destructuring-bind (count gdim rank) groups
+                    (dotimes (g count)
+                      (dispatch gpu e "d4_mm_q8_0" (list gdim rank n rbytes xw rows)
+                                (list (cons buf (+ woff (* g rank rbytes))) (cons x (* 4 g gdim)) (cons y (* 4 g rank)))
+                                (list (ceiling n 64) (ceiling rank 64) 1) 128 :shared 16384)))
+                  (dispatch gpu e "d4_mm_q8_0" (list cols rows n rbytes cols rows)
+                            (list (cons buf woff) x y)
+                            (list (ceiling n 64) (ceiling rows 64) 1) 128 :shared 16384)))
+            (sap-copy (sb-sys:vector-sap out) (gbuf-sap y) (* 4 n rows))))
+        out))))
+
+;;; --- attention for a chunk ------------------------------------------------------------
+
+(defun d4gpu-buf (st key bytes)
+  "Scratch buffer KEY of ST, at least BYTES."
+  (let ((b (getf (d4gpu-plist* st) key)))
+    (unless (and b (>= (gbuf-bytes b) bytes))
+      (setf b (gpu-buffer (d4gpu-gpu st) (max bytes 16)) (getf (d4gpu-plist* st) key) b))
+    b))
+
+(defun copy-floats-in (buf v n)
+  (declare (type f32vec v))
+  (sb-sys:with-pinned-objects (v) (sap-copy (gbuf-sap buf) (sb-sys:vector-sap v) (* 4 n))))
+
+(defun copy-u32-in (buf v)
+  (dotimes (i (length v)) (setf (sb-sys:sap-ref-32 (gbuf-sap buf) (* 4 i)) (aref v i))))
+
+(defun gpu-attend! (m l n q kr nkr kc nkc raws nraw ncomp idx maxc heads)
+  "D4_ATTEND for N tokens: Q (N x heads x 512, RoPE'd), raw rows KR (NKR),
+   compressed rows KC (NKC); per token its raw window (RAWS start, NRAW
+   rows) and its NCOMP compressed rows, listed in IDX (MAXC a token).  The
+   attention output into HEADS."
+  (let* ((st (ds4f-gpu-state m)) (gpu (d4gpu-gpu st))
+         (nh (ds4f-n-head m)) (hd (ds4f-head-dim m)) (qn (* n nh hd))
+         (bq (d4gpu-buf st :aq (* 4 qn))) (bkr (d4gpu-buf st :akr (* 4 (max 1 nkr) hd)))
+         (bkc (d4gpu-buf st :akc (* 4 (max 1 nkc) hd)))
+         (bra (d4gpu-buf st :araws (* 4 n))) (bnr (d4gpu-buf st :anraw (* 4 n)))
+         (bnc (d4gpu-buf st :ancomp (* 4 n))) (bix (d4gpu-buf st :aidx (* 4 (max 1 (* n maxc)))))
+         (bsk (d4gpu-buf st :asinks (* 4 nh))) (bo (d4gpu-buf st :aout (* 4 qn))))
+    (assert (= hd 512) () "d4_attend is written for 512-wide heads")
+    (assert (= nh 64) () "d4_attend is written for 64 heads")
+    (copy-floats-in bq q qn)
+    (copy-floats-in bkr kr (* nkr hd))
+    (when (plusp nkc) (copy-floats-in bkc kc (* nkc hd)))
+    (copy-u32-in bra raws) (copy-u32-in bnr nraw) (copy-u32-in bnc ncomp)
+    (when (plusp maxc) (copy-u32-in bix idx))
+    (copy-floats-in bsk (dl-sinks l) nh)
+    (with-gpu-work (e gpu)
+      (dispatch gpu e "d4_attend" (list nh hd (/ 1f0 (sqrt (float hd 1f0))) (max 1 maxc))
+                (list bq bkr bkc bra bnr bnc bix bsk bo)
+                n 512 :shared (* 4 (+ (* 8 512) (* 64 8) (* 8 64) 128))))
+    (sb-sys:with-pinned-objects (heads)
+      (sap-copy (sb-sys:vector-sap heads) (gbuf-sap bo) (* 4 qn)))
+    heads))

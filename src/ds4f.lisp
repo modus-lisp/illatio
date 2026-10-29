@@ -51,8 +51,13 @@
   (layers #() :type simple-vector)
   (gpu-plist '()))                      ; the GPU's state, when it runs (metal-ds4f.lisp)
 
-(defvar *ds4f-gpu* #+(and sbcl darwin) t #-(and sbcl darwin) nil
-  "Whether a DS4F prefill runs its routed experts on the GPU (metal-ds4f.lisp).")
+(defvar *ds4f-gpu* #+(and sbcl darwin) '(:experts :proj :attn) #-(and sbcl darwin) nil
+  "What of a DS4F prefill the GPU runs (metal-ds4f.lisp): any of :EXPERTS
+   (the routed FFN), :PROJ (the attention and shared expert's Q8_0
+   products), :ATTN (attention); T is all of them, NIL none.")
+
+(defun ds4f-gpu-p (part)
+  (or (eq *ds4f-gpu* t) (and (listp *ds4f-gpu*) (member part *ds4f-gpu*) t)))
 
 (defstruct (d4layer (:conc-name dl-))
   ratio
@@ -313,6 +318,7 @@
   "rope_tail_layer_inplace: on a compressed layer, base COMP-ROPE-BASE with
    YaRN interpolation (its magnitude factor cancelled, as DeepSeek V4's
    reference does), else plain RoPE at ROPE-BASE."
+  (declare (type f32vec x) (type fixnum n-heads head-dim pos il xo))
   (let* ((n-rot (ds4f-n-rot m)) (compressed (plusp (svref (ds4f-ratios m) il)))
          (base (if compressed (ds4f-comp-rope-base m) (ds4f-rope-base m)))
          (fscale (if (and compressed (plusp (ds4f-rope-factor m))) (/ 1f0 (ds4f-rope-factor m)) 1f0))
@@ -684,6 +690,17 @@
                 (dot-rows g4 xo (floor xo 32) (+ (* tk rows) (* 4 g4)))))))))
     out))
 
+(defun d4-layer-index (m l) (position l (ds4f-layers m)))
+
+(defun d4-chunk-q8mm (m l li short w xs n out)
+  "A chunk's product with layer LI's Q8_0 tensor SHORT: on the GPU when a
+   prefill uses it (*DS4F-GPU*), else Q8MM! (the CPU's, the decode's bits)."
+  (declare (ignorable l li short))
+  (if (ds4f-gpu-p :proj)
+      #+(and sbcl darwin) (gpu-q8mm! m li short xs n out)
+      #-(and sbcl darwin) (q8mm! (ds4f-pool m) w xs n out)
+      (q8mm! (ds4f-pool m) w xs n out)))
+
 (defun d4-hc-pre-chunk (m fn scale base norm-w cur n norms posts combs)
   "HC-PRE then the block's RMS norm for each of N tokens (streams in CUR),
    tokens in parallel, each on one thread: NORMS gets the normed inputs,
@@ -702,14 +719,14 @@
 (defun d4-shared-chunk! (m l norms n clamp)
   "D4-SHARED! for N tokens at once (MATMUL!: each (row, token) its bits)."
   (let* ((pool (ds4f-pool m)) (ff (ds4f-ff-exp m)) (d (ds4f-d m))
-         (g (q8mm! pool (dl-sh-gate l) norms n (f32vec (* n ff))))
-         (u (q8mm! pool (dl-sh-up l) norms n (f32vec (* n ff)))))
+         (g (d4-chunk-q8mm m l (d4-layer-index m l) "ffn_gate_shexp.weight" (dl-sh-gate l) norms n (f32vec (* n ff))))
+         (u (d4-chunk-q8mm m l (d4-layer-index m l) "ffn_up_shexp.weight" (dl-sh-up l) norms n (f32vec (* n ff)))))
     (declare (type f32vec g u))
     (dotimes (i (* n ff))
       (let ((gi (aref g i)) (ui (aref u i)))
         (when (> clamp 1f-6) (setf gi (min gi clamp) ui (max (- clamp) (min ui clamp))))
         (setf (aref g i) (* (d4-silu gi) ui))))
-    (q8mm! pool (dl-sh-down l) g n (f32vec (* n d)))))
+    (d4-chunk-q8mm m l (d4-layer-index m l) "ffn_down_shexp.weight" (dl-sh-down l) g n (f32vec (* n d)))))
 
 (defun d4-attention-chunk (m l li c cur next n pos0)
   "D4-ATTENTION for N tokens (their streams in CUR, a token every N-HC * D),
@@ -722,19 +739,28 @@
          (streams (f32vec hcd)) (cur1 (f32vec d)) (flat (f32vec hcd)) (norm (f32vec d)))
     (d4-hc-pre-chunk m (dl-hc-attn-fn l) (dl-hc-attn-scale l) (dl-hc-attn-base l) (dl-attn-norm l)
                      cur n norms posts combs)
-    (q8mm! pool (dl-q-a l) norms n qr)
+    (d4-chunk-q8mm m l li "attn_q_a.weight" (dl-q-a l) norms n qr)
     (dotimes (tk n) (d4-rms! qr qr-norm lq eps (dl-q-a-norm l) (* tk lq) (* tk lq)))
-    (q8mm! pool (dl-q-b l) qr-norm n q)
+    (d4-chunk-q8mm m l li "attn_q_b.weight" (dl-q-b l) qr-norm n q)
     (dotimes (u (* n nh)) (d4-rms! q q hd eps nil (* u hd) (* u hd)))
-    (q8mm! pool (dl-kv l) norms n kv0)
+    (d4-chunk-q8mm m l li "attn_kv.weight" (dl-kv l) norms n kv0)
     ;; the compressors' projections, for the chunk
     (let* ((coff (if (= ratio 4) 2 1)) (cw (* coff hd)) (iw (* coff (ds4f-ix-dim m)))
            (ckv (and (plusp ratio) (f32mm! pool (dl-comp-kv l) norms n (f32vec (* n cw)))))
            (csc (and (plusp ratio) (f32mm! pool (dl-comp-gate l) norms n (f32vec (* n cw)))))
            (ikv (and (= ratio 4) (f32mm! pool (dl-ixc-kv l) norms n (f32vec (* n iw)))))
            (isc (and (= ratio 4) (f32mm! pool (dl-ixc-gate l) norms n (f32vec (* n iw))))))
-    ;; token by token: the cache, the compressors, the indexer, attention
-    (let ((kv (f32vec hd)) (qt (f32vec (* nh hd))) (qrt (f32vec lq)) (ht (f32vec (* nh hd))))
+    ;; token by token: the cache, the compressors, the indexer, attention --
+    ;; or, with the GPU, everything but attention, each token's keys noted
+    ;; for D4_ATTEND to run for the chunk at once
+    (let* ((kv (f32vec hd)) (qt (f32vec (* nh hd))) (qrt (f32vec lq)) (ht (f32vec (* nh hd)))
+           (gpu (ds4f-gpu-p :attn)) (swa (ds4f-swa m))
+           (prev (dc-n-raw c)) (kr (and gpu (f32vec (* (+ prev n) hd))))
+           (raws (and gpu (make-array n :element-type '(unsigned-byte 32))))
+           (nraw (and gpu (make-array n :element-type '(unsigned-byte 32))))
+           (ncomp (and gpu (make-array n :element-type '(unsigned-byte 32))))
+           (lists (and gpu (make-array n))))
+      (when gpu (replace kr (dc-raw c) :end2 (* prev hd)))
       (dotimes (tk n)
         (let ((pos (+ pos0 tk)))
           (replace norm norms :start2 (* tk d) :end2 (* (1+ tk) d))
@@ -756,14 +782,45 @@
                                         :kv ikv :sc isc :o (* tk iw))))
                 (when row (push-comp! (dc-ix-comp c) #'dc-n-ix (ds4f-ix-dim m) row c) (incf (dc-n-ix c))))))
           (let ((allowed (and (= ratio 4) (indexer-allowed m l c norm qrt li pos))))
-            (d4-attend! m l qt c allowed ht)
-            (d4-rope! m ht nh hd pos li :inverse t)
-            (replace heads ht :start1 (* tk nh hd)))))))
+            (if gpu
+                (let ((row (+ prev tk)))
+                  ;; the row as the cache holds it (through F16), at its place
+                  (replace kr (dc-raw c) :start1 (* row hd) :start2 (* (1- (dc-n-raw c)) hd) :end2 (* (dc-n-raw c) hd))
+                  (setf (aref raws tk) (max 0 (- (1+ row) swa))
+                        (aref nraw tk) (min swa (1+ row)))
+                  (let ((nc (if (dc-comp c) (dc-n-comp c) 0)))
+                    (setf (svref lists tk)
+                          (if allowed
+                              (coerce (loop for r below nc when (= 1 (aref allowed r)) collect r) 'vector)
+                              nc))
+                    (setf (aref ncomp tk) (if allowed (length (svref lists tk)) nc)))
+                  (replace q qt :start1 (* tk nh hd)))
+                (progn
+                  (d4-attend! m l qt c allowed ht)
+                  (d4-rope! m ht nh hd pos li :inverse t)
+                  (replace heads ht :start1 (* tk nh hd)))))))
+      (when gpu
+        (let* ((maxc (reduce #'max ncomp :initial-value 0))
+               (idx (make-array (* n (max 1 maxc)) :element-type '(unsigned-byte 32)))
+               (nkc (if (dc-comp c) (dc-n-comp c) 0)))
+          (dotimes (tk n)
+            (let ((lst (svref lists tk)))
+              (if (integerp lst)
+                  (dotimes (r lst) (setf (aref idx (+ (* tk maxc) r)) r))
+                  (loop for r across lst for i from 0 do (setf (aref idx (+ (* tk maxc) i)) r)))))
+          #+(and sbcl darwin)
+          (gpu-attend! m l n q kr (+ prev n) (dc-comp c) nkc raws nraw ncomp idx maxc heads)
+          ;; RoPE back, a token a thread
+          (parallel-for (tk n pool)
+            (d4-rope! m heads nh hd (+ pos0 tk) li :inverse t :xo (* tk nh hd)))))))
     ;; out, for the chunk
     (let* ((groups (ds4f-out-groups m)) (rank (ds4f-lora-o m)) (gdim (* hd (floor nh groups)))
            (low (f32vec (* n groups rank))) (out (f32vec (* n d))) (o1 (f32vec d)) (out-s (f32vec hcd)))
-      (grouped-q8mm! pool (dl-out-a l) heads n groups gdim rank low)
-      (q8mm! pool (dl-out-b l) low n out)
+      (if (ds4f-gpu-p :proj)
+          #+(and sbcl darwin) (gpu-q8mm! m li "attn_output_a.weight" heads n low :groups (list groups gdim rank))
+          #-(and sbcl darwin) nil
+          (grouped-q8mm! pool (dl-out-a l) heads n groups gdim rank low))
+      (d4-chunk-q8mm m l li "attn_output_b.weight" (dl-out-b l) low n out)
       (dotimes (tk n)
         (replace streams cur :start2 (* tk hcd) :end2 (* (1+ tk) hcd))
         (replace o1 out :start2 (* tk d) :end2 (* (1+ tk) d))
@@ -1024,7 +1081,7 @@
                  (ev (coerce experts 'simple-vector)) (ne (length ev))
                  (xq (make-q8kvec (* n d))) (mid (f32vec (* n nu ff))) (midq (make-q8kvec (* n nu ff)))
                  (down (f32vec (* n nu d))))
-            (if *ds4f-gpu*
+            (if (ds4f-gpu-p :experts)
                 #+(and sbcl darwin) (ds4f-gpu-experts! m l li ev users norms ws n down)
                 #-(and sbcl darwin) nil
                 (progn

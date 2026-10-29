@@ -16,6 +16,13 @@
 ;;; 0.008 / 0.14, 0.22 / 0.91.  So the bounds are that floor with headroom:
 ;;; ds4's top token always in our top 10, our argmax ds4's on at least 90%
 ;;; of steps, and the distribution below.  Needs the GGUF ($ILLATIO_DS4F).
+;;; With $ILLATIO_DS4F_PREFILL set, prompts go through DS4F-PREFILL (on the
+;;; GPU, where there is one) rather than a token at a time.  The GPU rounds
+;;; activations to halves in its products, and its noise is this model's
+;;; floor again: each GPU part alone moves the press prompt's top-10
+;;; logprobs by a mean 0.25-0.34, as much as the CPU's own F16-scale
+;;; rounding does (0.26).  Its ranks-2-5 tail is wider (p95 1.57), so that
+;;; bound is 2.0 in this mode.
 
 (load (merge-pathnames "load.lisp" (or *load-truename* *default-pathname-defaults*)))
 (in-package #:illatio)
@@ -32,7 +39,9 @@
 
 (defun run-case (m c)
   (let ((name (getf c :name)) (ctx (make-d4ctx m :n-ctx 4096)) (agree 0) (ties 0) (worst 0) (t0 (get-internal-real-time)))
-    (loop for (tok . rest) on (getf c :prompt) do (ds4f-forward ctx tok :logits (null rest)))
+    (if (uiop:getenv "ILLATIO_DS4F_PREFILL")
+        (ds4f-prefill ctx (getf c :prompt))   ; layer-major, the GPU's where there is one
+        (loop for (tok . rest) on (getf c :prompt) do (ds4f-forward ctx tok :logits (null rest))))
     (loop for (want . ref) in (getf c :steps)
           for i from 0
           do (let ((ours (top-logprobs (d4ctx-logits ctx) 10))
@@ -62,7 +71,9 @@
   (dolist (c (with-open-file (s (merge-pathnames "vectors/ds4f-q2.sexp" (or *load-truename* *default-pathname-defaults*)))
                (loop for c = (read s nil) while c collect c)))
     (run-case m c))
-  (loop for (key p bound) in +ds4f-bounds+
+  (loop for (key p bound) in (if (uiop:getenv "ILLATIO_DS4F_PREFILL")
+                                 (subst 2.0 1.50 +ds4f-bounds+)
+                                 +ds4f-bounds+)
         for q = (quantile (getf *deltas* key) p)
         do (format t "~&~5A p~2D |dlogprob| ~,4F (bound ~,2F)~%" key (round (* 100 p)) q bound)
            (unless (< q bound) (incf *failures*)))
