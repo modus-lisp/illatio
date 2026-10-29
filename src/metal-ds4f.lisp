@@ -311,23 +311,21 @@
 ;;; the six (D4_MV_IQ2_XXS, the six at once), the clamped SwiGLU times their
 ;;; routing weights, down (D4_MV_Q2_K).  The CPU sums the six in slot order.
 
-(defun physical-memory-gb ()
-  "This machine's memory, in GiB (sysctl hw.memsize)."
-  (sb-alien:with-alien ((v sb-alien:unsigned-long 0) (len sb-alien:unsigned-long 8))
-    (sb-alien:alien-funcall
-     (sb-alien:extern-alien "sysctlbyname" (function sb-alien:int sb-alien:c-string (* t) (* sb-alien:unsigned-long)
-                                                    (* t) sb-alien:unsigned-long))
-     "hw.memsize" (sb-alien:cast (sb-alien:addr v) (* t)) (sb-alien:addr len) nil 0)
-    (ash v -30)))
-
 (defvar *ds4f-expert-cache-gb* nil
   "The expert pool's size, in GB (an expert is about 7 MB); NIL: what the
-   rest of the model leaves of this machine's memory (28 GB of 48; no more
-   than 28, one Metal buffer).")
+   GPU's working set leaves (EXPERT-CACHE-GB).")
 
-(defun expert-cache-gb ()
-  ;; what the rest leaves: the GPU's weights (7.4 GB), activations, the system
-  (or *ds4f-expert-cache-gb* (max 4 (min 28 (- (physical-memory-gb) 20)))))
+(defun expert-cache-gb (gpu)
+  "The pool's size: as ds4 sizes its cache, 7/8 of the GPU's recommended
+   working set (40.2 GB of a 48 GB M4 Pro: past it a command buffer fails
+   for want of memory), less the GPU's weights (7.4 GB), a prefill chunk's
+   activations (about 0.9 MB a token) and a GB for the rest; one Metal
+   buffer, so no more than its longest (30 GB) allows.  22 GB here."
+  (or *ds4f-expert-cache-gb*
+      (let* ((dev (gpu-device gpu))
+             (wss (/ (msg sb-alien:unsigned-long dev "recommendedMaxWorkingSetSize") 1d9))
+             (most (/ (msg sb-alien:unsigned-long dev "maxBufferLength") 1d9)))
+        (max 4 (floor (min (- most 2) (- (* 7/8 wss) 7.5 (* *ds4f-chunk* 0.0009) 1)))))))
 
 ;;; The expert pool: one GPU buffer of expert slots that prefill and decode
 ;;; share.  Work in flight comes first, new loads go around it: a slot a
@@ -347,7 +345,7 @@
   (let ((st (ds4f-gpu-state m)))
     (or (getf (d4gpu-plist* st) :xcache)
         (let* ((sb (d4gpu-slot-bytes st))
-               (n (max 6 (floor (* (expert-cache-gb) 1000000000) sb)))
+               (n (max 6 (floor (* (expert-cache-gb (d4gpu-gpu st)) 1000000000) sb)))
                (keys (* (ds4f-n-layer m) (ds4f-n-expert m))))
           (setf (getf (d4gpu-plist* st) :xcache)
                 (seed-expert-cache
