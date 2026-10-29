@@ -108,7 +108,21 @@ source file changes. Modes are flags, and a bare word is always text:
 bin/illatio [-m PATH] [-n N] [--temp T] [--seed S] "text"   # continue raw text, streamed
 bin/illatio --chat [-s "system prompt"]                     # one line = one user turn
 bin/illatio --serve [[HOST]:PORT]                           # default 127.0.0.1:9931
+bin/illatio --bench [-p 512] [-n 128] [-d 0,4096] [-r 3]     # llama-bench's tests and table
 ```
+
+`--gpu` runs any of them on the GPU (Metal; qwen35 in Q6_K so far).  Raw
+text ends with llama-simple's speed line, so a quick comparison is
+
+```
+llama-simple      -m M -n 32 "The capital of France is"   # Metal by default
+bin/illatio --gpu -m M -n 32 "The capital of France is"
+```
+
+(both greedy, the same text; `decoded 32 tokens in 3.6 s, speed: 8.9 t/s`
+on stderr, prompt included).  For a table, `bin/illatio --bench` takes
+llama-bench's `-p -n -d -r`.  GPU numbers move with the machine's heat, so
+run the two back to back.
 
 **Server.** `POST /v1/chat/completions` (blocking, or `"stream": true` for
 SSE, tool calls included), `GET /v1/models` (with `context_length`, which

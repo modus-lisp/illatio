@@ -24,6 +24,11 @@ usage:
   illatio [flags] --chat [\"text\"] chat; each line you type is a user turn
   illatio [flags] --serve [ADDR]  OpenAI-compatible server; ADDR is [HOST]:PORT
                                   (default 127.0.0.1:9931)
+  illatio [flags] --bench         llama-bench's tests, in its table: -p prompt
+                                  tokens, -n generated, -d context depth (each a
+                                  comma list), -r repetitions; e.g.
+                                    illatio --bench --gpu -m M -p 512 -n 128 -d 0,4096
+                                    llama-bench -ngl 99 -m M -p 512 -n 128 -d 0,4096
 
 flags:
   -m, --model PATH    GGUF file (default $ILLATIO_MODEL, then
@@ -47,11 +52,16 @@ flags:
     (loop while args
           do (let ((a (pop args)))
                (flet ((val () (or (pop args) (die "~A needs a value" a)))
-                      (int (s) (or (parse-integer s :junk-allowed t) (die "~A is not a number" s))))
+                      (int (s) (or (parse-integer s :junk-allowed t) (die "~A is not a number" s)))
+                      (int-list (s)
+                        (mapcar (lambda (x) (or (parse-integer x :junk-allowed t) (die "~A is not a number" x)))
+                                (uiop:split-string s :separator ","))))
                  (cond
                    ((member a '("-h" "--help") :test #'string=) (setf (getf opts :help) t))
                    ((member a '("-m" "--model") :test #'string=) (setf (getf opts :model) (val)))
-                   ((member a '("-n" "--predict") :test #'string=) (setf (getf opts :predict) (int (val))))
+                   ((member a '("-n" "--predict") :test #'string=)
+                    (let ((v (val)))           ; --bench takes a list, as llama-bench does
+                      (setf (getf opts :predict) (int v) (getf opts :bench-n) (int-list v))))
                    ((string= a "--temp") (setf (getf opts :temp) (let ((*read-default-float-format* 'single-float))
                                                                     (coerce (read-from-string (val)) 'single-float))))
                    ((string= a "--seed") (setf (getf opts :seed) (int (val))))
@@ -60,6 +70,10 @@ flags:
                    ((member a '("-s" "--system") :test #'string=) (setf (getf opts :system) (val)))
                    ((string= a "--chat") (setf (getf opts :mode) :chat))
                    ((string= a "--gpu") (setf (getf opts :gpu) t))
+                   ((string= a "--bench") (setf (getf opts :mode) :bench))
+                   ((string= a "-p") (setf (getf opts :bench-p) (int-list (val))))
+                   ((string= a "-d") (setf (getf opts :bench-d) (int-list (val))))
+                   ((string= a "-r") (setf (getf opts :bench-r) (int (val))))
                    ((string= a "--serve")
                     (setf (getf opts :mode) :serve)
                     (when (and args (find #\: (first args)) (not (eql 0 (search "-" (first args)))))
@@ -109,9 +123,16 @@ flags:
   (let* ((m (load-it opts))
          (ctx (make-context m :n-ctx (getf opts :ctx))))
     (out text)
-    (generate ctx text :max-tokens (getf opts :predict) :on-text #'out
-                       :sampler (make-sampler :temperature (or (getf opts :temp) 0) :seed (getf opts :seed)))
-    (terpri)))
+    (let ((t0 (get-internal-real-time)))
+      (multiple-value-bind (s ids)
+          (generate ctx text :max-tokens (getf opts :predict) :on-text #'out
+                             :sampler (make-sampler :temperature (or (getf opts :temp) 0) :seed (getf opts :seed)))
+        (declare (ignore s))
+        (terpri)
+        ;; llama-simple's closing line, timed as it times it (prompt included)
+        (let ((secs (/ (- (get-internal-real-time) t0) internal-time-units-per-second)))
+          (format *error-output* "illatio: decoded ~D tokens in ~,2F s, speed: ~,2F t/s~%"
+                  (length ids) secs (/ (length ids) (max secs 1d-6))))))))
 
 (defun run-chat (opts first)
   (let* ((m (load-it opts))
@@ -146,10 +167,55 @@ flags:
       (format *error-output* "illatio: serving http://~A:~D/v1 (context ~D)~%" host port (getf opts :ctx))
       (loop (sleep 3600)))))
 
+(defun run-bench (opts)
+  "llama-bench's pp and tg tests, timed the way it times them: random
+   tokens; pp a prompt of P in one go (prefill), tg N tokens decoded one at a
+   time; each after a context already D deep (not timed); the mean and
+   standard deviation of R runs, after a warm-up."
+  (let* ((m (load-it opts))
+         (path (model-path opts))
+         (ps (getf opts :bench-p '(512))) (ns (getf opts :bench-n '(128)))
+         (ds (getf opts :bench-d '(0))) (reps (getf opts :bench-r 3))
+         (state (sb-ext:seed-random-state 42))
+         (vocab (illatio::model-n-vocab m)))
+    (labels ((toks (k) (loop repeat k collect (random (min vocab 150000) state)))
+             (secs (t0) (/ (- (get-internal-real-time) t0) internal-time-units-per-second))
+             (one (kind k d)
+               (let ((ctx (make-context m :n-ctx (+ d k 64))))
+                 (unwind-protect
+                      (progn
+                        (when (plusp d) (eval-tokens ctx (toks d)))
+                        (ecase kind
+                          (:pp (let ((ids (toks k)) (t0 (get-internal-real-time)))
+                                 (eval-tokens ctx ids)
+                                 (/ k (secs t0))))
+                          (:tg (when (zerop d) (eval-tokens ctx (toks 1)))
+                               (let ((ids (toks k)) (t0 (get-internal-real-time)))
+                                 (dolist (tok ids) (forward ctx tok))
+                                 (/ k (secs t0))))))
+                   (free-context ctx)))))
+      (one :pp 32 0) (one :tg 4 0)                    ; warm-up: kernels, pages
+      (format t "~&| model | size | backend | threads | test | t/s |~%|---|---|---|---|---|---|~%")
+      (dolist (d ds)
+        (dolist (test (append (loop for p in ps when (plusp p) collect (list :pp p))
+                              (loop for n in ns when (plusp n) collect (list :tg n))))
+          (destructuring-bind (kind k) test
+            (let* ((xs (loop repeat reps collect (one kind k d)))
+                   (mean (/ (reduce #'+ xs) reps))
+                   (sd (sqrt (/ (reduce #'+ (mapcar (lambda (x) (expt (- x mean) 2)) xs)) (max 1 (1- reps))))))
+              (format t "| ~A | ~,2F GiB | ~A | ~A | ~(~A~)~D~@[ @ d~D~] | ~,2F ± ~,2F |~%"
+                      (illatio::model-name m)
+                      (/ (with-open-file (s path :element-type '(unsigned-byte 8)) (file-length s)) (expt 2d0 30))
+                      (if (getf opts :gpu) "Metal" "CPU")
+                      (if (getf opts :gpu) "-" (illatio::pool-size (illatio::model-pool m)))
+                      kind k (and (plusp d) d) mean sd)
+              (force-output))))))))
+
 (defun main (args)
   (multiple-value-bind (opts text) (parse-args args)
     (cond ((getf opts :help) (write-string +usage+))
           ((eq (getf opts :mode) :serve) (run-serve opts))
+          ((eq (getf opts :mode) :bench) (run-bench opts))
           ((eq (getf opts :mode) :chat) (run-chat opts (and (plusp (length text)) text)))
           ((plusp (length text)) (run-complete opts text))
           (t (write-string +usage+) (uiop:quit 2)))))
