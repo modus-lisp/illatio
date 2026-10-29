@@ -2,10 +2,13 @@
 ;;;
 ;;; As ds4's disk KV cache (ds4-server --kv-disk-dir, ds4-agent's
 ;;; sysprompt.kv): a prefill of a long prompt saves the context's state at
-;;; each *KV-INTERVAL* boundary and at its end -- the raw ring, the
-;;; compressed and indexer rows, the compressors' windows, with the tokens
-;;; they hold -- and a context starting over takes the longest saved prefix
-;;; of its new prompt instead of prefilling it.  DeepSeek V4's state is small
+;;; the message boundaries in it -- before a <｜User｜> or <｜Assistant｜>
+;;; token, so the end of a system prompt is one -- and at its end: the raw
+;;; ring, the compressed and indexer rows, the compressors' windows, with the
+;;; tokens they hold.  A context starting over takes the longest saved
+;;; prefix of its new prompt instead of prefilling it: a new conversation
+;;; with the same system prompt, or an old one carried on, starts where the
+;;; saved one left off.  DeepSeek V4's state is small
 ;;; (about 50 MB at 6K tokens): the rows are kept through F16 already, so
 ;;; they are stored so, losslessly; the windows (f32, -1e30 where empty) as
 ;;; they are.  A saved prefix is always shorter than the prompt that takes
@@ -18,7 +21,7 @@
 
 (defparameter *kv-disk-gb* 8 "The saved states' budget; the oldest go first.")
 (defparameter *kv-min-tokens* 512 "Prefills shorter than this save nothing.")
-(defparameter *kv-interval* 2048 "A long prefill saves its state at each multiple of this.")
+(defparameter *kv-min-gap* 512 "A saved state at least this many tokens past the last one.")
 
 (defconstant +kv-magic+ #x31564b46344453)  ; "DS4FKV1"
 
@@ -177,20 +180,28 @@
 
 (pushnew 'ds4f-restore-prefix *restore-prefix-hooks*)
 
+(defun ds4f-role-ids (m)
+  "The ids of the chat format's turn tokens: a message ends before one."
+  (let ((ids (vocab-ids (ds4f-vocab m))))
+    (remove nil (mapcar (lambda (name) (gethash name ids)) '("<｜User｜>" "<｜Assistant｜>")))))
+
 (defun ds4f-eval-saving (c prefix tokens)
-  "DS4F-PREFILL of TOKENS after PREFIX (the tokens C holds), saving the state
-   at each *KV-INTERVAL* boundary it crosses and at its end, when TOKENS are
-   *KV-MIN-TOKENS* or more."
+  "DS4F-PREFILL of TOKENS after PREFIX (the tokens C holds), its state saved
+   at the message boundaries in them (*KV-MIN-GAP* apart at least) and at
+   their end, when TOKENS are *KV-MIN-TOKENS* or more."
   (if (or (null *kv-dir*) (< (length tokens) *kv-min-tokens*))
       (ds4f-prefill c tokens)
-      (let ((done (reverse prefix)) (rest tokens))
-        (loop while rest
-              do (let* ((pos (d4ctx-pos c))
-                        (to-boundary (- (* *kv-interval* (1+ (floor pos *kv-interval*))) pos))
-                        (n (min (length rest) to-boundary))
-                        (piece (subseq rest 0 n)))
-                   (setf rest (nthcdr n rest))
-                   (ds4f-prefill c piece :logits (null rest))
-                   (setf done (revappend piece done))
-                   (handler-case (ds4f-save-state c (reverse done))
-                     (error (e) (warn "illatio: could not save the context's state: ~A" e))))))))
+      (let* ((roles (ds4f-role-ids (d4ctx-model c))) (pos0 (d4ctx-pos c)) (end (+ pos0 (length tokens)))
+             (cuts (let ((last pos0) (out '()))
+                     (loop for tk in tokens for p from pos0
+                           when (and (member tk roles) (> p pos0) (>= (- p last) *kv-min-gap*) (< p end))
+                             do (push p out) (setf last p))
+                     (nreverse (cons end out))))
+             (done (reverse prefix)) (rest tokens))
+        (dolist (cut cuts)
+          (let* ((n (- cut (d4ctx-pos c))) (piece (subseq rest 0 n)))
+            (setf rest (nthcdr n rest))
+            (ds4f-prefill c piece :logits (null rest))
+            (setf done (revappend piece done))
+            (handler-case (ds4f-save-state c (reverse done))
+              (error (e) (warn "illatio: could not save the context's state: ~A" e))))))))

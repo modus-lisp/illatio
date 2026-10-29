@@ -1174,10 +1174,10 @@
 ;;; are summed in its slot order -- the decode's arithmetic, so a prefill is
 ;;; bit-identical to feeding the tokens one at a time.
 
-(defparameter *ds4f-chunk* 2048
-  "Tokens a layer-major pass takes at once.  A chunk reads nearly every
-   expert of every layer (77 GB), more than the page cache holds, so long
-   prompts want long chunks.")
+(defparameter *ds4f-chunk* 4096
+  "Tokens a layer-major pass takes at once.  A chunk reads nearly all of
+   every layer's experts (77 GB, less what the expert pool holds), so long
+   prompts want long chunks; its activations take about 0.9 MB a token.")
 
 (defun ds4f-prefill (ctx tokens &key (logits t))
   "TOKENS at the next positions, *DS4F-CHUNK* at a time."
