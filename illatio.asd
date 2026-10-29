@@ -20,6 +20,7 @@
      (:file "neon-modus" :if-feature :modus)             ; the same kernel on modus's %vi lanes
      (:file "tensor")      ; Q8_0 weights and the quantized matvec
      (:file "kquant")      ; Q4_K / Q6_K weights against Q8_K activations
+     (:file "iquant")      ; IQ2_XXS / Q2_K (DeepSeek V4 Flash's experts), read in the file
      (:file "unicode-data") ; letter/number/space ranges, generated from SBCL's tables
      (:file "tokenizer")   ; byte-level BPE
      (:file "model")       ; the forward pass

@@ -85,6 +85,33 @@
        (%static-bytes (length v) (array-element-type v))))
     nil))
 
+#+sbcl
+(defun map-file-vector (path)
+  "The file at PATH as one (UNSIGNED-BYTE 8) vector, read-only, without
+   reading it: its pages come from the disk when touched and stay in the
+   page cache while there is room, which is how a model larger than memory
+   streams.  The file is mapped at a fixed address one page into an
+   anonymous mapping, and the vector's header is written at the end of
+   that first page, right before the file's first byte."
+  (let* ((page 16384)
+         (size (with-open-file (s path :element-type '(unsigned-byte 8)) (file-length s)))
+         (span (* page (ceiling size page)))
+         (base (%mmap-anon (+ page span)))
+         (fd (sb-unix:unix-open (namestring (truename path)) sb-unix:o_rdonly 0)))
+    (unless fd (error "cannot open ~A" path))
+    (unwind-protect
+         (let ((addr (sb-alien:alien-funcall
+                      (sb-alien:extern-alien "mmap" (function sb-alien:unsigned-long sb-alien:unsigned-long
+                                                              sb-alien:unsigned-long sb-alien:int sb-alien:int
+                                                              sb-alien:int sb-alien:long))
+                      (+ base page) span 1 #x11 fd 0))) ; PROT_READ, MAP_SHARED | MAP_FIXED
+           (unless (= addr (+ base page)) (error "mmap of ~A failed" path)))
+      (sb-unix:unix-close fd))
+    (let ((h (sb-sys:int-sap (- (+ base page) 16))))
+      (setf (sb-sys:sap-ref-word h 0) sb-vm:simple-array-unsigned-byte-8-widetag
+            (sb-sys:sap-ref-word h 8) (ash size sb-vm:n-fixnum-tag-bits))
+      (sb-kernel:%make-lisp-obj (logior (- (+ base page) 16) sb-vm:other-pointer-lowtag)))))
+
 #+modus (defun free-static-vector (v) (modus:free-static-vector v))
 
 (defun make-i8vec (n &key static)
