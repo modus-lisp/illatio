@@ -25,6 +25,8 @@
      (:file "model")       ; the forward pass
      (:file "batch")       ; prefill: three tokens per multiply
      (:file "qwen35")      ; Qwen3.5's hybrid layers: gated delta net, gated attention
+     (:file "metal" :if-feature (:and :sbcl :darwin))        ; the GPU, through the Objective-C runtime
+     (:file "metal-qwen35" :if-feature (:and :sbcl :darwin)) ; qwen35 on it (kernels: src/metal/)
      (:file "generate")))))  ; sampling, prompt reuse, streaming text
 
 (defsystem "illatio/openai"

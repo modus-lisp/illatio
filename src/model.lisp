@@ -47,7 +47,8 @@
   (ssm-v-heads 0 :type fixnum) (ssm-v-dim 0 :type fixnum)
   token-embd output-norm output
   (layers #() :type simple-vector)
-  pool)
+  pool
+  gpu)                                  ; a GMODEL when the GPU runs it (metal-qwen35.lisp)
 
 (defun arch-key (g arch key) (meta g (format nil "~A.~A" arch key)))
 
@@ -377,6 +378,9 @@
   #-sbcl (forward-1 ctx token logits))
 
 (defun forward-1 (ctx token logits)
+  #+(and sbcl darwin)
+  (when (model-gpu (context-model ctx))
+    (return-from forward-1 (gpu-forward ctx token logits)))
   (when (model-recurrent-p (context-model ctx))
     (return-from forward-1 (forward-qwen35 ctx token :logits logits)))
   (let* ((m (context-model ctx))

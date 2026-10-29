@@ -530,7 +530,7 @@
     act))
 
 (defun matrix-act-kind (w)
-  (if (kmat-p w) :q8k :q8))
+  (if (or (kmat-p w) (gmat-p w)) :q8k :q8))
 
 (defun matrix-rows (w) (if (kmat-p w) (kmat-rows w) (q8mat-rows w)))
 
@@ -557,8 +557,25 @@
   "Row ROW of the embedding matrix W as floats."
   (if (kmat-p w) (kmat-row! w row out) (q8mat-row! w row out)))
 
+;;; A matrix left in the file, for the GPU (metal-qwen35.lisp): where its
+;;; blocks are and their shape; the GPU reads them there.
+(defstruct (gmat (:constructor %make-gmat))
+  name type (rows 0 :type fixnum) (cols 0 :type fixnum)
+  (offset 0 :type (unsigned-byte 62))   ; from the start of the file
+  (row-bytes 0 :type fixnum))
+
+(defvar *matrices-in-file* nil
+  "When true, LOAD-QMAT makes GMATs: the matrices stay in the file, for the GPU.")
+
+(defun make-gmat-for (g name)
+  (let* ((ti (gguf-tensor g name)) (dims (tensor-info-dims ti)))
+    (%make-gmat :name name :type (tensor-info-type ti)
+                :cols (first dims) :rows (reduce #'* (rest dims))
+                :offset (+ (gguf-data-offset g) (tensor-info-offset ti))
+                :row-bytes (floor (tensor-bytes ti) (reduce #'* (rest dims))))))
+
 (defun load-qmat (g name)
   "Tensor NAME as the matrix type its format calls for."
-  (if (kquant-type-p (tensor-info-type (gguf-tensor g name)))
-      (load-kmat g name)
-      (load-q8mat g name)))
+  (cond (*matrices-in-file* (make-gmat-for g name))
+        ((kquant-type-p (tensor-info-type (gguf-tensor g name))) (load-kmat g name))
+        (t (load-q8mat g name))))

@@ -60,6 +60,7 @@
   (let ((st (q35-state ctx)))
     (loop for v across (q35-conv st) do (fill v 0f0))
     (loop for v across (q35-ssm st) do (fill v 0f0)))
+  #+(and sbcl darwin) (reset-gpu-state ctx)
   ctx)
 
 ;;; --- small ops, as ggml computes them ------------------------------------------

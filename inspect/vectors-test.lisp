@@ -32,7 +32,8 @@
 ;;; are that floor with the same headroom.
 ;;; Exits 0 iff all hold.  Needs the model: $ILLATIO_TEST_MODEL, or
 ;;; ~/models/qwen2.5-0.5b-instruct-q8_0.gguf; and its vectors:
-;;; $ILLATIO_TEST_VECTORS, or vectors/qwen2.5-0.5b-q8_0.sexp.
+;;; $ILLATIO_TEST_VECTORS, or vectors/qwen2.5-0.5b-q8_0.sexp.  With
+;;; $ILLATIO_TEST_GPU set, the model runs on the GPU (metal-qwen35.lisp).
 
 (require :asdf)
 (asdf:load-asd (merge-pathnames "../illatio.asd" (or *load-truename* *default-pathname-defaults*)))
@@ -102,7 +103,9 @@
   (unless (probe-file path)
     (format t "no model at ~A; see README (Testing)~%" path)
     (uiop:quit 2))
-  (let ((m (load-model path)))
+  (let ((m (if (uiop:getenv "ILLATIO_TEST_GPU")
+               (funcall (intern "LOAD-MODEL-GPU" '#:illatio) path)
+               (load-model path))))
     (dolist (c (read-vectors (or (uiop:getenv "ILLATIO_TEST_VECTORS")
                                  (merge-pathnames "vectors/qwen2.5-0.5b-q8_0.sexp"
                                                   (or *load-truename* *default-pathname-defaults*)))))

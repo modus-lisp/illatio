@@ -287,6 +287,10 @@
 (defun eval-tokens (ctx tokens)
   "Feed TOKENS; only the last one's logits are computed.  More than one goes
    through FORWARD-BATCH, a chunk at a time."
+  (when (model-gpu (context-model ctx))
+    ;; the GPU takes a token at a time, so far
+    (loop for (tok . rest) on tokens do (forward ctx tok :logits (null rest)))
+    (return-from eval-tokens (context-logits ctx)))
   (if (null (rest tokens))
       (when tokens (forward ctx (first tokens)))
       (loop with batch = (if (model-recurrent-p (context-model ctx)) #'forward-batch-qwen35 #'forward-batch)
