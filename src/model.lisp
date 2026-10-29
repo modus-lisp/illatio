@@ -157,7 +157,8 @@
          (qd (model-q-dim model))
          (kv (* (model-n-kv-head model) (model-head-dim model)))
          (f (model-ffn model)))
-    (%make-context
+    (own-context-caches
+     (%make-context
      :model model :n-ctx n-ctx
      ;; static on modus: a 4B model's cache at 4096 tokens is 1.2 GB, more
      ;; than its copying heap's semispace; FREE-CONTEXT gives it back
@@ -170,7 +171,17 @@
      :x (f32vec d) :h (f32vec d) :q (f32vec qd) :k (f32vec kv) :v (f32vec kv)
      :att (f32vec qd) :ffn-a (f32vec f) :ffn-b (f32vec f)
      :xq (make-qact (max d qd) (model-act-kinds model)) :hq (make-qact f (model-act-kinds model))
-     :logits (f32vec (model-n-vocab model)))))
+     :logits (f32vec (model-n-vocab model))))))
+
+(defun context-static-vectors (ctx)
+  "The vectors of CTX outside the heap: its KV cache and recurrent state."
+  (let ((st (getf (context-plist ctx) :q35)))
+    (concatenate 'list (context-k-cache ctx) (context-v-cache ctx) (and st (q35-ssm st)))))
+
+(defun own-context-caches (ctx)
+  "Have CTX's caches freed with it, if FREE-CONTEXT doesn't free them first."
+  (disown-static-vectors ctx)
+  (own-static-vectors ctx (context-static-vectors ctx)))
 
 ;;; --- ops --------------------------------------------------------------------
 
@@ -436,13 +447,13 @@
   (detokenize-with (model-vocab model) ids))
 
 (defun free-context (ctx)
-  "Release CTX's KV cache now (on modus it is outside the heap, so the
-   collector would never reclaim it); CTX is unusable afterwards.  Harmless
-   to call twice, and on SBCL it only drops the references."
-  #+modus (dolist (caches (list (context-k-cache ctx) (context-v-cache ctx)
-                                (let ((st (getf (context-plist ctx) :q35))) (and st (q35-ssm st)))))
-            (when caches (loop for c across caches do (modus:free-static-vector c))))
+  "Release CTX's KV cache and recurrent state now, rather than when CTX is
+   collected (and on modus, which has no finalizers, rather than never);
+   CTX is unusable afterwards.  Harmless to call twice."
+  (disown-static-vectors ctx)
+  (map nil #'free-static-vector (context-static-vectors ctx))
   (setf (context-k-cache ctx) nil (context-v-cache ctx) nil)
+  (remf (context-plist ctx) :q35)
   ctx)
 
 (defun greedy (model prompt n &key (ctx nil ctx-p))

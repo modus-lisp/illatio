@@ -31,17 +31,92 @@
             `(let ((,b (aref ,v ,i))) (declare (type (unsigned-byte 8) ,b)) (if (> ,b 127) (- ,b 256) ,b))))
 #+modus (defmacro i8-byte (x) `(logand ,x 255))
 
+#+sbcl
+(progn
+  ;; SBCL's :STATIC: the vector lives in memory mapped outside the dynamic
+  ;; space, behind an array header written by hand (the static-vectors
+  ;; library's way).  The collector ignores pointers out of its spaces, so it
+  ;; neither scans nor moves the vector, and the dynamic space need not hold
+  ;; the weights: a 27B model's 22 GB no longer sizes the heap or its
+  ;; collections.  Such a vector lives until FREE-STATIC-VECTOR.
+  (defun %mmap-anon (bytes)
+    (let ((addr (sb-alien:alien-funcall
+                 (sb-alien:extern-alien "mmap" (function sb-alien:unsigned-long sb-alien:unsigned-long
+                                                         sb-alien:unsigned-long sb-alien:int sb-alien:int
+                                                         sb-alien:int sb-alien:long))
+                 0 bytes 3                ; PROT_READ | PROT_WRITE
+                 #+darwin #x1002 #-darwin #x22 ; MAP_PRIVATE | MAP_ANON
+                 -1 0)))
+      (when (= addr (ldb (byte 64 0) -1))
+        (error "mmap of ~:D bytes failed" bytes))
+      addr))
+
+  (defun %static-bytes (n element-type)
+    (+ (* 2 sb-vm:n-word-bytes)
+       (* n (if (member element-type '(single-float (signed-byte 32)) :test #'equal) 4 1))))
+
+  (defun sbcl-static-vector (n element-type)
+    "A zeroed (SIMPLE-ARRAY ELEMENT-TYPE (N)) outside SBCL's heap."
+    (if (zerop n)
+        (make-array 0 :element-type element-type)
+        (let* ((addr (%mmap-anon (%static-bytes n element-type)))
+               (sap (sb-sys:int-sap addr)))
+          (setf (sb-sys:sap-ref-word sap 0)
+                (cdr (assoc element-type
+                            `((single-float . ,sb-vm:simple-array-single-float-widetag)
+                              ((signed-byte 32) . ,sb-vm:simple-array-signed-byte-32-widetag)
+                              ((unsigned-byte 8) . ,sb-vm:simple-array-unsigned-byte-8-widetag)
+                              ((signed-byte 8) . ,sb-vm:simple-array-signed-byte-8-widetag))
+                            :test #'equal))
+                (sb-sys:sap-ref-word sap sb-vm:n-word-bytes) (ash n sb-vm:n-fixnum-tag-bits))
+          (sb-kernel:%make-lisp-obj (logior addr sb-vm:other-pointer-lowtag)))))
+
+  (defun static-vector-p (v)
+    "Whether V is outside the dynamic space (as only these vectors are)."
+    (let ((addr (sb-kernel:get-lisp-obj-address v)))
+      (not (< sb-vm:dynamic-space-start addr (+ sb-vm:dynamic-space-start (sb-ext:dynamic-space-size))))))
+
+  (defun free-static-vector (v)
+    "Unmap a vector SBCL-STATIC-VECTOR made; anything else is left alone."
+    (when (and (plusp (length v)) (static-vector-p v))
+      (sb-alien:alien-funcall
+       (sb-alien:extern-alien "munmap" (function sb-alien:int sb-alien:unsigned-long sb-alien:unsigned-long))
+       (logandc2 (sb-kernel:get-lisp-obj-address v) sb-vm:lowtag-mask)
+       (%static-bytes (length v) (array-element-type v))))
+    nil))
+
+#+modus (defun free-static-vector (v) (modus:free-static-vector v))
+
 (defun make-i8vec (n &key static)
   #+modus (if static
               (modus:make-static-vector n)
               (make-array n :element-type '(unsigned-byte 8) :initial-element 0))
-  #-modus (progn static (make-array n :element-type '(signed-byte 8) :initial-element 0)))
+  #+sbcl (if static
+             (sbcl-static-vector n '(signed-byte 8))
+             (make-array n :element-type '(signed-byte 8) :initial-element 0))
+  #-(or modus sbcl) (progn static (make-array n :element-type '(signed-byte 8) :initial-element 0)))
 
 (defun f32vec (n &key static)
   #+modus (if static
               (modus:make-static-vector n :element-type 'single-float)
               (make-array n :element-type 'single-float :initial-element 0f0))
-  #-modus (progn static (make-array n :element-type 'single-float :initial-element 0f0)))
+  #+sbcl (if static
+             (sbcl-static-vector n 'single-float)
+             (make-array n :element-type 'single-float :initial-element 0f0))
+  #-(or modus sbcl) (progn static (make-array n :element-type 'single-float :initial-element 0f0)))
+
+(defun own-static-vectors (owner vectors)
+  "Free VECTORS (static) when OWNER is collected, unless DISOWN-STATIC-
+   VECTORS is called first (by whatever frees them itself).  Only SBCL has
+   the finalizers; on modus an owner's vectors last until they are freed."
+  #+sbcl (sb-ext:finalize owner (lambda () (map nil #'free-static-vector vectors)) :dont-save t)
+  #-sbcl (progn owner vectors)
+  owner)
+
+(defun disown-static-vectors (owner)
+  #+sbcl (sb-ext:cancel-finalization owner)
+  #-sbcl owner
+  owner)
 
 ;;; A Q8_0 matrix: ROWS rows of COLS weights, row-major, each row COLS/32
 ;;; blocks.  QUANTS holds the int8s, SCALES the per-block fp16 scales already

@@ -39,7 +39,8 @@
 
 (defun make-u8vec (n &key static)
   #+modus (if static (modus:make-static-vector n) (make-array n :element-type '(unsigned-byte 8) :initial-element 0))
-  #-modus (progn static (make-array n :element-type '(unsigned-byte 8) :initial-element 0)))
+  #+sbcl (if static (sbcl-static-vector n '(unsigned-byte 8)) (make-array n :element-type '(unsigned-byte 8) :initial-element 0))
+  #-(or modus sbcl) (progn static (make-array n :element-type '(unsigned-byte 8) :initial-element 0)))
 
 (declaim (inline s8))
 (defun s8 (b)
@@ -257,45 +258,71 @@
                 (%q4k-dot (sb-sys:vector-sap desc) nb)
                 (%q6k-dot (sb-sys:vector-sap desc) nb))))))))
 
+(defconstant +tile-bytes+ 65536
+  "The weights a batched multiply keeps in a core's L1 while every token of
+   the batch passes over them.")
+
+(defun kmat-tile-rows (w)
+  (let ((row-bytes (* (kmat-nb w) (if (eq (kmat-type w) :q4_k) 144 210))))
+    (max 1 (floor +tile-bytes+ row-bytes))))
+
 #+(and sbcl arm64)
-(defun kmat-range-dot-neon! (w xv xo out start end oo)
-  "OUT[oo+r] = row r of W against XV at XO, for rows START..END-1, by the NEON
-   kernels.  One descriptor for the whole range, its weight pointers moved
-   on per row: a descriptor a row was 64 bytes of garbage a row, 260 MB a
-   27B token."
-  (declare (type kmat w) (type q8kvec xv) (type f32vec out) (type fixnum xo start end oo)
+(defun kmat-range-dot-neon! (w xv xo out start end oo &optional (n 1) (xstride 0) (ostride 0))
+  "OUT[oo + t*OSTRIDE + r] = row r of W against token t of XV (at XO +
+   t*XSTRIDE), rows START..END-1, tokens 0..N-1, by the NEON kernels.  The
+   rows go a tile at a time, every token over a tile before the next, so a
+   batch reads the weights once.  One descriptor for it all, its pointers
+   moved on per row: a descriptor a row was 64 bytes of garbage a row, 260
+   MB a 27B token."
+  (declare (type kmat w) (type q8kvec xv) (type f32vec out)
+           (type fixnum xo start end oo n xstride ostride)
            (optimize speed (safety 0)))
-  (let* ((nb (kmat-nb w)) (y0 (floor xo +qk-k+))
+  (let* ((nb (kmat-nb w))
          (q4 (eq (kmat-type w) :q4_k))
          (qstride (* nb (if q4 128 192))) (dstride (* nb (if q4 8 4)))
+         (tile (kmat-tile-rows w))
          (qs (kmat-qs w)) (sc (kmat-sc w)) (dd (kmat-dd w))
          (yq (q8kvec-qs xv)) (yd (q8kvec-d xv)) (bs (q8kvec-bsums xv)) (b32 (q8kvec-bsum32 xv))
          (desc (make-array 6 :element-type '(unsigned-byte 64))))
-    (declare (type fixnum nb y0 qstride dstride) (type (simple-array (unsigned-byte 64) (6)) desc))
+    (declare (type fixnum nb qstride dstride tile) (type (simple-array (unsigned-byte 64) (6)) desc))
     (sb-sys:with-pinned-objects (qs sc dd yq yd bs b32 desc)
       (let ((q0 (sb-sys:sap-int (sb-sys:vector-sap qs)))
             (s0 (sb-sys:sap-int (sb-sys:vector-sap sc)))
             (d0 (sb-sys:sap-int (sb-sys:vector-sap dd)))
+            (yq0 (sb-sys:sap-int (sb-sys:vector-sap yq)))
+            (yd0 (sb-sys:sap-int (sb-sys:vector-sap yd)))
+            (yb0 (sb-sys:sap-int (sb-sys:vector-sap (if q4 b32 bs))))
             (dsap (sb-sys:vector-sap desc)))
-        (declare (type (unsigned-byte 64) q0 s0 d0))
-        (setf (aref desc 3) (+ (sb-sys:sap-int (sb-sys:vector-sap yq)) xo)
-              (aref desc 4) (+ (sb-sys:sap-int (sb-sys:vector-sap yd)) (* y0 4))
-              (aref desc 5) (if q4
-                                (+ (sb-sys:sap-int (sb-sys:vector-sap b32)) (* y0 32))
-                                (+ (sb-sys:sap-int (sb-sys:vector-sap bs)) (* y0 64))))
-        (loop for r of-type fixnum from start below end
-              do (setf (aref desc 0) (+ q0 (* r qstride))
-                       (aref desc 1) (+ s0 (* r nb 16))
-                       (aref desc 2) (+ d0 (* r dstride)))
-                 (setf (aref out (+ oo r))
-                       (if q4 (%q4k-dot dsap nb) (%q6k-dot dsap nb))))))
+        (declare (type (unsigned-byte 64) q0 s0 d0 yq0 yd0 yb0))
+        (loop for t0 of-type fixnum from start below end by tile
+              do (let ((t1 (min end (+ t0 tile))))
+                   (declare (type fixnum t1))
+                   (dotimes (tk n)
+                     (let* ((x (+ xo (* tk xstride))) (y0 (floor x +qk-k+))
+                            (o (+ oo (* tk ostride))))
+                       (declare (type fixnum x y0 o))
+                       (setf (aref desc 3) (+ yq0 x)
+                             (aref desc 4) (+ yd0 (* y0 4))
+                             (aref desc 5) (+ yb0 (* y0 (if q4 32 64))))
+                       (loop for r of-type fixnum from t0 below t1
+                             do (setf (aref desc 0) (+ q0 (* r qstride))
+                                      (aref desc 1) (+ s0 (* r nb 16))
+                                      (aref desc 2) (+ d0 (* r dstride)))
+                                (setf (aref out (+ o r))
+                                      (if q4 (%q4k-dot dsap nb) (%q6k-dot dsap nb))))))))))
     out))
 
-(defun kmat-range-dot! (w xv xo out start end &optional (oo 0))
-  "OUT[oo+r] = row r of W against XV at XO, rows START..END-1."
-  #+(and sbcl arm64) (when (neon-active-p) (return-from kmat-range-dot! (kmat-range-dot-neon! w xv xo out start end oo)))
-  (loop for r from start below end
-        do (setf (aref out (+ oo r)) (kmat-row-dot w r xv xo)))
+(defun kmat-range-dot! (w xv xo out start end &optional (oo 0) (n 1) (xstride 0) (ostride 0))
+  "OUT[oo + t*OSTRIDE + r] = row r of W against token t of XV (at XO +
+   t*XSTRIDE), rows START..END-1, tokens 0..N-1, a tile of rows at a time."
+  #+(and sbcl arm64) (when (neon-active-p)
+                       (return-from kmat-range-dot! (kmat-range-dot-neon! w xv xo out start end oo n xstride ostride)))
+  (let ((tile (kmat-tile-rows w)))
+    (loop for t0 from start below end by tile
+          do (dotimes (tk n)
+               (loop for r from t0 below (min end (+ t0 tile))
+                     do (setf (aref out (+ oo (* tk ostride) r))
+                              (kmat-row-dot w r xv (+ xo (* tk xstride))))))))
   out)
 
 (defun kmat-row-dot (w row xv xo)

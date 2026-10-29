@@ -23,8 +23,8 @@
      (:file "unicode-data") ; letter/number/space ranges, generated from SBCL's tables
      (:file "tokenizer")   ; byte-level BPE
      (:file "model")       ; the forward pass
-     (:file "qwen35")      ; Qwen3.5's hybrid layers: gated delta net, gated attention
      (:file "batch")       ; prefill: three tokens per multiply
+     (:file "qwen35")      ; Qwen3.5's hybrid layers: gated delta net, gated attention
      (:file "generate")))))  ; sampling, prompt reuse, streaming text
 
 (defsystem "illatio/openai"
