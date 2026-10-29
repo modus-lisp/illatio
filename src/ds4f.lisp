@@ -442,7 +442,7 @@
 ;;; --- per-context state -------------------------------------------------------------
 
 (defstruct (d4cache (:conc-name dc-))
-  raw (n-raw 0)                         ; the last SWA rows, oldest first
+  raw (n-raw 0) (raw-total 0)           ; the last SWA rows: a ring, position p at row p mod SWA
   comp (n-comp 0) st-kv st-score        ; compressed rows; the compressor's window
   ix-comp (n-ix 0) ix-kv ix-score)      ; the indexer's
 
@@ -466,17 +466,22 @@
                          :ix-score (and (= ratio 4) (neg (* coff ratio coff ixd)))))))
                   (ds4f-layers m)))))
 
+(declaim (inline raw-slot))
+(defun raw-slot (c r cap)
+  "The ring row of the window's row R (0 the oldest)."
+  (declare (type fixnum r cap))
+  (mod (+ (- (the fixnum (dc-raw-total c)) (the fixnum (dc-n-raw c))) r) cap))
+
 (defun push-raw! (m c kv)
   "kv_cache_push_raw: KV, through F16, at the end of the window (the oldest
-   row dropped when it is full)."
-  (let* ((hd (ds4f-head-dim m)) (cap (ds4f-swa m)) (raw (dc-raw c)))
+   row dropped when it is full).  The window is a ring (the GPU writes one
+   row a token), read oldest first, as ds4's shifted window is."
+  (let* ((hd (ds4f-head-dim m)) (cap (ds4f-swa m)) (raw (dc-raw c))
+         (o (* (mod (dc-raw-total c) cap) hd)))
     (declare (type f32vec raw kv))
-    (when (= (dc-n-raw c) cap)
-      (replace raw raw :start2 hd)
-      (decf (dc-n-raw c)))
-    (let ((o (* (dc-n-raw c) hd)))
-      (dotimes (i hd) (setf (aref raw (+ o i)) (f16-round (aref kv i)))))
-    (incf (dc-n-raw c))))
+    (dotimes (i hd) (setf (aref raw (+ o i)) (f16-round (aref kv i))))
+    (incf (dc-raw-total c))
+    (setf (dc-n-raw c) (min cap (1+ (dc-n-raw c))))))
 
 ;;; --- the compressor ----------------------------------------------------------------
 
@@ -616,7 +621,7 @@
   "layer_attention_mixed_one: each head over the raw window and the allowed
    compressed rows, the sink in the denominator."
   (let* ((hd (ds4f-head-dim m)) (nh (ds4f-n-head m)) (sinks (dl-sinks l))
-         (raw (dc-raw c)) (n-raw (dc-n-raw c))
+         (raw (dc-raw c)) (n-raw (dc-n-raw c)) (cap (ds4f-swa m))
          (comp (dc-comp c)) (n-comp (if comp (dc-n-comp c) 0))
          (scale (/ 1f0 (sqrt (float hd 1f0)))))
     (declare (type f32vec q heads sinks raw))
@@ -626,7 +631,7 @@
         (declare (type single-float mx))
         ;; the raw and compressed rows each through attention's kernels (NEON where there are)
         (with-attention-kernels (dot axpy) (raw raw q heads)
-          (dotimes (r n-raw) (let ((s (* (the single-float (dot (* r hd) qo hd)) scale))) (setf (aref score r) s mx (max mx s)))))
+          (dotimes (r n-raw) (let ((s (* (the single-float (dot (* (raw-slot c r cap) hd) qo hd)) scale))) (setf (aref score r) s mx (max mx s)))))
         (when comp
           (let ((comp comp))
             (declare (type f32vec comp))
@@ -639,7 +644,7 @@
         (let ((denom (exp (- (aref sinks h) mx))))
           (declare (type single-float denom))
           (with-attention-kernels (dot axpy) (raw raw q heads)
-            (dotimes (r n-raw) (let ((w (exp (- (aref score r) mx)))) (incf denom w) (axpy w (* r hd) qo hd))))
+            (dotimes (r n-raw) (let ((w (exp (- (aref score r) mx)))) (incf denom w) (axpy w (* (raw-slot c r cap) hd) qo hd))))
           (when comp
             (let ((comp comp))
               (declare (type f32vec comp))
@@ -821,7 +826,9 @@
            (ncomp (and gpu (make-array n :element-type '(unsigned-byte 32))))
            (lists (and gpu (make-array n)))
            (ixvis (and gpu (= ratio 4) (make-array n :element-type '(unsigned-byte 32)))))
-      (when gpu (replace kr (dc-raw c) :end2 (* prev hd)))
+      (when gpu
+        (dotimes (r prev)
+          (let ((o (* (raw-slot c r swa) hd))) (replace kr (dc-raw c) :start1 (* r hd) :start2 o :end2 (+ o hd)))))
       (dotimes (tk n)
         (let ((pos (+ pos0 tk)))
           (replace norm norms :start2 (* tk d) :end2 (* (1+ tk) d))
@@ -847,7 +854,8 @@
             (if gpu
                 (let ((row (+ prev tk)))
                   ;; the row as the cache holds it (through F16), at its place
-                  (replace kr (dc-raw c) :start1 (* row hd) :start2 (* (1- (dc-n-raw c)) hd) :end2 (* (dc-n-raw c) hd))
+                  (let ((o (* (mod (1- (dc-raw-total c)) swa) hd)))
+                    (replace kr (dc-raw c) :start1 (* row hd) :start2 o :end2 (+ o hd)))
                   (setf (aref raws tk) (max 0 (- (1+ row) swa))
                         (aref nraw tk) (min swa (1+ row)))
                   (let ((nc (if (dc-comp c) (dc-n-comp c) 0)))
