@@ -63,6 +63,13 @@
 (defun context-tokens (ctx) (getf (context-plist ctx) :tokens))
 (defun (setf context-tokens) (v ctx) (setf (getf (context-plist ctx) :tokens) v))
 
+(defvar *restore-prefix-hooks* '()
+  "Functions (CTX IDS) that may give a context starting over a saved state of
+   a prefix of IDS: how many tokens it then holds, or NIL (ds4f-kv.lisp).")
+
+(defun restore-prefix (ctx ids)
+  (or (some (lambda (f) (funcall f ctx ids)) *restore-prefix-hooks*) 0))
+
 (defun sync-prompt (ctx ids)
   "Make the cache hold exactly IDS, re-evaluating only past the prefix it
    already has, and leave the logits of the last one.  Returns how many
@@ -78,7 +85,9 @@
     (when (model-recurrent-p (context-model ctx))
       (if (and (= common (length have)) (< common (length ids)))
           nil
-          (progn (setf common 0) (reset-recurrent! ctx))))
+          (progn (setf common 0) (reset-recurrent! ctx)))
+      ;; starting over: from a saved state of a prefix, if there is one
+      (when (zerop common) (setf common (restore-prefix ctx ids))))
     (setf (context-pos ctx) common
           (context-tokens ctx) (subseq ids 0 common))
     (eval-tokens ctx (nthcdr common ids))

@@ -1327,7 +1327,9 @@
 (defun ds4f-context-eval (ctx tokens)
   (let ((c (ds4f-context ctx)))
     (setf (d4ctx-pos c) (context-pos ctx))
-    (if (rest tokens) (ds4f-prefill c tokens) (when tokens (ds4f-forward c (first tokens))))
+    (if (rest tokens)
+        (ds4f-eval-saving c (context-tokens ctx) tokens)
+        (when tokens (ds4f-forward c (first tokens))))
     (setf (context-pos ctx) (d4ctx-pos c))
     (context-logits ctx)))
 
