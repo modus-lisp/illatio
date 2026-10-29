@@ -9,7 +9,7 @@ drives the GPU through Metal from Lisp, and it runs
 **DeepSeek V4 Flash, a 284B-parameter model, from the SSD on a 48 GB
 laptop**, at the speed of the C engine it was ported from.
 
-*Illatio* is Latin for inference, the step from what is given to what follows.
+*Illatio*, Latin: "a carrying in; an inference."
 
 ```
 bin/illatio "The capital of France is"
@@ -313,6 +313,24 @@ modus-lisp.
   bits; what is left is modus's thread scaling.
 - **More formats and models.**  Q5_K, Q8_0-with-K-quant mixes, and
   Qwen3.6-35B-A3B (`qwen35moe`).
+
+## Afterword
+
+This began as a Lisp that could run a half-billion-parameter model on its
+CPU, and arrived at a 284B mixture of experts running from an SSD on a
+laptop, as fast as the C it was ported from, with every step checked against
+a reference and the GPU no longer what it waits on.  Most of the work was
+not arithmetic but logistics -- what lives where, what moves when, and what
+must finish before something new is loaded.
+
+None of it would exist without two people who showed how it is done.
+[Georgi Gerganov](https://github.com/ggerganov)'s ggml and llama.cpp made
+local inference real for everyone, and their kernels and arithmetic are the
+reference illatio measures itself against.  [Salvatore
+Sanfilippo](https://github.com/antirez)'s ds4 showed that one careful
+engine, built for one model and written to be read, can run DeepSeek V4
+from a laptop's SSD; illatio's port follows it op for op.  Thank you both
+for building something amazing.
 
 ## License
 
