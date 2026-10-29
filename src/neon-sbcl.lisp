@@ -82,6 +82,19 @@
 ;;;   add  xD, xN, xM             8b000000 | M<<16 | N<<5 | D
 ;;;   ldp / stp qA, qB, [xN, #16k] ad400000 / ad000000 | k<<15 | B<<10 | N<<5 | A
 ;;;   fsub vD.4s, vN.4s, vM.4s    4ea0d400 | M<<16 | N<<5 | D
+;;; and for the IQ2_XXS / Q2_K expert rows:
+;;;   ldr  hT, [xN], #2           7c402400 | N<<5 | T
+;;;   fcvt sD, hN                 1ee24000 | N<<5 | D
+;;;   ldr  wT, [xN], #4           b8404400 | N<<5 | T
+;;;   ubfx xD, xN, #L, #W         d3400000 | L<<16 | (L+W-1)<<10 | N<<5 | D
+;;;   orr  xD, xN, xM, lsl #S     aa000000 | M<<16 | S<<10 | N<<5 | D
+;;;   ldr  dT, [xN, xM, lsl #3]   fc607800 | M<<16 | N<<5 | T
+;;;   mov  vD.d[1], vN.d[0]       6e180400 | N<<5 | D
+;;;   lsr  wD, wN, #28            531c7c00 | N<<5 | D
+;;;   scvtf sD, wN                1e220000 | N<<5 | D
+;;;   fmov sD, #0.5 / #0.25       1e2c1000 / 1e2a1000 | D
+;;;   movi dD, #0                 2f00e400 | D
+;;;   fneg sD, sN                 1e214000 | N<<5 | D
 ;;;   shl  vD.16b, vN.16b, #2     4f0a5400 | N<<5 | D     (ushr #2: 6f0e0400)
 ;;;   b.ne  -K instructions       54000001 | (-K mod 2^19)<<5
 ;;;
@@ -129,6 +142,15 @@
 ;;; The delta rule for sixteen values of one head, one token (see Q35-DELTA!).
 (sb-c:defknown %delta-block (sb-sys:system-area-pointer (unsigned-byte 32))
     (values) ())
+
+;;; DeepSeek V4 Flash's expert rows (iquant.lisp): an IQ2_XXS or Q2_K row in
+;;; the GGUF against Q8_K activations.  DESC: the row, then the activations'
+;;; quants and scales (IQ2_XXS: and the signed-grid table; Q2_K: and their
+;;; 16-sums).
+(sb-c:defknown %iq2xxs-dot (sb-sys:system-area-pointer (unsigned-byte 32))
+    single-float (sb-c:flushable))
+(sb-c:defknown %q2k-dot (sb-sys:system-area-pointer (unsigned-byte 32))
+    single-float (sb-c:flushable))
 
 (sb-c:defknown %f32-axpy4
     (sb-sys:system-area-pointer sb-sys:system-area-pointer single-float (unsigned-byte 32))
@@ -793,6 +815,159 @@
             (dolist (w (list (logior #xac810000 (ash o1 10) (ash po 5) o0)
                              (logior #xac810000 (ash o3 10) (ash po 5) o2)))
               (illatio::word w))))))))
+
+;;; IQ2XXS-ROW-DOT's arithmetic: per sub-block of 32, four 8-byte rows of the
+;;; signed grid (+IQ2XXS-SIGNED+, indexed by grid*128 + sign pattern) SDOTted
+;;; with the activations, times (0.5 + LS), the even and odd sub-blocks
+;;; summed apart; per block TOTAL += (d * y.d) * (their sum); a quarter of it.
+(define-vop (illatio::%iq2xxs-dot)
+  (:translate illatio::%iq2xxs-dot)
+  (:policy :fast-safe)
+  (:args (desc :scs (sap-reg) :target pd) (nb :scs (unsigned-reg) :target count))
+  (:arg-types system-area-pointer unsigned-num)
+  (:results (sum :scs (single-reg)))
+  (:result-types single-float)
+  (:temporary (:sc unsigned-reg) pw) (:temporary (:sc unsigned-reg) ptab)
+  (:temporary (:sc unsigned-reg) pyq) (:temporary (:sc unsigned-reg) pyd)
+  (:temporary (:sc unsigned-reg) wg) (:temporary (:sc unsigned-reg) ws)
+  (:temporary (:sc unsigned-reg) t1) (:temporary (:sc unsigned-reg) t2)
+  (:temporary (:sc unsigned-reg :from (:argument 0)) pd)
+  (:temporary (:sc unsigned-reg :from (:argument 1)) count)
+  (:temporary (:sc double-reg) dw) (:temporary (:sc double-reg) ydv)
+  (:temporary (:sc double-reg) dd) (:temporary (:sc double-reg) suma)
+  (:temporary (:sc double-reg) sumb) (:temporary (:sc double-reg) half)
+  (:temporary (:sc double-reg) va) (:temporary (:sc double-reg) vb)
+  (:temporary (:sc double-reg) vt) (:temporary (:sc double-reg) ya)
+  (:temporary (:sc double-reg) yb) (:temporary (:sc double-reg) acc)
+  (:temporary (:sc double-reg) lsv) (:temporary (:sc double-reg) tt)
+  (:generator 200
+    (move pd desc) (move count nb)
+    (illatio::with-a64 (pw ptab pyq pyd wg ws t1 t2 pd count sum dw ydv dd suma sumb half
+                        va vb vt ya yb acc lsv tt)
+      (loop for r in (list pw ptab pyq pyd) for k from 0
+            do (illatio::word (illatio::a64 (logior #xf9400000 (ash k 10)) r pd)))
+      (illatio::word (illatio::a64 #x2f00e400 sum))                 ; total = 0
+      (illatio::word (illatio::a64 #x1e2c1000 half))                ; 0.5
+      (flet ((ubfx (d n lsb width)
+               (logior #xd3400000 (ash lsb 16) (ash (+ lsb width -1) 10) (ash n 5) d)))
+        (illatio::loop-while-count
+         count
+         (append
+          (list (illatio::a64 #x7c402400 dw pw) (illatio::a64 #x1ee24000 dw dw)   ; d
+                (illatio::a64 #xbc404400 ydv pyd)                                ; y.d
+                (illatio::a64 #x1e200800 dd dw ydv)                              ; d * y.d
+                (illatio::a64 #x2f00e400 suma) (illatio::a64 #x2f00e400 sumb))
+          (loop for ib below 8
+                append (append
+                        (list (illatio::a64 #xb8404400 wg pw) (illatio::a64 #xb8404400 ws pw))
+                        (loop for l below 4
+                              append (list (ubfx t1 wg (* 8 l) 8)
+                                           (ubfx t2 ws (* 7 l) 7)
+                                           (logior #xaa000000 (ash t1 16) (ash 7 10) (ash t2 5) t2)
+                                           (logior #xfc607800 (ash t2 16) (ash ptab 5)
+                                                   (case l (0 va) (2 vb) (t vt)))
+                                           (case l
+                                             (1 (illatio::a64 #x6e180400 va vt))
+                                             (3 (illatio::a64 #x6e180400 vb vt))
+                                             (t #xd503201f))))                   ; nop
+                        (list (illatio::a64-ldp-q ya yb pyq)
+                              (illatio::a64 #x6f00e400 acc)
+                              (illatio::a64 #x4e809400 acc va ya)
+                              (illatio::a64 #x4e809400 acc vb yb)
+                              (illatio::a64 #x4eb1b800 acc acc)                  ; the sub-block's integer dot
+                              (illatio::a64 #x5e21d800 acc acc)
+                              (illatio::a64 #x531c7c00 t1 ws)                    ; LS
+                              (illatio::a64 #x1e220000 lsv t1)
+                              (illatio::a64 #x1e202800 lsv half lsv)             ; 0.5 + LS
+                              (illatio::a64 #x1e200800 tt acc lsv)
+                              (if (evenp ib)
+                                  (illatio::a64 #x1e202800 suma suma tt)
+                                  (illatio::a64 #x1e202800 sumb sumb tt)))))
+          (list (illatio::a64 #x1e202800 tt suma sumb)
+                (illatio::a64 #x1e200800 tt dd tt)
+                (illatio::a64 #x1e202800 sum sum tt)))))
+      (illatio::word (illatio::a64 #x1e2a1000 tt))                  ; 0.25
+      (illatio::word (illatio::a64 #x1e200800 sum tt sum)))))
+
+;;; Q2K-ROW-DOT's arithmetic: per block, SUM += (-y.d * dmin) * (the mins
+;;; against the activations' 16-sums), then SUM += (y.d * d) * (each
+;;; 16-weight group's SDOT times its scale, summed).
+(define-vop (illatio::%q2k-dot)
+  (:translate illatio::%q2k-dot)
+  (:policy :fast-safe)
+  (:args (desc :scs (sap-reg) :target pd) (nb :scs (unsigned-reg) :target count))
+  (:arg-types system-area-pointer unsigned-num)
+  (:results (sum :scs (single-reg)))
+  (:result-types single-float)
+  (:temporary (:sc unsigned-reg) pw) (:temporary (:sc unsigned-reg) pyq)
+  (:temporary (:sc unsigned-reg) pyd) (:temporary (:sc unsigned-reg) pbs)
+  (:temporary (:sc unsigned-reg :from (:argument 0)) pd)
+  (:temporary (:sc unsigned-reg :from (:argument 1)) count)
+  (:temporary (:sc double-reg) sc) (:temporary (:sc double-reg) qa0)
+  (:temporary (:sc double-reg) qa1) (:temporary (:sc double-reg) qb0)
+  (:temporary (:sc double-reg) qb1) (:temporary (:sc double-reg) m3)
+  (:temporary (:sc double-reg) m4) (:temporary (:sc double-reg) w0)
+  (:temporary (:sc double-reg) w1) (:temporary (:sc double-reg) s0)
+  (:temporary (:sc double-reg) s1) (:temporary (:sc double-reg) s2)
+  (:temporary (:sc double-reg) s3) (:temporary (:sc double-reg) v)
+  (:temporary (:sc double-reg) yv) (:temporary (:sc double-reg) tq)
+  (:temporary (:sc double-reg) acc) (:temporary (:sc double-reg) dh)
+  (:temporary (:sc double-reg) dmh) (:temporary (:sc double-reg) ydb)
+  (:temporary (:sc double-reg) tt)
+  (:generator 200
+    (move pd desc) (move count nb)
+    (illatio::with-a64 (pw pyq pyd pbs pd count sum sc qa0 qa1 qb0 qb1 m3 m4 w0 w1 s0 s1 s2 s3
+                        v yv tq acc dh dmh ydb tt)
+      (loop for r in (list pw pyq pyd pbs) for k from 0
+            do (illatio::word (illatio::a64 (logior #xf9400000 (ash k 10)) r pd)))
+      (illatio::word (illatio::a64 #x2f00e400 sum))
+      (illatio::word (illatio::a64 #x4f00e460 m3))                  ; 0x03
+      (illatio::word (illatio::a64 #x4f00e5e0 m4))                  ; 0x0f
+      (flet ((widen4 (src)
+               ;; 16 bytes of SRC as four int32x4 in s0..s3 (w0, w1 the halves)
+               (list (illatio::a64 #x2f08a400 w0 src) (illatio::a64 #x6f08a400 w1 src)
+                     (illatio::a64 #x2f10a400 s0 w0) (illatio::a64 #x6f10a400 s1 w0)
+                     (illatio::a64 #x2f10a400 s2 w1) (illatio::a64 #x6f10a400 s3 w1))))
+        (illatio::loop-while-count
+         count
+         (append
+          (list (illatio::a64 #x3cc10400 sc pw)                          ; 16 scale/min bytes
+                (illatio::a64-ldp-q qa0 qa1 pw) (illatio::a64-ldp-q qb0 qb1 pw)
+                (illatio::a64 #x7c402400 dh pw) (illatio::a64 #x1ee24000 dh dh)
+                (illatio::a64 #x7c402400 dmh pw) (illatio::a64 #x1ee24000 dmh dmh)
+                (illatio::a64 #xbc404400 ydb pyd)
+                (illatio::a64 #x1e200800 dh ydb dh)                      ; d = y.d * d
+                (illatio::a64 #x1e214000 tt ydb)
+                (illatio::a64 #x1e200800 dmh tt dmh)                     ; dmin = -y.d * dmin
+                (illatio::a64 #x6f0c0400 v sc))                          ; the mins
+          (widen4 v)
+          (list (illatio::a64-ldp-q yv tq pbs)
+                (illatio::a64 #x4ea09c00 acc s0 yv) (illatio::a64 #x4ea09400 acc s1 tq)
+                (illatio::a64-ldp-q yv tq pbs)
+                (illatio::a64 #x4ea09400 acc s2 yv) (illatio::a64 #x4ea09400 acc s3 tq)
+                (illatio::a64 #x4eb1b800 acc acc) (illatio::a64 #x5e21d800 acc acc)
+                (illatio::a64 #x1e200800 tt dmh acc)
+                (illatio::a64 #x1e202800 sum sum tt)                     ; sum += dmin * mins
+                (illatio::a64 #x4e201c00 v sc m4))                       ; the scales
+          (widen4 v)
+          (list (illatio::a64 #x6f00e400 acc))
+          (loop for h below 2
+                append (loop for k below 4
+                             append (loop for half below 2
+                                          for q = (if (zerop h) (if (zerop half) qa0 qa1) (if (zerop half) qb0 qb1))
+                                          for g = (+ (* h 8) (* 2 k) half)
+                                          append (append
+                                                  (if (zerop k)
+                                                      (list (illatio::a64 #x4e201c00 v q m3))
+                                                      (list (illatio::a64 (ecase k (1 #x6f0e0400) (2 #x6f0c0400) (3 #x6f0a0400)) v q)
+                                                            (illatio::a64 #x4e201c00 v v m3)))
+                                                  (list (illatio::a64 #x3cc10400 yv pyq)
+                                                        (illatio::a64 #x6f00e400 tq)
+                                                        (illatio::a64 #x4e809400 tq v yv)
+                                                        (illatio::a64-mla-lane acc tq (nth (floor g 4) (list s0 s1 s2 s3)) (mod g 4)))))))
+          (list (illatio::a64 #x4eb1b800 acc acc) (illatio::a64 #x5e21d800 acc acc)
+                (illatio::a64 #x1e200800 tt dh acc)
+                (illatio::a64 #x1e202800 sum sum tt))))))))
 
 (define-vop (illatio::%f32-axpy4)
   (:translate illatio::%f32-axpy4)

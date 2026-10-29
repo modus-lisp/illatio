@@ -228,3 +228,55 @@
                 (setf (aref out (+ (* b 256) (* h 128) (* k 32) (* half 16) l))
                       (- (* dl (float (ldb (byte 2 (* 2 k)) (aref w (+ bo 16 (* h 32) (* half 16) l))) 1f0))
                          ml))))))))))
+
+;;; --- NEON (SBCL on arm64): %IQ2XXS-DOT and %Q2K-DOT (neon-sbcl.lisp) ----------------
+;;; Each gives its portable twin's bits: the same integers, the floats in the
+;;; same order.  DESC is the caller's (a thread's), filled per row, so a row
+;;; costs no allocation.
+
+(defvar *iq2xxs-signed* nil
+  "Row G*128+S: grid entry G's eight weights with sign pattern S applied,
+   int8 (256 KB, outside the heap so its address holds).")
+
+(defun iq2xxs-signed ()
+  (or *iq2xxs-signed*
+      (setf *iq2xxs-signed*
+            (let ((v (make-u8vec (* 256 128 8) :static t)))
+              (dotimes (g 256 v)
+                (dotimes (s 128)
+                  (dotimes (j 8)
+                    (setf (aref v (+ (* (+ (* g 128) s) 8) j))
+                          (ldb (byte 8 0) (* (aref +iq2xxs-grid-bytes+ (+ (* g 8) j))
+                                             (aref +iq2xxs-signs+ (+ (* s 8) j))))))))))))
+
+(defun make-row-desc () (make-array 4 :element-type '(unsigned-byte 64)))
+
+(defun iq2xxs-row-dot* (desc w off nb xv xo)
+  "IQ2XXS-ROW-DOT, by NEON when it can run here."
+  #+(and sbcl arm64)
+  (when (neon-active-p)
+    (let ((tab (iq2xxs-signed)) (qs (q8kvec-qs xv)) (yd (q8kvec-d xv)))
+      (declare (type (simple-array (unsigned-byte 64) (4)) desc))
+      (return-from iq2xxs-row-dot*
+        (sb-sys:with-pinned-objects (w tab qs yd desc)
+          (setf (aref desc 0) (+ (sb-sys:sap-int (sb-sys:vector-sap w)) off)
+                (aref desc 1) (sb-sys:sap-int (sb-sys:vector-sap tab))
+                (aref desc 2) (+ (sb-sys:sap-int (sb-sys:vector-sap qs)) xo)
+                (aref desc 3) (+ (sb-sys:sap-int (sb-sys:vector-sap yd)) (* 4 (floor xo +qk-k+))))
+          (%iq2xxs-dot (sb-sys:vector-sap desc) nb)))))
+  (progn desc (iq2xxs-row-dot w off nb xv xo)))
+
+(defun q2k-row-dot* (desc w off nb xv xo)
+  "Q2K-ROW-DOT, by NEON when it can run here."
+  #+(and sbcl arm64)
+  (when (neon-active-p)
+    (let ((qs (q8kvec-qs xv)) (yd (q8kvec-d xv)) (bs (q8kvec-bsums xv)))
+      (declare (type (simple-array (unsigned-byte 64) (4)) desc))
+      (return-from q2k-row-dot*
+        (sb-sys:with-pinned-objects (w qs yd bs desc)
+          (setf (aref desc 0) (+ (sb-sys:sap-int (sb-sys:vector-sap w)) off)
+                (aref desc 1) (+ (sb-sys:sap-int (sb-sys:vector-sap qs)) xo)
+                (aref desc 2) (+ (sb-sys:sap-int (sb-sys:vector-sap yd)) (* 4 (floor xo +qk-k+)))
+                (aref desc 3) (+ (sb-sys:sap-int (sb-sys:vector-sap bs)) (* 4 (floor xo 16))))
+          (%q2k-dot (sb-sys:vector-sap desc) nb)))))
+  (progn desc (q2k-row-dot w off nb xv xo)))

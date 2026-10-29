@@ -33,7 +33,7 @@
                             (if (eq type :iq2_xxs) "IQ2_XXS" "Q2_K") (princ-to-string ncols)
                             (princ-to-string row0) (princ-to-string nrows) out) :output nil)
     (let ((ref (read-floats out (* nrows ncols))) (row (f32vec ncols))
-          (x (f32vec ncols)) (xv (make-q8kvec ncols)) (worst-deq 0f0) (worst-rel 0d0)
+          (x (f32vec ncols)) (xv (make-q8kvec ncols)) (worst-deq 0f0) (worst-rel 0d0) (neon-diff 0)
           (state (sb-ext:seed-random-state 7)))
       (dotimes (i ncols) (setf (aref x i) (- (random 2f0 state) 1f0)))
       (quantize-q8k! x xv)
@@ -50,11 +50,15 @@
             (let ((l1 (loop for i below ncols
                             sum (abs (* (coerce (aref ref (+ (* r ncols) i)) 'double-float)
                                         (aref (q8kvec-d xv) (floor i 256)) (i8-ref (q8kvec-qs xv) i))))))
-              (setf worst-rel (max worst-rel (/ (abs (- k exact)) l1)))))))
+              (setf worst-rel (max worst-rel (/ (abs (- k exact)) l1)))
+            ;; the NEON kernel gives the portable one's bits
+            (let ((n (if (eq type :iq2_xxs) (iq2xxs-row-dot* (make-row-desc) *w* ro (floor ncols 256) xv 0)
+                         (q2k-row-dot* (make-row-desc) *w* ro (floor ncols 256) xv 0))))
+              (unless (eql n k) (incf neon-diff)))))))
       (delete-file out)
-      (format t "~&~A rows ~D..~D: dequant vs ggml max |diff| ~G; kernel vs exact, max |diff|/sum|terms| ~,2E~%"
-              name row0 (+ row0 nrows -1) worst-deq worst-rel)
-      (unless (and (zerop worst-deq) (< worst-rel 1d-6)) (incf *failures*)))))
+      (format t "~&~A rows ~D..~D: dequant vs ggml max |diff| ~G; kernel vs exact, max |diff|/sum|terms| ~,2E; NEON /= portable on ~D rows~%"
+              name row0 (+ row0 nrows -1) worst-deq worst-rel neon-diff)
+      (unless (and (zerop worst-deq) (< worst-rel 1d-6) (zerop neon-diff)) (incf *failures*)))))
 (check "blk.3.ffn_gate_exps.weight" :iq2_xxs (* 117 2048) 64)
 (check "blk.40.ffn_up_exps.weight" :iq2_xxs (* 3 2048) 64)
 (check "blk.3.ffn_down_exps.weight" :q2_k (* 117 4096) 64)
