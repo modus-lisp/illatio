@@ -198,7 +198,8 @@
                 (setf (gethash name table) (list total (floor bytes rows) rows (first dims)))
                 (push (list total (+ (gguf-data-offset g) (tensor-info-offset ti)) bytes) jobs)
                 (incf total (* 64 (ceiling bytes 64))))))
-          (let ((buf (gpu-buffer (d4gpu-gpu st) total)) (fd (ds4f-fd m)) (jobs (coerce jobs 'simple-vector)))
+          (let ((buf (lock-buffer (gpu-buffer (d4gpu-gpu st) total) "Q8_0 weights")) (fd (ds4f-fd m))
+                (jobs (coerce jobs 'simple-vector)))
             (parallel-for (k (length jobs) (ds4f-pool m))
               (destructuring-bind (at off bytes) (svref jobs k)
                 (pread-into fd (sb-sys:sap+ (gbuf-sap buf) at) off bytes)))
@@ -319,14 +320,26 @@
     (ash v -30)))
 
 (defvar *ds4f-expert-cache-gb* nil
-  "The decode expert cache's size, in GB (an expert is about 7 MB); NIL:
-   what the rest of the model leaves of this machine's memory (24 GB of 48;
-   no more than 28, one Metal buffer).")
+  "The expert pool's size, in GB (an expert is about 7 MB); NIL: what the
+   rest of the model leaves of this machine's memory (27 GB of 48; no more
+   than 28, one Metal buffer).")
 
 (defun expert-cache-gb ()
-  (or *ds4f-expert-cache-gb* (max 4 (min 28 (- (physical-memory-gb) 24)))))
+  ;; the pool takes what prefill's staging buffers had too (3.6 GB)
+  (or *ds4f-expert-cache-gb* (max 4 (min 28 (- (physical-memory-gb) 21)))))
 
-(defstruct (d4xcache (:conc-name dx-)) buf (n 0) slot-of owner used pending (tick 0) (free 0)
+;;; The expert pool: one GPU buffer of expert slots that prefill and decode
+;;; share.  Work in flight comes first, new loads go around it: a slot a
+;;; layer is computing with is PINned and a slot being read is PENDING, and
+;;; neither is given up; demand reads (what the layer at hand needs) go
+;;; ahead of reads ahead (what the next layer will want).  A prefill reads a
+;;; layer's experts into slots of their own (FRESH), and gives them back
+;;; (FREES, taken first) once the layer is done -- but for the ones its last
+;;; tokens chose, which decode will most likely want next -- so a long
+;;; prompt passes through a layer's worth of slots, not the whole pool.
+
+(defstruct (d4xcache (:conc-name dx-)) buf (n 0) slot-of owner used pending pin fresh (frees '())
+  (tick 0) (free 0) (decode-pins '())
   (hits 0) (misses 0) (read-time 0) (prefetched 0) (waited 0))
 
 (defun ds4f-expert-cache (m)
@@ -337,11 +350,24 @@
                (keys (* (ds4f-n-layer m) (ds4f-n-expert m))))
           (setf (getf (d4gpu-plist* st) :xcache)
                 (seed-expert-cache
-                 m (make-d4xcache :buf (gpu-buffer (d4gpu-gpu st) (* n sb)) :n n
+                 m (make-d4xcache :buf (lock-buffer (gpu-buffer (d4gpu-gpu st) (* n sb)) "expert pool") :n n
                                   :slot-of (make-array keys :element-type 'fixnum :initial-element -1)
                                   :owner (make-array n :element-type 'fixnum :initial-element -1)
                                   :used (make-array n :element-type 'fixnum :initial-element 0)
-                                  :pending (make-array n :element-type 'fixnum :initial-element 0))))))))
+                                  :pending (make-array n :element-type 'fixnum :initial-element 0)
+                                  :pin (make-array n :element-type 'fixnum :initial-element 0)
+                                  :fresh (make-array n :element-type 'bit :initial-element 0))))))))
+
+(defvar *ds4f-lock-memory* t
+  "Whether the expert pool and the GPU's weights are locked in memory
+   (mlock), as ds4 locks its resident weights: a command buffer makes every
+   buffer it uses resident, and a pool the system had compressed in part
+   (most of it is cold while a prefill runs) would be decompressed each time.")
+
+(defun lock-buffer (b what)
+  (when (and *ds4f-lock-memory* (not (gpu-mlock b)))
+    (warn "illatio: could not lock the ~A (~,1F GB) in memory" what (/ (gbuf-bytes b) 1d9)))
+  b)
 
 (defvar *ds4f-seed-experts* t
   "Whether the decode expert cache starts with ds4's most used experts.")
@@ -403,8 +429,20 @@
 ;;; only a read: the routing is the layer's own.
 
 (defstruct (d4reader (:conc-name dr-))
-  (mutex (sb-thread:make-mutex :name "illatio reads ahead")) (cv (sb-thread:make-waitqueue))
-  (jobs '()) (tail '()) threads)
+  (mutex (sb-thread:make-mutex :name "illatio expert reads")) (cv (sb-thread:make-waitqueue))
+  (urgent '()) (urgent-tail '()) (ahead '()) (ahead-tail '()) threads)
+
+(defun enqueue-reads (r jobs urgent)
+  "JOBS ((src dst bytes slot)...) onto R's urgent queue (demand) or its
+   queue ahead; a reader takes an urgent job before any other."
+  (when jobs
+    (sb-thread:with-mutex ((dr-mutex r))
+      (if urgent
+          (progn (if (dr-urgent-tail r) (setf (cdr (dr-urgent-tail r)) jobs) (setf (dr-urgent r) jobs))
+                 (setf (dr-urgent-tail r) (last jobs)))
+          (progn (if (dr-ahead-tail r) (setf (cdr (dr-ahead-tail r)) jobs) (setf (dr-ahead r) jobs))
+                 (setf (dr-ahead-tail r) (last jobs))))
+      (sb-thread:condition-broadcast (dr-cv r)))))
 
 (defun ds4f-reader (m xc)
   "XC's reading-ahead threads (started the first time)."
@@ -419,93 +457,143 @@
                                  (loop
                                    (let ((job nil))
                                      (sb-thread:with-mutex ((dr-mutex r))
-                                       (loop until (dr-jobs r) do (sb-thread:condition-wait (dr-cv r) (dr-mutex r)))
-                                       (setf job (pop (dr-jobs r)))
-                                       (unless (dr-jobs r) (setf (dr-tail r) '())))
+                                       (loop until (or (dr-urgent r) (dr-ahead r))
+                                             do (sb-thread:condition-wait (dr-cv r) (dr-mutex r)))
+                                       (if (dr-urgent r)
+                                           (progn (setf job (pop (dr-urgent r)))
+                                                  (unless (dr-urgent r) (setf (dr-urgent-tail r) '())))
+                                           (progn (setf job (pop (dr-ahead r)))
+                                                  (unless (dr-ahead r) (setf (dr-ahead-tail r) '())))))
                                      (destructuring-bind (src dst bytes slot) job
                                        (pread-into fd (sb-sys:sap+ base dst) src bytes)
                                        (sb-thread:with-mutex ((dr-mutex r))
                                          (when (zerop (decf (aref pending slot)))
                                            (sb-thread:condition-broadcast (dr-cv r))))))))
-                               :name "illatio expert read ahead")))
+                               :name "illatio expert reads")))
           (setf (getf (d4gpu-plist* st) :reader) r)))))
 
 (defun cache-victim (xc)
-  "A slot for a new expert: a free one, else the least recently used that
-   isn't being read."
-  (if (< (dx-free xc) (dx-n xc))
-      (prog1 (dx-free xc) (incf (dx-free xc)))
-      (let ((used (dx-used xc)) (pending (dx-pending xc)) (best -1) (bu most-positive-fixnum))
-        (declare (type (simple-array fixnum (*)) used pending) (type fixnum best bu))
-        (dotimes (j (dx-n xc) best)
-          (when (and (< (aref used j) bu) (zerop (aref pending j))) (setf best j bu (aref used j)))))))
+  "A slot for a new expert: one given back, else one never used, else the
+   least recently used that no work holds (pinned) or is reading."
+  (cond ((dx-frees xc) (pop (dx-frees xc)))
+        ((< (dx-free xc) (dx-n xc)) (prog1 (dx-free xc) (incf (dx-free xc))))
+        (t (let ((used (dx-used xc)) (pending (dx-pending xc)) (pin (dx-pin xc))
+                 (best -1) (bu most-positive-fixnum))
+             (declare (type (simple-array fixnum (*)) used pending pin) (type fixnum best bu))
+             (dotimes (j (dx-n xc))
+               (when (and (< (aref used j) bu) (zerop (aref pending j)) (zerop (aref pin j)))
+                 (setf best j bu (aref used j))))
+             (assert (>= best 0) () "every expert slot is held by work in flight")
+             best))))
 
 (defun cache-claim (xc key tick)
   "A slot of XC for KEY, its old expert forgotten."
   (let ((s (cache-victim xc)) (owner (dx-owner xc)) (slot-of (dx-slot-of xc)))
     (declare (type (simple-array fixnum (*)) owner slot-of))
     (when (>= (aref owner s) 0) (setf (aref slot-of (aref owner s)) -1))
-    (setf (aref owner s) key (aref slot-of key) s (aref (dx-used xc) s) tick)
+    (setf (aref owner s) key (aref slot-of key) s (aref (dx-used xc) s) tick (aref (dx-fresh xc) s) 0)
     s))
 
+(defun cache-release (xc s)
+  "Give slot S back: its expert forgotten, the slot first to be taken."
+  (let ((owner (dx-owner xc)))
+    (declare (type (simple-array fixnum (*)) owner))
+    (when (>= (aref owner s) 0) (setf (aref (dx-slot-of xc) (aref owner s)) -1))
+    (setf (aref owner s) -1 (aref (dx-used xc) s) 0 (aref (dx-fresh xc) s) 0)
+    (push s (dx-frees xc))))
+
+(defun cache-read (m xc li slots experts urgent)
+  "Start reading layer LI's EXPERTS into SLOTS (claimed), urgent or ahead."
+  (let* ((r (ds4f-reader m xc)) (sb (d4gpu-slot-bytes (ds4f-gpu-state m))) (l (svref (ds4f-layers m) li))
+         (jobs '()))
+    (loop for s in slots for e in experts
+          do (let ((pieces (expert-pieces m l (list e) (list (* s sb)))))
+               (sb-thread:with-mutex ((dr-mutex r)) (setf (aref (dx-pending xc) s) (length pieces)))
+               (dolist (p pieces) (push (append p (list s)) jobs))))
+    (enqueue-reads r (nreverse jobs) urgent)))
+
+(defun cache-wait (m xc slots)
+  "Wait until none of SLOTS is being read."
+  (let ((pending (dx-pending xc)))
+    (declare (type (simple-array fixnum (*)) pending))
+    (when (some (lambda (s) (plusp (aref pending s))) slots)
+      (let ((r (ds4f-reader m xc)))
+        (incf (dx-waited xc))
+        (sb-thread:with-mutex ((dr-mutex r))
+          (loop while (some (lambda (s) (plusp (aref pending s))) slots)
+                do (sb-thread:condition-wait (dr-cv r) (dr-mutex r))))))))
+
 (defun cache-experts (m l li sel)
-  "The cache slots of layer LI's experts SEL: the missing ones read in, the
-   ones being read ahead waited for."
+  "The cache slots of layer LI's experts SEL for decode: the missing ones
+   read in (urgently: ahead of any read ahead), the ones being read waited
+   for; pinned until the next layer's lookup (their layer runs between)."
+  (declare (ignore l))
   (let* ((xc (ds4f-expert-cache m)) (ne (ds4f-n-expert m)) (k (length sel))
-         (slots (make-array k :element-type 'fixnum)) (missing '()) (waits '())
-         (slot-of (dx-slot-of xc)) (used (dx-used xc)) (pending (dx-pending xc))
+         (slots (make-array k :element-type 'fixnum)) (miss-slots '()) (miss-experts '())
+         (slot-of (dx-slot-of xc)) (used (dx-used xc)) (pin (dx-pin xc))
          (tick (incf (dx-tick xc))))
-    (declare (type (simple-array fixnum (*)) slot-of used pending))
+    (declare (type (simple-array fixnum (*)) slot-of used pin))
+    (dolist (s (dx-decode-pins xc)) (decf (aref pin s)))
+    (setf (dx-decode-pins xc) '())
     (dotimes (i k)
       (let ((s (aref slot-of (+ (* li ne) (aref sel i)))))
-        (if (>= s 0)
-            (progn (setf (aref used s) tick (aref slots i) s) (incf (dx-hits xc))
-                   (when (plusp (aref pending s)) (push s waits)))
-            (setf (aref slots i) -1))))
-    (dotimes (i k)
-      (when (minusp (aref slots i))
-        (let ((s (cache-claim xc (+ (* li ne) (aref sel i)) tick)))
-          (setf (aref slots i) s)
-          (push (cons (aref sel i) s) missing)
-          (incf (dx-misses xc)))))
+        (cond ((>= s 0) (setf (aref used s) tick (aref slots i) s) (incf (dx-hits xc)))
+              (t (let ((s (cache-claim xc (+ (* li ne) (aref sel i)) tick)))
+                   (setf (aref slots i) s)
+                   (push s miss-slots) (push (aref sel i) miss-experts)
+                   (incf (dx-misses xc)))))
+        (incf (aref pin (aref slots i))) (push (aref slots i) (dx-decode-pins xc))))
     (let ((t0 (get-internal-real-time)))
-      (when missing
-        (read-experts-pieces m l (mapcar #'car missing)
-                             (mapcar (lambda (x) (* (cdr x) (d4gpu-slot-bytes (ds4f-gpu-state m)))) missing)
-                             (dx-buf xc)))
-      (when waits
-        (let ((r (ds4f-reader m xc)))
-          (incf (dx-waited xc) (length waits))
-          (sb-thread:with-mutex ((dr-mutex r))
-            (loop while (some (lambda (s) (plusp (aref pending s))) waits)
-                  do (sb-thread:condition-wait (dr-cv r) (dr-mutex r))))))
+      (cache-read m xc li miss-slots miss-experts t)
+      (cache-wait m xc (coerce slots 'list))
       (incf (dx-read-time xc) (- (get-internal-real-time) t0)))
     slots))
 
 (defun prefetch-cache-experts (m li experts)
-  "Start reading layer LI's EXPERTS that XC lacks, on the reading-ahead
-   threads."
-  (let* ((xc (ds4f-expert-cache m)) (ne (ds4f-n-expert m)) (r (ds4f-reader m xc))
-         (sb (d4gpu-slot-bytes (ds4f-gpu-state m))) (slot-of (dx-slot-of xc))
-         (pending (dx-pending xc)) (tick (dx-tick xc)) (jobs '()))
-    (declare (type (simple-array fixnum (*)) slot-of pending))
+  "Start reading layer LI's EXPERTS the pool lacks, ahead (behind any demand)."
+  (let* ((xc (ds4f-expert-cache m)) (ne (ds4f-n-expert m)) (slot-of (dx-slot-of xc))
+         (tick (dx-tick xc)) (slots '()) (missing '()))
+    (declare (type (simple-array fixnum (*)) slot-of))
     (dolist (e experts)
       (let ((key (+ (* li ne) e)))
         (if (>= (aref slot-of key) 0)
             (setf (aref (dx-used xc) (aref slot-of key)) tick)
-            (let* ((s (cache-claim xc key tick))
-                   (pieces (expert-pieces m (svref (ds4f-layers m) li) (list e) (list (* s sb)))))
-              (incf (dx-prefetched xc))
-              (sb-thread:with-mutex ((dr-mutex r)) (setf (aref pending s) (length pieces)))
-              (dolist (p pieces) (push (append p (list s)) jobs))))))
-    (when jobs
-      (let ((new (nreverse jobs)))
-        (sb-thread:with-mutex ((dr-mutex r))
-          (if (dr-tail r)
-              (setf (cdr (dr-tail r)) new)
-              (setf (dr-jobs r) new))
-          (setf (dr-tail r) (last new))
-          (sb-thread:condition-broadcast (dr-cv r)))))))
+            (progn (push (cache-claim xc key tick) slots) (push e missing) (incf (dx-prefetched xc))))))
+    (cache-read m xc li (nreverse slots) (nreverse missing) nil)))
+
+;;; --- prefill's side of the pool ------------------------------------------------------
+
+(defun pool-take-layer (m li experts urgent)
+  "Slots for layer LI's EXPERTS for a prefill, pinned: the resident ones as
+   they are, the others claimed (fresh) and their reads started.  A vector
+   of the slots, by position in EXPERTS."
+  (let* ((xc (ds4f-expert-cache m)) (ne (ds4f-n-expert m)) (slot-of (dx-slot-of xc)) (pin (dx-pin xc))
+         (tick (dx-tick xc)) (out (make-array (length experts) :element-type 'fixnum))
+         (rs '()) (re '()))
+    (declare (type (simple-array fixnum (*)) slot-of pin))
+    (loop for e in experts for i from 0
+          do (let ((s (aref slot-of (+ (* li ne) e))))
+               (when (minusp s)
+                 (setf s (cache-claim xc (+ (* li ne) e) tick))
+                 (setf (aref (dx-fresh xc) s) 1)
+                 (push s rs) (push e re))
+               (incf (aref pin s))
+               (setf (aref out i) s)))
+    (cache-read m xc li (nreverse rs) (nreverse re) urgent)
+    out))
+
+(defun pool-done-layer (m slots keep)
+  "A prefill's layer done with SLOTS: unpinned; the fresh ones given back
+   but for those holding experts KEEP says to (the chunk's last tokens'),
+   which stay as recently used."
+  (let* ((xc (ds4f-expert-cache m)) (pin (dx-pin xc)) (tick (incf (dx-tick xc))))
+    (declare (type (simple-array fixnum (*)) pin))
+    ;; a slot read ahead for an expert no token chose may be reading yet: never given back mid-read
+    (cache-wait m xc (coerce slots 'list))
+    (loop for s across slots
+          do (decf (aref pin s))
+             (cond ((funcall keep s) (setf (aref (dx-used xc) s) tick (aref (dx-fresh xc) s) 0))
+                   ((and (= 1 (aref (dx-fresh xc) s)) (zerop (aref pin s))) (cache-release xc s))))))
 
 (defun predict-experts (m li x token k)
   "A guess at layer LI's experts for the token whose previous layer's FFN

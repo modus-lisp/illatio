@@ -141,6 +141,14 @@
       (let ((sap (msg ptr obj "contents")))
         (%make-gbuf :obj obj :sap sap :bytes bytes)))))
 
+(defun gpu-mlock (b)
+  "Lock buffer B's pages in memory (mlock): the system neither compresses nor
+   pages them out, so a command buffer using B doesn't wait on making it
+   resident.  Whether it could."
+  (zerop (sb-alien:alien-funcall
+          (sb-alien:extern-alien "mlock" (function sb-alien:int sb-sys:system-area-pointer sb-alien:unsigned-long))
+          (gbuf-sap b) (gbuf-bytes b))))
+
 (defun gpu-free (b)
   "Give back buffer B (GPU-BUFFER's or GPU-WRAP's; a wrapped one's memory
    stays its owner's)."

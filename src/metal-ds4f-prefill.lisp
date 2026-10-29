@@ -9,8 +9,11 @@
 ;;; context carries, which is then brought up to date -- the indexer's top
 ;;; 512 per token, D4_ATTEND, the output products, HC post), then the FFN's
 ;;; HC pre, norm, router logits and shared expert.  The second: the routed
-;;; experts (each expert once, on the tokens that chose it, its weights read
-;;; ahead into the staging buffer), each token's sum in slot order, HC post.
+;;; experts (each expert once, on the tokens that chose it, from its slot in
+;;; the expert pool), each token's sum in slot order, HC post.  A long chunk
+;;; takes slots for all of a layer's experts as the layer starts, reading the
+;;; missing ones while its attention runs; the layer done, the slots go back
+;;; but for the experts the prompt's last tokens chose, kept for decode.
 ;;; The F16 weights (the compressors', the indexer's, the router's, HC's) are
 ;;; the file's, in a GPU buffer of their own: D4_MM_F16 takes them as they are.
 
@@ -36,7 +39,8 @@
                     (setf (gethash name table) (list total (floor bytes rows) rows (first dims)))
                     (push (list total (+ (gguf-data-offset g) (tensor-info-offset ti)) bytes) jobs)
                     (incf total (* 64 (ceiling bytes 64))))))))
-          (let ((buf (gpu-buffer (d4gpu-gpu st) total)) (fd (ds4f-fd m)) (jobs (coerce jobs 'simple-vector)))
+          (let ((buf (lock-buffer (gpu-buffer (d4gpu-gpu st) total) "F16 weights")) (fd (ds4f-fd m))
+                (jobs (coerce jobs 'simple-vector)))
             (parallel-for (k (length jobs) (ds4f-pool m))
               (destructuring-bind (at off bytes) (svref jobs k)
                 (pread-into fd (sb-sys:sap+ (gbuf-sap buf) at) off bytes)))
@@ -207,10 +211,13 @@
     (dispatch gpu e "d4_swiglu_w" (list n ff (svref (ds4f-clamps m) li)) (list sg su ones smid) (ceiling (* n ff) 256) 256)
     (enc-q8mm m gpu e li "ffn_down_shexp.weight" smid sout n)))
 
-(defun enc-ffn-tail-chunk (m gpu e st l li n ev users ws sels sb sa preloaded parity)
-  "The chunk's routed experts, each once on the tokens that chose it, their
-   sums in slot order with the shared expert, and HC post: SB into SA."
-  (declare (ignore sels))
+(defparameter *ds4f-keep-tail* 16
+  "A prompt's last this many tokens' experts stay in the pool after its prefill.")
+
+(defun enc-ffn-tail-chunk (m gpu e st l li n ev users ws slots sb sa)
+  "The chunk's routed experts (pool SLOTS, by position in EV), each once on
+   the tokens that chose it, their sums in slot order with the shared
+   expert, and HC post: SB into SA."
   (let* ((d (ds4f-d m)) (ff (ds4f-ff-exp m)) (nu (ds4f-n-used m)) (ne (length ev))
          (clamp (svref (ds4f-clamps m) li))
          (counts (map 'vector #'length users))
@@ -219,7 +226,7 @@
          (rmap (pbuf st :p-rmap rows)) (smap (pbuf st :p-smap (* n nu))) (wv (pbuf st :p-wrow rows))
          (x (pbuf st :p-x (* rows d))) (g (pbuf st :p-g (* rows ff))) (u (pbuf st :p-u (* rows ff)))
          (mid (pbuf st :p-mid (* rows ff))) (down (pbuf st :p-down (* rows d))) (moe (pbuf st :p-moe (* n d)))
-         (stage (stage-buffer st parity)) (sbytes (d4gpu-slot-bytes st)) (gb (d4gpu-gate-bytes st))
+         (stage (dx-buf (ds4f-expert-cache m))) (sbytes (d4gpu-slot-bytes st)) (gb (d4gpu-gate-bytes st))
          (grb (second (dl-gate-exps l))) (grows (third (dl-gate-exps l)))
          (drb (second (dl-down-exps l))) (drows (third (dl-down-exps l))))
     ;; the row each (expert, user) takes, and back from each (token, slot)
@@ -229,17 +236,14 @@
                  (setf (sb-sys:sap-ref-32 (gbuf-sap rmap) (* 4 r)) tk
                        (sb-sys:sap-ref-32 (gbuf-sap smap) (* 4 (+ (* tk nu) slot))) r
                        (sb-sys:sap-ref-single (gbuf-sap wv) (* 4 r)) (aref (svref ws tk) slot)))))
-    ;; the experts not read ahead, into their slots now
-    (unless preloaded
-      (read-experts-pieces m l (coerce ev 'list) (loop for k below ne collect (* k sbytes)) stage))
     (dispatch gpu e "d4_gather_rows" (list d rows) (list (pbuf st :p-norm2 (* n d)) rmap x) (ceiling (* rows d) 256) 256)
     (dotimes (k ne)
-      (let ((nt (aref counts k)) (b (aref bases k)) (s0 (* (if preloaded (svref ev k) k) sbytes)))
+      (let ((nt (aref counts k)) (b (aref bases k)) (s0 (* (aref slots k) sbytes)))
         (enc-mm gpu e "d4_mm_iq2_xxs" stage s0 grb grows d x g nt :xoff (* 4 b d) :yoff (* 4 b ff))
         (enc-mm gpu e "d4_mm_iq2_xxs" stage (+ s0 gb) grb grows d x u nt :xoff (* 4 b d) :yoff (* 4 b ff))))
     (dispatch gpu e "d4_swiglu_w" (list rows ff clamp) (list g u wv mid) (ceiling (* rows ff) 256) 256)
     (dotimes (k ne)
-      (let ((nt (aref counts k)) (b (aref bases k)) (s0 (* (if preloaded (svref ev k) k) sbytes)))
+      (let ((nt (aref counts k)) (b (aref bases k)) (s0 (* (aref slots k) sbytes)))
         (enc-mm gpu e "d4_mm_q2_k" stage (+ s0 (* 2 gb)) drb drows ff mid down nt :xoff (* 4 b ff) :yoff (* 4 b d))))
     (dispatch gpu e "d4_moe_sum_rows" (list d nu n) (list down smap (pbuf st :p-sout (* n d)) moe)
               (ceiling (* n d) 256) 256)
@@ -262,7 +266,8 @@
               (dotimes (h n-hc) (setf (sb-sys:sap-ref-single sap (* 4 (+ (* tk hcd) (* h d) j))) v)))))))
     (dotimes (li (ds4f-n-layer m))
       (let* ((l (svref (ds4f-layers m) li)) (c (svref (d4ctx-caches ctx) li))
-             (reading (and (>= n *ds4f-read-all-from*) (read-layer-experts m l (mod li 2)))))
+             ;; a long chunk wants nearly all of a layer's experts: slots for them all, read under the attention
+             (all (and (>= n *ds4f-read-all-from*) (pool-take-layer m li (loop for k below ne collect k) nil))))
         (with-gpu-work (e gpu)
           (enc-attention-chunk m gpu e st l li c pos0 n sa sb)
           (enc-ffn-head-chunk m gpu e st l li n sb))
@@ -277,10 +282,18 @@
               (dotimes (slot nu) (push (cons tk slot) (gethash (aref sel slot) groups)))))
           (let* ((experts (sort (loop for k being the hash-keys of groups collect k) #'<))
                  (users (map 'simple-vector (lambda (k) (coerce (reverse (gethash k groups)) 'simple-vector)) experts))
-                 (ev (coerce experts 'simple-vector)))
-            (mapc #'sb-thread:join-thread reading)
+                 (ev (coerce experts 'simple-vector)) (xc (ds4f-expert-cache m))
+                 (taken (or all (pool-take-layer m li experts t)))
+                 (slots (if all (map '(vector fixnum) (lambda (k) (aref all k)) ev) taken))
+                 (tail (and logits (let ((h (make-hash-table)))
+                                     (loop for tk from (max 0 (- n *ds4f-keep-tail*)) below n
+                                           do (loop for x across (svref sels tk) do (setf (gethash x h) t)))
+                                     h))))
+            (cache-wait m xc (coerce slots 'list))
             (with-gpu-work (e gpu)
-              (enc-ffn-tail-chunk m gpu e st l li n ev users ws sels sb sa (and reading t) (if reading (mod li 2) 0)))))))
+              (enc-ffn-tail-chunk m gpu e st l li n ev users ws slots sb sa))
+            (pool-done-layer m taken
+                             (lambda (s) (and tail (gethash (mod (aref (dx-owner xc) s) ne) tail))))))))
     (incf (d4ctx-pos ctx) n)
     (when logits
       (let ((last (f32vec hcd)))
