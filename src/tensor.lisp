@@ -232,10 +232,14 @@
   (%make-q8vec :quants (make-i8vec n)
                :scales (f32vec (floor n 32))))
 
+(defvar *q8-f16-scale* t
+  "Whether QUANTIZE-Q8! stores each block's scale rounded to F16, as ggml
+   does.  ds4 keeps it a float; its port (ds4f.lisp) binds this to NIL.")
+
 (defun quantize-q8! (x out &optional (xo 0) (n (length x)) (qo 0) (so 0))
   "Quantize X[xo..xo+n) into OUT's quants at QO and scales at SO, as ggml does
-   on ARM: d = amax/127, rounded to fp16 for storage; q = round-half-even(x/d)
-   using the *unrounded* d, as vcvtnq does."
+   on ARM: d = amax/127, rounded to fp16 for storage (unless *Q8-F16-SCALE*
+   is NIL); q = round-half-even(x/d) using the *unrounded* d, as vcvtnq does."
   (declare (type f32vec x) (type fixnum xo n qo so) (optimize speed (safety 0)))
   (let ((q (q8vec-quants out)) (s (q8vec-scales out)))
     (dotimes (b (floor n 32))
@@ -246,7 +250,7 @@
              (d (/ amax 127f0))
              (id (if (zerop d) 0f0 (/ 1f0 d))))
         (declare (type single-float amax d id) (type fixnum base qbase))
-        (setf (aref s (+ so b)) (half-to-single (single-to-half d)))
+        (setf (aref s (+ so b)) (if *q8-f16-scale* (half-to-single (single-to-half d)) d))
         (loop for j of-type fixnum from 0 below 32
               do (setf (aref q (+ qbase j)) (i8-byte (the (signed-byte 8) (round (* (aref x (+ base j)) id))))))))
     out))

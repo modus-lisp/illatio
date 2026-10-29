@@ -680,13 +680,17 @@
 
 ;;; --- a token -----------------------------------------------------------------------
 
+(defvar *ds4f-q8-f16-scale* nil
+  "*Q8-F16-SCALE* in ds4f's passes: NIL, as ds4 keeps Q8_0 activation scales.")
+
 (defun ds4f-forward (ctx token &key (logits t))
   "TOKEN at the next position; the logits, if LOGITS, in the context."
   #+sbcl (sb-int:with-float-traps-masked (:overflow :inexact :underflow) (ds4f-forward-1 ctx token logits))
   #-sbcl (ds4f-forward-1 ctx token logits))
 
 (defun ds4f-forward-1 (ctx token logits)
-  (let* ((m (d4ctx-model ctx)) (d (ds4f-d m)) (n (ds4f-n-hc m)) (pos (d4ctx-pos ctx))
+  (let* ((*q8-f16-scale* *ds4f-q8-f16-scale*)
+         (m (d4ctx-model ctx)) (d (ds4f-d m)) (n (ds4f-n-hc m)) (pos (d4ctx-pos ctx))
          (streams (f32vec (* n d))) (next (f32vec (* n d))) (wf (ds4f-file m)))
     (declare (type u8vec wf))
     (let ((o (+ (ds4f-embd-off m) (* token d 2))))
