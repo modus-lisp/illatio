@@ -56,6 +56,10 @@
    (the routed FFN), :PROJ (the attention and shared expert's Q8_0
    products), :ATTN (attention); T is all of them, NIL none.")
 
+(defparameter *ds4f-read-all-from* 512
+  "From this many tokens a chunk's layer reads all its experts ahead, while
+   its attention runs: nearly all are used.")
+
 (defun ds4f-gpu-p (part)
   (or (eq *ds4f-gpu* t) (and (listp *ds4f-gpu*) (member part *ds4f-gpu*) t)))
 
@@ -742,7 +746,8 @@
     (d4-chunk-q8mm m l li "attn_q_a.weight" (dl-q-a l) norms n qr)
     (dotimes (tk n) (d4-rms! qr qr-norm lq eps (dl-q-a-norm l) (* tk lq) (* tk lq)))
     (d4-chunk-q8mm m l li "attn_q_b.weight" (dl-q-b l) qr-norm n q)
-    (dotimes (u (* n nh)) (d4-rms! q q hd eps nil (* u hd) (* u hd)))
+    (parallel-for (tk n pool)
+      (dotimes (h nh) (let ((u (+ (* tk nh) h))) (d4-rms! q q hd eps nil (* u hd) (* u hd)))))
     (d4-chunk-q8mm m l li "attn_kv.weight" (dl-kv l) norms n kv0)
     ;; the compressors' projections, for the chunk
     (let* ((coff (if (= ratio 4) 2 1)) (cw (* coff hd)) (iw (* coff (ds4f-ix-dim m)))
@@ -886,13 +891,13 @@
     #-sbcl (dolist (j jobs) (apply #'prefetch-file-range j))))
 
 
-(defun d4-route (m l li x token)
+(defun d4-route (m l li x token &optional logits-in)
   "(values experts weights): the hash table's experts in the first layers,
    else the top N-USED of sqrt(softplus(router)) + bias; weights from the
    unbiased probabilities, renormalized and scaled."
   (let* ((ne (ds4f-n-expert m)) (nu (ds4f-n-used m))
          (logits (f32vec ne)) (probs (f32vec ne)) (sel (make-array nu)) (w (f32vec nu)))
-    (f32mv! (ds4f-pool m) (dl-gate-inp l) x logits)
+    (if logits-in (replace logits logits-in) (f32mv! (ds4f-pool m) (dl-gate-inp l) x logits))
     (dotimes (i ne) (setf (aref probs i) (sqrt (d4-softplus (aref logits i)))))
     (if (dl-tid2eid l)
         (dotimes (i nu) (setf (aref sel i) (aref (dl-tid2eid l) (+ (* token nu) i))))
@@ -1060,8 +1065,11 @@
           (let ((v (f16-at wf (+ o (* 2 j)))))
             (dotimes (h n-hc) (setf (aref cur (+ (* tk hcd) (* h d) j)) v))))))
     (dotimes (li (ds4f-n-layer m))
-      (let ((l (svref (ds4f-layers m) li)) (c (svref (d4ctx-caches ctx) li))
-            (streams (f32vec hcd)) (out-s (f32vec hcd)))
+      (let* ((l (svref (ds4f-layers m) li)) (c (svref (d4ctx-caches ctx) li))
+             (streams (f32vec hcd)) (out-s (f32vec hcd))
+             ;; a long chunk uses nearly every expert: read them all now, under the attention
+             (reading (and (ds4f-gpu-p :experts) (>= n *ds4f-read-all-from*)
+                           #+(and sbcl darwin) (read-layer-experts m l (mod li 2)))))
         (d4-attention-chunk m l li c cur next n pos0)
         (rotatef cur next)
         ;; the FFN: route every token, then each expert once
@@ -1070,10 +1078,12 @@
               (groups (make-hash-table)))
           (d4-hc-pre-chunk m (dl-hc-ffn-fn l) (dl-hc-ffn-scale l) (dl-hc-ffn-base l) (dl-ffn-norm l)
                            cur n norms posts combs)
-          (let ((norm (f32vec d)))
+          (let* ((norm (f32vec d)) (ne (ds4f-n-expert m))
+                 (rl (f32mm! pool (dl-gate-inp l) norms n (f32vec (* n ne)))) (row (f32vec ne)))
             (dotimes (tk n)
               (replace norm norms :start2 (* tk d) :end2 (* (1+ tk) d))
-              (multiple-value-bind (sel w) (d4-route m l li norm (svref tokv tk))
+              (replace row rl :start2 (* tk ne) :end2 (* (1+ tk) ne))
+              (multiple-value-bind (sel w) (d4-route m l li norm (svref tokv tk) row)
                 (setf (svref sels tk) sel (svref ws tk) w)
                 (dotimes (slot nu) (push (cons tk slot) (gethash (aref sel slot) groups))))))
           (let* ((experts (sort (loop for e being the hash-keys of groups collect e) #'<))
@@ -1082,7 +1092,9 @@
                  (xq (make-q8kvec (* n d))) (mid (f32vec (* n nu ff))) (midq (make-q8kvec (* n nu ff)))
                  (down (f32vec (* n nu d))))
             (if (ds4f-gpu-p :experts)
-                #+(and sbcl darwin) (ds4f-gpu-experts! m l li ev users norms ws n down)
+                #+(and sbcl darwin) (progn (mapc #'sb-thread:join-thread reading)
+                                           (ds4f-gpu-experts! m l li ev users norms ws n down
+                                                              :preloaded reading :parity (if reading (mod li 2) 0)))
                 #-(and sbcl darwin) nil
                 (progn
             (prefetch-experts m l ev)

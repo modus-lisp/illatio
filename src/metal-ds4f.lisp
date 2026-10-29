@@ -64,7 +64,38 @@
                                              sb-sys:system-area-pointer sb-alien:unsigned-long))
    dst src bytes))
 
-(defun ds4f-gpu-experts! (m l li ev users norms ws n down-out)
+(defun stage-buffer (st parity)
+  "Staging buffer PARITY (0 or 1): two, so a layer's experts can be read
+   while the one before it computes."
+  (if (zerop parity)
+      (d4gpu-stage st)
+      (or (getf (d4gpu-plist* st) :stage1)
+          (setf (getf (d4gpu-plist* st) :stage1) (gpu-buffer (d4gpu-gpu st) (gbuf-bytes (d4gpu-stage st)))))))
+
+(defun read-layer-experts (m l parity &key (threads 4))
+  "Start reading every expert of layer L into staging buffer PARITY, slot =
+   expert id, on THREADS threads of their own; the threads, to join."
+  (let* ((st (ds4f-gpu-state m)) (buf (stage-buffer st parity)) (fd (ds4f-fd m))
+         (ne (ds4f-n-expert m)) (sb (d4gpu-slot-bytes st)) (gb (d4gpu-gate-bytes st)))
+    (destructuring-bind (goff grb grows gcols) (dl-gate-exps l)
+      (declare (ignore gcols))
+      (destructuring-bind (uoff urb urows ucols) (dl-up-exps l)
+        (declare (ignore urows ucols))
+        (destructuring-bind (doff drb drows dcols) (dl-down-exps l)
+          (declare (ignore dcols))
+          (loop for k below threads
+                collect (let ((k k))
+                          (sb-thread:make-thread
+                           (lambda ()
+                             (multiple-value-bind (s e) (share ne k threads)
+                               (loop for ex from s below e
+                                     do (let ((slot (sb-sys:sap+ (gbuf-sap buf) (* ex sb))))
+                                          (pread-into fd slot (+ goff (* ex grows grb)) gb)
+                                          (pread-into fd (sb-sys:sap+ slot gb) (+ uoff (* ex grows urb)) gb)
+                                          (pread-into fd (sb-sys:sap+ slot (* 2 gb)) (+ doff (* ex drows drb)) (* drows drb))))))
+                           :name "illatio expert read"))))))))
+
+(defun ds4f-gpu-experts! (m l li ev users norms ws n down-out &key preloaded (parity 0))
   "The routed FFN of a chunk's layer LI on the GPU.  EV: the distinct experts;
    USERS: for each, its (token . slot)s; NORMS: the tokens' normed inputs;
    WS: their routing weights.  DOWN-OUT gets each (token, slot)'s down
@@ -86,7 +117,7 @@
           (declare (ignore dcols))
           (let ((fd (ds4f-fd m)) (sbase (gbuf-sap (d4gpu-stage st)))
                 (sb (d4gpu-slot-bytes st)) (gb (d4gpu-gate-bytes st)))
-            (parallel-for (k ne pool)
+            (parallel-for (k (if preloaded 0 ne) pool)   ; read ahead already: slot = expert id
               (let ((e (svref ev k)) (slot (sb-sys:sap+ sbase (* k sb))))
                 (pread-into fd slot (+ goff (* e grows grb)) gb)
                 (pread-into fd (sb-sys:sap+ slot gb) (+ uoff (* e grows urb)) gb)
@@ -95,32 +126,33 @@
           (let ((xs (gbuf-sap (d4gpu-x st))) (wsap (gbuf-sap (d4gpu-w st))))
             (sb-sys:with-pinned-objects (norms)
               (let ((nsap (sb-sys:vector-sap norms)))
-                (dotimes (k ne)
+                (parallel-for (k ne pool)
                   (loop for (tk . slot) across (svref users k) for i from 0
                         do (let ((row (+ (aref bases k) i)))
                              (sap-copy (sb-sys:sap+ xs (* 4 row d)) (sb-sys:sap+ nsap (* 4 tk d)) (* 4 d))
                              (setf (sb-sys:sap-ref-single wsap (* 4 row)) (aref (svref ws tk) slot))))))))
-          (let ((stage (d4gpu-stage st)) (sb (d4gpu-slot-bytes st)) (gb (d4gpu-gate-bytes st)))
+          (let ((stage (stage-buffer st parity)) (sb (d4gpu-slot-bytes st)) (gb (d4gpu-gate-bytes st))
+                (slot-of (lambda (k) (if preloaded (svref ev k) k))))
             (with-gpu-work (e gpu)
               (flet ((mm (kernel woff cols rbytes nr x xoff y yoff ntok)
                        (dispatch gpu e kernel (list cols nr ntok rbytes cols nr)
                                  (list (cons stage woff) (cons x xoff) (cons y yoff))
                                  (list (ceiling ntok 64) (ceiling nr 64) 1) 128 :shared 16384)))
                 (dotimes (k ne)
-                  (let ((nt (aref counts k)) (b (aref bases k)) (s0 (* k sb)))
+                  (let ((nt (aref counts k)) (b (aref bases k)) (s0 (* (funcall slot-of k) sb)))
                     (mm "d4_mm_iq2_xxs" s0 d grb grows (d4gpu-x st) (* 4 b d) (d4gpu-g st) (* 4 b ff) nt)
                     (mm "d4_mm_iq2_xxs" (+ s0 gb) d urb grows (d4gpu-x st) (* 4 b d) (d4gpu-u st) (* 4 b ff) nt)))
                 (dispatch gpu e "d4_swiglu_w" (list rows ff clamp)
                           (list (d4gpu-g st) (d4gpu-u st) (d4gpu-w st) (d4gpu-mid st))
                           (ceiling (* rows ff) 256) 256)
                 (dotimes (k ne)
-                  (let ((nt (aref counts k)) (b (aref bases k)) (s0 (* k sb)))
+                  (let ((nt (aref counts k)) (b (aref bases k)) (s0 (* (funcall slot-of k) sb)))
                     (mm "d4_mm_q2_k" (+ s0 (* 2 gb)) ff drb drows (d4gpu-mid st) (* 4 b ff) (d4gpu-down st) (* 4 b d) nt))))))
           ;; back to (token, slot) order
           (let ((ds (gbuf-sap (d4gpu-down st))))
             (sb-sys:with-pinned-objects (down-out)
               (let ((osap (sb-sys:vector-sap down-out)))
-                (dotimes (k ne)
+                (parallel-for (k ne pool)
                   (loop for (tk . slot) across (svref users k) for i from 0
                         do (sap-copy (sb-sys:sap+ osap (* 4 (+ (* tk nu) slot) d))
                                      (sb-sys:sap+ ds (* 4 (+ (aref bases k) i) d)) (* 4 d))))))))))
