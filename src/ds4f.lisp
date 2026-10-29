@@ -637,13 +637,44 @@
      from (- to from) 3))                ; MADV_WILLNEED
   #-sbcl (progn w start bytes))
 
+;;; madvise WILLNEED reads in the calling thread on macOS, so the reads are
+;;; handed to a thread of their own: the FFN queues them and goes on, and they
+;;; overlap its work instead of preceding it.
+#+sbcl
+(progn
+  (defvar *prefetch-lock* (sb-thread:make-mutex :name "prefetch"))
+  (defvar *prefetch-cv* (sb-thread:make-waitqueue))
+  (defvar *prefetch-queue* '())
+  (defvar *prefetch-thread* nil)
+
+  (defun prefetch-loop ()
+    (loop
+      (let ((job (sb-thread:with-mutex (*prefetch-lock*)
+                   (loop until *prefetch-queue*
+                         do (sb-thread:condition-wait *prefetch-cv* *prefetch-lock*))
+                   (pop *prefetch-queue*))))
+        (destructuring-bind (w start bytes) job
+          (prefetch-file-range w start bytes)))))
+
+  (defun queue-prefetch (jobs)
+    "Read JOBS ((vector start bytes)...) ahead, in order, in the background."
+    (sb-thread:with-mutex (*prefetch-lock*)
+      (unless (and *prefetch-thread* (sb-thread:thread-alive-p *prefetch-thread*))
+        (setf *prefetch-thread* (sb-thread:make-thread #'prefetch-loop :name "illatio prefetch")))
+      (setf *prefetch-queue* (append *prefetch-queue* jobs))
+      (sb-thread:condition-broadcast *prefetch-cv*))))
+
 (defun prefetch-experts (m l sel)
-  "Every routed matrix of the experts SEL, read ahead."
-  (dolist (tensor (list (dl-gate-exps l) (dl-up-exps l) (dl-down-exps l)))
-    (destructuring-bind (off row-bytes rows cols) tensor
-      (declare (ignore cols))
-      (loop for e across sel
-            do (prefetch-file-range (ds4f-file m) (+ off (* e rows row-bytes)) (* rows row-bytes))))))
+  "Every routed matrix of the experts SEL, read ahead in the background,
+   expert by expert in SEL's order (the order the FFN takes them in)."
+  (let ((jobs '()))
+    (loop for e across sel
+          do (dolist (tensor (list (dl-gate-exps l) (dl-up-exps l) (dl-down-exps l)))
+               (destructuring-bind (off row-bytes rows cols) tensor
+                 (declare (ignore cols))
+                 (push (list (ds4f-file m) (+ off (* e rows row-bytes)) (* rows row-bytes)) jobs))))
+    #+sbcl (queue-prefetch (nreverse jobs))
+    #-sbcl (dolist (j jobs) (apply #'prefetch-file-range j))))
 
 
 (defun d4-route (m l li x token)
@@ -683,6 +714,7 @@
       (multiple-value-bind (sel w) (d4-route m l li norm token)
         (prefetch-experts m l sel)
         (let ((xq (make-q8kvec d)) (mid (f32vec (* nu ff))) (moe (f32vec d)) (shared (f32vec d)))
+          (declare (ignorable shared))
           (quantize-q8k! norm xq)
           ;; gate and up: silu(clamp(g)) * clamp(u) * weight, per expert
           (destructuring-bind (goff grb grows gcols) (dl-gate-exps l)
@@ -720,17 +752,20 @@
                                              (incf acc (q2k-row-dot* desc wf (+ doff (* (+ (* (aref sel i) drows) r) drb))
                                                                      nb midq (* i ff))))
                                            (setf (aref moe r) acc)))))))))))
-          ;; the shared expert
-          (let ((g (f32vec ff)) (u (f32vec ff)))
-            (q8mv! pool (dl-sh-gate l) norm g)
-            (q8mv! pool (dl-sh-up l) norm u)
-            (dotimes (i ff)
-              (let ((gi (aref g i)) (ui (aref u i)))
-                (when (> clamp 1f-6) (setf gi (min gi clamp) ui (max (- clamp) (min ui clamp))))
-                (setf (aref g i) (* (d4-silu gi) ui))))
-            (q8mv! pool (dl-sh-down l) g shared))
+          (d4-shared! m l norm clamp shared)
           (dotimes (i d) (setf (aref moe i) (+ (aref moe i) (aref shared i))))
           (values moe post comb))))))
+
+(defun d4-shared! (m l norm clamp out)
+  "layer_shared_ffn_one: the shared expert of NORM into OUT."
+  (let* ((pool (ds4f-pool m)) (ff (ds4f-ff-exp m)) (g (f32vec ff)) (u (f32vec ff)))
+    (q8mv! pool (dl-sh-gate l) norm g)
+    (q8mv! pool (dl-sh-up l) norm u)
+    (dotimes (i ff)
+      (let ((gi (aref g i)) (ui (aref u i)))
+        (when (> clamp 1f-6) (setf gi (min gi clamp) ui (max (- clamp) (min ui clamp))))
+        (setf (aref g i) (* (d4-silu gi) ui))))
+    (q8mv! pool (dl-sh-down l) g out)))
 
 ;;; --- a token -----------------------------------------------------------------------
 
@@ -760,16 +795,142 @@
           (hc-post! m next out streams post comb))
         (rotatef streams next)))
     (incf (d4ctx-pos ctx))
+    (when logits (ds4f-head! m streams (d4ctx-logits ctx)))
+    ctx))
+
+(defun ds4f-head! (m streams logits)
+  "output_logits_one: the streams' sigmoid-weighted sum, normed, to LOGITS."
+  (let* ((n (ds4f-n-hc m)) (d (ds4f-d m))
+         (flat (f32vec (* n d))) (pre (f32vec n)) (w (f32vec n)) (embd (f32vec d)) (norm (f32vec d))
+         (scale (ds4f-out-hc-scale m)) (base (ds4f-out-hc-base m)))
+    (d4-rms! streams flat (* n d) (ds4f-eps m))
+    (f32mv! (ds4f-pool m) (ds4f-out-hc-fn m) flat pre)
+    (dotimes (i n) (setf (aref w i) (+ (d4-sigmoid (+ (* (aref pre i) (aref scale 0)) (aref base i))) (ds4f-hc-eps m))))
+    (locally (declare (type f32vec streams w embd) (type fixnum n d) (optimize speed (safety 0)))
+      (dotimes (j d)
+        (let ((acc 0f0)) (dotimes (h n) (incf acc (* (aref streams (+ (* h d) j)) (aref w h)))) (setf (aref embd j) acc))))
+    (d4-rms! embd norm d (ds4f-eps m) (ds4f-output-norm m))
+    (q8mv! (ds4f-pool m) (ds4f-output m) norm logits)))
+
+;;; --- a prompt, layer-major ---------------------------------------------------------
+;;;
+;;; As prefill_layer_major_cpu: every token of a chunk through a layer before
+;;; the next layer.  Attention goes token by token (each sees the ones before
+;;; it); the FFN routes the whole chunk, reads each distinct expert's weights
+;;; once for all the tokens that chose it (and asks for them all at once),
+;;; and keeps each (token, slot)'s down projection apart so a token's experts
+;;; are summed in its slot order -- the decode's arithmetic, so a prefill is
+;;; bit-identical to feeding the tokens one at a time.
+
+(defparameter *ds4f-chunk* 256 "Tokens a layer-major pass takes at once.")
+
+(defun ds4f-prefill (ctx tokens &key (logits t))
+  "TOKENS at the next positions, *DS4F-CHUNK* at a time."
+  (loop for rest = tokens then (nthcdr *ds4f-chunk* rest)
+        while rest
+        do (let ((chunk (subseq rest 0 (min *ds4f-chunk* (length rest)))))
+             #+sbcl (sb-int:with-float-traps-masked (:overflow :inexact :underflow)
+                      (ds4f-prefill-1 ctx chunk (and logits (<= (length rest) *ds4f-chunk*))))
+             #-sbcl (ds4f-prefill-1 ctx chunk (and logits (<= (length rest) *ds4f-chunk*)))))
+  ctx)
+
+(defun ds4f-prefill-1 (ctx tokens logits)
+  (let* ((*q8-f16-scale* *ds4f-q8-f16-scale*)
+         (m (d4ctx-model ctx)) (d (ds4f-d m)) (n-hc (ds4f-n-hc m)) (hcd (* n-hc d))
+         (pos0 (d4ctx-pos ctx)) (n (length tokens)) (tokv (coerce tokens 'simple-vector))
+         (pool (ds4f-pool m)) (wf (ds4f-file m)) (eps (ds4f-eps m))
+         (nu (ds4f-n-used m)) (ff (ds4f-ff-exp m))
+         (cur (f32vec (* n hcd))) (next (f32vec (* n hcd))))
+    (declare (type u8vec wf) (type f32vec cur next))
+    (dotimes (tk n)
+      (let ((o (+ (ds4f-embd-off m) (* (svref tokv tk) d 2))))
+        (dotimes (j d)
+          (let ((v (f16-at wf (+ o (* 2 j)))))
+            (dotimes (h n-hc) (setf (aref cur (+ (* tk hcd) (* h d) j)) v))))))
+    (dotimes (li (ds4f-n-layer m))
+      (let ((l (svref (ds4f-layers m) li)) (c (svref (d4ctx-caches ctx) li))
+            (streams (f32vec hcd)) (out-s (f32vec hcd)))
+        ;; attention, token by token
+        (dotimes (tk n)
+          (replace streams cur :start2 (* tk hcd) :end2 (* (1+ tk) hcd))
+          (multiple-value-bind (out post comb) (d4-attention m l li c streams (+ pos0 tk))
+            (hc-post! m out-s out streams post comb))
+          (replace next out-s :start1 (* tk hcd)))
+        (rotatef cur next)
+        ;; the FFN: route every token, then each expert once
+        (let ((norms (f32vec (* n d))) (posts (make-array n)) (combs (make-array n))
+              (sels (make-array n)) (ws (make-array n)) (clamp (svref (ds4f-clamps m) li))
+              (groups (make-hash-table)))
+          (dotimes (tk n)
+            (replace streams cur :start2 (* tk hcd) :end2 (* (1+ tk) hcd))
+            (let ((cur1 (f32vec d)) (flat (f32vec hcd)) (norm (f32vec d)))
+              (multiple-value-bind (post comb)
+                  (hc-pre m (dl-hc-ffn-fn l) (dl-hc-ffn-scale l) (dl-hc-ffn-base l) streams cur1 flat)
+                (setf (svref posts tk) post (svref combs tk) comb))
+              (d4-rms! cur1 norm d eps (dl-ffn-norm l))
+              (replace norms norm :start1 (* tk d))
+              (multiple-value-bind (sel w) (d4-route m l li norm (svref tokv tk))
+                (setf (svref sels tk) sel (svref ws tk) w)
+                (dotimes (slot nu) (push (cons tk slot) (gethash (aref sel slot) groups))))))
+          (let* ((experts (sort (loop for e being the hash-keys of groups collect e) #'<))
+                 (users (map 'simple-vector (lambda (e) (coerce (reverse (gethash e groups)) 'simple-vector)) experts))
+                 (ev (coerce experts 'simple-vector)) (ne (length ev))
+                 (xq (make-q8kvec (* n d))) (mid (f32vec (* n nu ff))) (midq (make-q8kvec (* n nu ff)))
+                 (down (f32vec (* n nu d))))
+            (prefetch-experts m l ev)
+            (dotimes (tk n) (quantize-q8k! norms xq (* tk d) d (* tk d)))
+            ;; gate and up: an item is (expert, row), against every token that chose it
+            (destructuring-bind (goff grb grows gcols) (dl-gate-exps l)
+              (destructuring-bind (uoff urb urows ucols) (dl-up-exps l)
+                (declare (ignore urows ucols))
+                (let ((nb (floor gcols +qk-k+)))
+                  (pool-run pool
+                            (lambda (ti tn)
+                              (let ((desc (make-row-desc)))
+                                (declare (dynamic-extent desc))
+                                (multiple-value-bind (s e) (share (* ne ff) ti tn)
+                                  (loop for item from s below e
+                                        do (multiple-value-bind (k r) (floor item ff)
+                                             (let ((ex (svref ev k)))
+                                               (loop for (tk . slot) across (svref users k)
+                                                     do (let ((g (iq2xxs-row-dot* desc wf (+ goff (* (+ (* ex grows) r) grb)) nb xq (* tk d)))
+                                                              (u (iq2xxs-row-dot* desc wf (+ uoff (* (+ (* ex grows) r) urb)) nb xq (* tk d))))
+                                                          (declare (type single-float g u))
+                                                          (when (> clamp 1f-6)
+                                                            (setf g (min g clamp) u (max (- clamp) (min u clamp))))
+                                                          (setf (aref mid (+ (* (+ (* tk nu) slot) ff) r))
+                                                                (* (* (d4-silu g) u) (aref (svref ws tk) slot)))))))))))))))
+            (dotimes (i (* n nu)) (quantize-q8k! mid midq (* i ff) ff (* i ff)))
+            ;; down: an item is (expert, row); each (token, slot)'s output kept apart
+            (destructuring-bind (doff drb drows dcols) (dl-down-exps l)
+              (let ((nb (floor dcols +qk-k+)))
+                (pool-run pool
+                          (lambda (ti tn)
+                            (let ((desc (make-row-desc)))
+                              (declare (dynamic-extent desc))
+                              (multiple-value-bind (s e) (share (* ne d) ti tn)
+                                (loop for item from s below e
+                                      do (multiple-value-bind (k r) (floor item d)
+                                           (let ((ex (svref ev k)))
+                                             (loop for (tk . slot) across (svref users k)
+                                                   do (setf (aref down (+ (* (+ (* tk nu) slot) d) r))
+                                                            (q2k-row-dot* desc wf (+ doff (* (+ (* ex drows) r) drb)) nb midq
+                                                                          (* (+ (* tk nu) slot) ff)))))))))))))
+            ;; per token: its experts in slot order, the shared expert, the HC post
+            (let ((moe (f32vec d)) (shared (f32vec d)) (norm (f32vec d)))
+              (dotimes (tk n)
+                (dotimes (r d)
+                  (let ((acc 0f0))
+                    (dotimes (slot nu) (incf acc (aref down (+ (* (+ (* tk nu) slot) d) r))))
+                    (setf (aref moe r) acc)))
+                (replace norm norms :start2 (* tk d))
+                (d4-shared! m l norm clamp shared)
+                (dotimes (i d) (setf (aref moe i) (+ (aref moe i) (aref shared i))))
+                (replace streams cur :start2 (* tk hcd) :end2 (* (1+ tk) hcd))
+                (hc-post! m out-s moe streams (svref posts tk) (svref combs tk))
+                (replace next out-s :start1 (* tk hcd))))))
+        (rotatef cur next)))
+    (incf (d4ctx-pos ctx) n)
     (when logits
-      ;; output_logits_one: the streams' sigmoid-weighted sum, normed, to logits
-      (let* ((flat (f32vec (* n d))) (pre (f32vec n)) (w (f32vec n)) (embd (f32vec d)) (norm (f32vec d))
-             (scale (ds4f-out-hc-scale m)) (base (ds4f-out-hc-base m)))
-        (d4-rms! streams flat (* n d) (ds4f-eps m))
-        (f32mv! (ds4f-pool m) (ds4f-out-hc-fn m) flat pre)
-        (dotimes (i n) (setf (aref w i) (+ (d4-sigmoid (+ (* (aref pre i) (aref scale 0)) (aref base i))) (ds4f-hc-eps m))))
-        (locally (declare (type f32vec streams w embd) (type fixnum n d) (optimize speed (safety 0)))
-          (dotimes (j d)
-            (let ((acc 0f0)) (dotimes (h n) (incf acc (* (aref streams (+ (* h d) j)) (aref w h)))) (setf (aref embd j) acc))))
-        (d4-rms! embd norm d (ds4f-eps m) (ds4f-output-norm m))
-        (q8mv! (ds4f-pool m) (ds4f-output m) norm (d4ctx-logits ctx))))
+      (ds4f-head! m (subseq cur (* (1- n) hcd)) (d4ctx-logits ctx)))
     ctx))
