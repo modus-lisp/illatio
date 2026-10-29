@@ -50,15 +50,15 @@ Qwen3-4B in Q4_K_M (2.5 GB):
 | decode, 8–10 threads | 65.6 | 3.0 | 61.2 |
 | prefill, 8–10 threads | 86.6 | 3.7 | 114 |
 
-The 27B `qwen35` in Q6_K (22 GB; `llama-bench -ngl 0`, prefill at 512
-tokens):
+The 27B `qwen35` in Q6_K (22 GB; `llama-bench -ngl 0 -p 512`, illatio on
+the same 512-token prefill, except its 1-thread one, on 96):
 
 | tok/s | illatio, SBCL | llama.cpp |
 |---|---|---|
-| decode, 1 thread | 1.10 | 1.19 |
-| prefill, 1 thread | 5.0 | 3.2 |
-| decode, 10 threads | 9.3 | 7.8 |
-| prefill, 10 threads | 35.5 | 25.5 |
+| decode, 1 thread | 1.10 | 1.21 |
+| prefill, 1 thread | 5.0 | 3.15 |
+| decode, 10 threads | 9.3 | 6.9 |
+| prefill, 10 threads | 35.5 | 22.8 |
 
 Other checks:
 
