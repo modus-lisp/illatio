@@ -333,11 +333,10 @@ inspect/collect-vectors.py http://localhost:18931 inspect/vectors/qwen2.5-0.5b-q
   (8 threads give 3x) and the serial per-layer ops between the products.
 - **More formats.** Q5_K (Q5_K_M files) and Q8_0-with-K-quant mixes.
 - **Qwen3.6-35B-A3B** (`qwen35moe`): expert routing on top of `qwen35`.
-- **ds4f.** Memory, for a bigger expert cache: the Q8_0 weights are held
-  twice (the CPU's matrices and the GPU's raw blocks, 6 GB); the GPU's
-  kernels reading the CPU's layout would free one.  The decode cache's
-  misses (12 a token, read while the GPU waits), and the F32 products from
-  F16 weights (half their bandwidth).
+- **ds4f.** The decode cache's misses (12 a token, read while the GPU
+  waits), the F32 products from F16 weights (half their bandwidth and 1 GB),
+  and the expert cache's size on bigger machines (one Metal buffer stops it
+  at 28 GB).
 
 ## License
 

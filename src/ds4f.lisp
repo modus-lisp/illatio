@@ -96,6 +96,29 @@
           (floor (tensor-bytes ti) (* (second dims) (third dims)))
           (second dims) (first dims))))
 
+(defvar *ds4f-cpu-q8* #+(and sbcl darwin) nil #-(and sbcl darwin) t
+  "Whether LOAD-DS4F loads the attention's and shared expert's Q8_0 matrices
+   for the CPU (8.5 GB).  With the GPU they run there, from its own copy of
+   the raw blocks; a CPU path that wants them loads them then
+   (DS4F-CPU-Q8!).")
+
+(defparameter +ds4f-cpu-q8+
+  '((dl-q-a "attn_q_a.weight") (dl-q-b "attn_q_b.weight") (dl-kv "attn_kv.weight")
+    (dl-out-a "attn_output_a.weight") (dl-out-b "attn_output_b.weight")
+    (dl-sh-gate "ffn_gate_shexp.weight") (dl-sh-up "ffn_up_shexp.weight") (dl-sh-down "ffn_down_shexp.weight")))
+
+(defun ds4f-cpu-q8! (m)
+  "M's attention and shared expert Q8_0 matrices for the CPU, loaded if
+   LOAD-DS4F left them to the GPU."
+  (let ((l0 (svref (ds4f-layers m) 0)))
+    (unless (dl-q-a l0)
+      (dotimes (li (ds4f-n-layer m))
+        (let ((l (svref (ds4f-layers m) li)))
+          (loop for (acc short) in +ds4f-cpu-q8+
+                do (funcall (fdefinition (list 'setf acc))
+                            (load-q8mat (ds4f-gguf m) (format nil "blk.~D.~A" li short)) l))))))
+  m)
+
 (defun load-ds4f (path &key (threads (default-thread-count)))
   "DeepSeek V4 Flash at PATH: the non-routed weights in memory (Q8_0 as
    Q8MATs, F16 widened to F32), the routed experts left in the file, which is
@@ -103,6 +126,7 @@
   (let* ((g (read-gguf path)) (a "deepseek4"))
     (flet ((k (key &optional default) (or (arch-key g a key) default))
            (q8 (name) (load-q8mat g name))
+           (q8-cpu (name) (and *ds4f-cpu-q8* (load-q8mat g name)))
            (f32 (name) (load-f32 g name))
            (fm (name) (load-f32mat g name))
            (opt (name f) (and (gguf-tensor g name nil) (funcall f name))))
@@ -142,11 +166,11 @@
                                  (make-d4layer
                                   :ratio ratio
                                   :attn-norm (f32 (n "attn_norm.weight"))
-                                  :q-a (q8 (n "attn_q_a.weight")) :q-a-norm (f32 (n "attn_q_a_norm.weight"))
-                                  :q-b (q8 (n "attn_q_b.weight"))
-                                  :kv (q8 (n "attn_kv.weight")) :kv-norm (f32 (n "attn_kv_a_norm.weight"))
+                                  :q-a (q8-cpu (n "attn_q_a.weight")) :q-a-norm (f32 (n "attn_q_a_norm.weight"))
+                                  :q-b (q8-cpu (n "attn_q_b.weight"))
+                                  :kv (q8-cpu (n "attn_kv.weight")) :kv-norm (f32 (n "attn_kv_a_norm.weight"))
                                   :sinks (f32 (n "attn_sinks.weight"))
-                                  :out-a (q8 (n "attn_output_a.weight")) :out-b (q8 (n "attn_output_b.weight"))
+                                  :out-a (q8-cpu (n "attn_output_a.weight")) :out-b (q8-cpu (n "attn_output_b.weight"))
                                   :comp-kv (opt (n "attn_compressor_kv.weight") #'fm)
                                   :comp-gate (opt (n "attn_compressor_gate.weight") #'fm)
                                   :comp-ape (opt (n "attn_compressor_ape.weight") #'fm)
@@ -164,8 +188,8 @@
                                   :gate-exps (expert-tensor g (n "ffn_gate_exps.weight"))
                                   :up-exps (expert-tensor g (n "ffn_up_exps.weight"))
                                   :down-exps (expert-tensor g (n "ffn_down_exps.weight"))
-                                  :sh-gate (q8 (n "ffn_gate_shexp.weight")) :sh-up (q8 (n "ffn_up_shexp.weight"))
-                                  :sh-down (q8 (n "ffn_down_shexp.weight"))
+                                  :sh-gate (q8-cpu (n "ffn_gate_shexp.weight")) :sh-up (q8-cpu (n "ffn_up_shexp.weight"))
+                                  :sh-down (q8-cpu (n "ffn_down_shexp.weight"))
                                   :hc-attn-fn (fm (n "hc_attn_fn.weight")) :hc-attn-scale (f32 (n "hc_attn_scale.weight"))
                                   :hc-attn-base (f32 (n "hc_attn_base.weight"))
                                   :hc-ffn-fn (fm (n "hc_ffn_fn.weight")) :hc-ffn-scale (f32 (n "hc_ffn_scale.weight"))
@@ -1104,6 +1128,7 @@
   #+(and sbcl darwin)
   (when (ds4f-gpu-p :decode-all)
     (return-from ds4f-forward-1 (ds4f-gpu-forward ctx token logits)))
+  (ds4f-cpu-q8! (d4ctx-model ctx))
   (let* ((*q8-f16-scale* *ds4f-q8-f16-scale*)
          (m (d4ctx-model ctx)) (d (ds4f-d m)) (n (ds4f-n-hc m)) (pos (d4ctx-pos ctx))
          (streams (f32vec (* n d))) (next (f32vec (* n d))) (wf (ds4f-file m)))
@@ -1166,6 +1191,7 @@
   ctx)
 
 (defun ds4f-prefill-1 (ctx tokens logits)
+  (unless (ds4f-gpu-p :proj) (ds4f-cpu-q8! (d4ctx-model ctx)))
   (let* ((*q8-f16-scale* *ds4f-q8-f16-scale*)
          (m (d4ctx-model ctx)) (d (ds4f-d m)) (n-hc (ds4f-n-hc m)) (hcd (* n-hc d))
          (pos0 (d4ctx-pos ctx)) (n (length tokens)) (tokv (coerce tokens 'simple-vector))
