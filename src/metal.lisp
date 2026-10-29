@@ -204,7 +204,22 @@
                  (dotimes (k 3) (setf (aref sz (+ o k)) (or (nth k l) 1))))))
         (size3 groups 0) (size3 threads 3))
       (msg sb-alien:void enc "dispatchThreadgroups:threadsPerThreadgroup:"
-           (ptr (sb-sys:vector-sap sz)) (ptr (sb-sys:sap+ (sb-sys:vector-sap sz) 24))))))
+           (ptr (sb-sys:vector-sap sz)) (ptr (sb-sys:sap+ (sb-sys:vector-sap sz) 24))))
+    (when *gpu-profile* (profile-dispatch gpu e kernel))))
+
+(defvar *gpu-profile* nil
+  "When a hash table, each dispatch runs as its own command buffer and its
+   GPU time (seconds) is added under its kernel's name.")
+
+(defun profile-dispatch (gpu e kernel)
+  "Close E's command buffer, run it, charge its GPU time to KERNEL, and open
+   a fresh one in E."
+  (end-work e)
+  (let ((t0 (msg double-float (enc-cb e) "GPUStartTime"))
+        (t1 (msg double-float (enc-cb e) "GPUEndTime")))
+    (incf (gethash kernel *gpu-profile* 0d0) (- t1 t0)))
+  (let ((fresh (begin-work gpu)))
+    (setf (enc-cb e) (enc-cb fresh) (enc-enc e) (enc-enc fresh))))
 
 (defmacro with-gpu-work ((e gpu) &body body)
   "Encode BODY's dispatches into one command buffer, then run it and wait."

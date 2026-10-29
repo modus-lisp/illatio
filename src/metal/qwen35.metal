@@ -143,6 +143,150 @@ kernel void row_q6k(constant row_args & a [[buffer(0)]],
     y[i] = (float)b->d * sc[l / 16 + 2 * quarter] * (float)(q - 32);
 }
 
+// Rows 16*IL..16*IL+15 of a block's 256 weights, as halves (ggml's
+// dequantize_q6_K).
+static void dequantize_q6_K(device const block_q6_K * xb, short il, thread half4x4 & reg) {
+    const half d_all = xb->d;
+    device const uint16_t * ql = (device const uint16_t *)xb->ql;
+    device const uint16_t * qh = (device const uint16_t *)xb->qh;
+    device const int8_t * scales = (device const int8_t *)xb->scales;
+
+    ql = ql + 32*(il/8) + 16*((il/2)&1) + 8*(il&1);
+    qh = qh + 16*(il/8) + 8*(il&1);
+    float sc = scales[(il%2) + 2 * ((il/2))];
+    il = (il/2) & 3;
+
+    const uint32_t kmask1 = il>1 ? (il>2 ? 0xC0C0C0C0 : 0x30303030) : (il>0 ? 0x0C0C0C0C : 0x03030303);
+    const uint32_t kmask2 = il>1 ? 0xF0F0F0F0                       : 0x0F0F0F0F;
+    const float ml = d_all * sc * 32.f;
+    const float dl0 = d_all * sc;
+    const float dl1 = dl0 / 256.f;
+    const float dl2 = dl0 / (256.f * 256.f);
+    const float dl3 = dl0 / (256.f * 256.f * 256.f);
+    const uint8_t shr_h = il>2 ? 2 : 0;
+    const uint8_t shl_h = il>1 ? 0 : (il>0 ? 2 : 4);
+    const uint8_t shr_l = il>1 ? 4 : 0;
+    for (int i = 0; i < 4; ++i) {
+        const uint32_t  low = (ql[2*i] | (uint32_t)(ql[2*i+1] << 16)) & kmask2;
+        const uint32_t high = (qh[2*i] | (uint32_t)(qh[2*i+1] << 16)) & kmask1;
+        const uint32_t q = ((high << shl_h) >> shr_h) | (low >> shr_l);
+        reg[i][0] = dl0 *  ((half)(q & 0xFF))       - ml;
+        reg[i][1] = dl1 * ((float)(q & 0xFF00))     - ml;
+        reg[i][2] = dl2 * ((float)(q & 0xFF0000))   - ml;
+        reg[i][3] = dl3 * ((float)(q & 0xFF000000)) - ml;
+    }
+}
+
+struct mm_args { uint ncols; uint nrows; uint ntok; uint row_bytes; };
+
+// Y[t][r] = W[r] . X[t] for NTOK tokens: ggml's kernel_mul_mm for Q6_K (its
+// simdgroup-matrix path, without bounds checks on the input: NCOLS is a
+// whole number of super-blocks).  A threadgroup of four simdgroups makes a
+// 64-row by 32-token tile, its weights dequantized to halves and both
+// operands staged in threadgroup memory (8 KB), 32 columns at a time.
+kernel void mm_q6k(constant mm_args & a [[buffer(0)]],
+                   device const char  * src0 [[buffer(1)]],
+                   device const float * src1 [[buffer(2)]],
+                   device       float * dst  [[buffer(3)]],
+                   threadgroup  char  * shmem [[threadgroup(0)]],
+                   uint3  tgpig [[threadgroup_position_in_grid]],
+                   ushort tiitg [[thread_index_in_threadgroup]],
+                   ushort sgitg [[simdgroup_index_in_threadgroup]]) {
+    threadgroup half * sa = (threadgroup half *)(shmem);
+    threadgroup half * sb = (threadgroup half *)(shmem + 4096);
+
+    constexpr int NR0 = 64;
+    constexpr int NR1 = 32;
+    constexpr int NK  = 32;
+    constexpr int NL0 = NK/16;
+    constexpr int NL1 = NK/8;
+    constexpr short nl = 16;                // QK_NL: a block is 16 groups of 16
+
+    const int r0 = tgpig.y*NR0;
+    const int r1 = tgpig.x*NR1;
+
+    const short nr0 = ((int)a.nrows - r0 < NR0) ? ((int)a.nrows - r0) : NR0;
+    const short nr1 = ((int)a.ntok  - r1 < NR1) ? ((int)a.ntok  - r1) : NR1;
+
+    const short lr0 = ((short)tiitg/NL0) < nr0 ? ((short)tiitg/NL0) : nr0 - 1;
+    const short lr1 = ((short)tiitg/NL1) < nr1 ? ((short)tiitg/NL1) : nr1 - 1;
+
+    const short il0 = (tiitg % NL0);
+    short il = il0;
+
+    device const block_q6_K * x = (device const block_q6_K *)(src0 + (ulong)a.row_bytes*(r0 + lr0)) + il0/nl;
+
+    const short iy = 8*(tiitg % NL1);
+    device const float * y = src1 + (ulong)a.ncols*(r1 + lr1) + iy;
+
+    simdgroup_half8x8 ma[4];
+    simdgroup_half8x8 mb[2];
+    simdgroup_float8x8 mc[8];
+    for (short i = 0; i < 8; i++) mc[i] = make_filled_simdgroup_matrix<float, 8>(0.f);
+
+    for (uint loop_k = 0; loop_k < a.ncols; loop_k += NK) {
+        half4x4 temp_a;
+        dequantize_q6_K(x, il, temp_a);
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        for (short i = 0; i < 16; i++) {
+            const short sx = 2*il0 + i/8;
+            const short sy = (tiitg/NL0)/8;
+            const short lx = (tiitg/NL0)%8;
+            const short ly = i%8;
+            const short ib = 8*sx + sy;
+            *(sa + 64*ib + 8*ly + lx) = temp_a[i/4][i%4];
+        }
+
+        {
+            const short sx = (tiitg%NL1);
+            const short sy = (tiitg/NL1)/8;
+            const short ly = (tiitg/NL1)%8;
+            const short ib = 4*sx + sy;
+            *(threadgroup half2x4 *)(sb + 64*ib + 8*ly) = (half2x4)(*((device float2x4 *) y));
+        }
+
+        il = (il + 2 < nl) ? il + 2 : il % 2;
+        x  = (il < 2) ? x + (2 + nl - 1)/nl : x;
+        y += NK;
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        threadgroup const half * lsma = (sa + 4*64*(sgitg%2));
+        threadgroup const half * lsmb = (sb + 2*64*(sgitg/2));
+
+        for (short ik = 0; ik < NK/8; ik++) {
+            simdgroup_barrier(mem_flags::mem_none);
+            for (short i = 0; i < 4; i++) simdgroup_load(ma[i], lsma + 64*i, 8, 0, false);
+            simdgroup_barrier(mem_flags::mem_none);
+            for (short i = 0; i < 2; i++) simdgroup_load(mb[i], lsmb + 64*i, 8, 0, false);
+            simdgroup_barrier(mem_flags::mem_none);
+            for (short i = 0; i < 8; i++) simdgroup_multiply_accumulate(mc[i], mb[i/4], ma[i%4], mc[i]);
+            lsma += 8*64;
+            lsmb += 4*64;
+        }
+    }
+
+    if (r0 + NR0 <= (int)a.nrows && r1 + NR1 <= (int)a.ntok) {
+        device float * C = dst + (r0 + 32*(sgitg & 1)) + (ulong)(r1 + 16*(sgitg >> 1)) * a.nrows;
+        for (short i = 0; i < 8; i++) simdgroup_store(mc[i], C + 8*(i%4) + 8*a.nrows*(i/4), a.nrows, 0, false);
+    } else {
+        // a tile at the edge: through threadgroup memory, only what is inside
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        threadgroup float * temp_str = ((threadgroup float *) shmem) + 32*(sgitg&1) + (16*(sgitg >> 1))*NR0;
+        for (short i = 0; i < 8; i++) simdgroup_store(mc[i], temp_str + 8*(i%4) + 8*NR0*(i/4), NR0, 0, false);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (sgitg == 0) {
+            for (int j = tiitg; j < nr1; j += NR1) {
+                device float * D = dst + r0 + (ulong)(r1 + j)*a.nrows;
+                threadgroup float * C = temp_str + (j*NR0);
+                for (int i = 0; i < nr0; i++) D[i] = C[i];
+            }
+        }
+    }
+}
+
 // --- norms and elementwise ops ---------------------------------------------------
 
 struct norm_args { uint n; float eps; uint w_stride; };
@@ -189,22 +333,25 @@ kernel void gate_mul(constant n_args & a [[buffer(0)]],
 
 // --- the gated delta net (a linear layer) -----------------------------------------
 
-struct gates_args { uint vh; };
+struct gates_args { uint vh; uint n; };
 
-// BETA = sigmoid(BETA); ALPHA = softplus(ALPHA + dt) * A, per V head.
+// BETA = sigmoid(BETA); ALPHA = softplus(ALPHA + dt) * A, per V head of each
+// of N tokens.
 kernel void q35_gates(constant gates_args & a [[buffer(0)]],
                       device float * alpha [[buffer(1)]], device float * beta [[buffer(2)]],
                       device const float * A [[buffer(3)]], device const float * dt [[buffer(4)]],
-                      uint j [[thread_position_in_grid]]) {
-    if (j >= a.vh) return;
-    beta[j] = sigmoid(beta[j]);
-    const float s = alpha[j] + dt[j];
-    alpha[j] = (s > 20.0f ? s : log(1.0f + exp(s))) * A[j];
+                      uint i [[thread_position_in_grid]]) {
+    if (i >= a.vh * a.n) return;
+    const uint j = i % a.vh;
+    beta[i] = sigmoid(beta[i]);
+    const float s = alpha[i] + dt[j];
+    alpha[i] = (s > 20.0f ? s : log(1.0f + exp(s))) * A[j];
 }
 
-struct conv_args { uint ch; };
+struct conv_args { uint ch; uint n; };
 
-// C = silu(causal conv of each channel's last 4 inputs); STATE moves on.
+// C = silu(causal conv of each channel's last 4 inputs) for N tokens in
+// order (a thread a channel); STATE moves on by one a token.
 kernel void q35_conv(constant conv_args & a [[buffer(0)]],
                      device const float * qkv [[buffer(1)]], device const float * kern [[buffer(2)]],
                      device float * state [[buffer(3)]], device float * c [[buffer(4)]],
@@ -212,23 +359,28 @@ kernel void q35_conv(constant conv_args & a [[buffer(0)]],
     if (ci >= a.ch) return;
     device float * st = state + ci * 3;
     device const float * k = kern + ci * 4;
-    const float x0 = st[0], x1 = st[1], x2 = st[2], x3 = qkv[ci];
-    float s = 0.f;
-    s += x0 * k[0]; s += x1 * k[1]; s += x2 * k[2]; s += x3 * k[3];
-    c[ci] = silu(s);
-    st[0] = x1; st[1] = x2; st[2] = x3;
+    float x0 = st[0], x1 = st[1], x2 = st[2];
+    for (uint t = 0; t < a.n; ++t) {
+        const float x3 = qkv[t * a.ch + ci];
+        float s = 0.f;
+        s += x0 * k[0]; s += x1 * k[1]; s += x2 * k[2]; s += x3 * k[3];
+        c[t * a.ch + ci] = silu(s);
+        x0 = x1; x1 = x2; x2 = x3;
+    }
+    st[0] = x0; st[1] = x1; st[2] = x2;
 }
 
-struct l2_args { uint n; float eps; };
+struct l2_args { uint n; float eps; uint rows_per_tok; uint tok_stride; };
 
-// X /= max(|X|, eps) per row of N, in place (a threadgroup a row).
+// X /= max(|X|, eps) per row of N, in place (a threadgroup a row); row r is
+// token r / ROWS_PER_TOK's row r % ROWS_PER_TOK, tokens TOK_STRIDE apart.
 kernel void l2norm(constant l2_args & a [[buffer(0)]],
                    device float * x [[buffer(1)]],
                    uint tg [[threadgroup_position_in_grid]],
                    uint tid [[thread_position_in_threadgroup]],
                    uint ntg [[threads_per_threadgroup]]) {
     threadgroup float sh[32];
-    device float * xr = x + (ulong)tg * a.n;
+    device float * xr = x + (ulong)(tg / a.rows_per_tok) * a.tok_stride + (tg % a.rows_per_tok) * a.n;
     float s = 0.f;
     for (uint i = tid; i < a.n; i += ntg) s += xr[i] * xr[i];
     s = tg_sum(s, sh, tid, ntg);
@@ -236,44 +388,47 @@ kernel void l2norm(constant l2_args & a [[buffer(0)]],
     for (uint i = tid; i < a.n; i += ntg) xr[i] *= scale;
 }
 
-struct delta_args { uint kh; uint kd; uint vh; uint vd; float scale; };
+struct delta_args { uint kh; uint kd; uint vh; uint vd; float scale; uint n; uint ch; };
 
-// The delta rule for one V head (a threadgroup), one value v a thread.  S is
-// k-major, S[k][v] at h*kd*vd + k*vd + v, as on the CPU, so a k's values
-// are adjacent and the threads read them together.
+#define DELTA_KD 128                    // a K head's width: the host checks
+#define DELTA_TG 32                     // values a threadgroup
+
+// The delta rule for DELTA_TG values of one V head (grid x the head, y the
+// block of values; a thread a value v), for N tokens in order (token t's C
+// at t*CH, its gates at t*VH, its O at t*VH*VD).  A thread keeps its column
+// of S -- S[k][v] for every k, the state is k-major as on the CPU -- in
+// registers for the whole chunk; only K and Q are shared, a token at a time.
 kernel void q35_delta(constant delta_args & a [[buffer(0)]],
                       device const float * c [[buffer(1)]],
                       device const float * beta [[buffer(2)]],
                       device const float * g [[buffer(3)]],
                       device float * S [[buffer(4)]],
                       device float * o [[buffer(5)]],
-                      uint h [[threadgroup_position_in_grid]],
-                      uint v [[thread_position_in_threadgroup]],
-                      uint ntg [[threads_per_threadgroup]]) {
-    threadgroup float kv[256];
-    threadgroup float qv[256];
-    const uint kq = (h % a.kh) * a.kd;                      // K heads tile over V heads
-    const uint kk = a.kh * a.kd + (h % a.kh) * a.kd;
-    const uint vv = 2 * a.kh * a.kd + h * a.vd;
-    for (uint t = v; t < a.kd; t += ntg) { kv[t] = c[kk + t]; qv[t] = c[kq + t] * a.scale; }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    if (v >= a.vd) return;
-    const float decay = exp(g[h]), b = beta[h];
-    device float * Sh = S + (ulong)h * a.kd * a.vd + v;
-    float sk = 0.f;
-    for (uint k = 0; k < a.kd; ++k) {
-        const float s = Sh[k * a.vd] * decay;
-        Sh[k * a.vd] = s;
-        sk += s * kv[k];
+                      uint2 tgp [[threadgroup_position_in_grid]],
+                      uint2 tpg [[thread_position_in_threadgroup]]) {
+    threadgroup float kv[DELTA_KD];
+    threadgroup float qv[DELTA_KD];
+    const uint h = tgp.x, tid = tpg.x, v = tgp.y * DELTA_TG + tid;
+    const uint kq = (h % a.kh) * DELTA_KD;                  // K heads tile over V heads
+    const uint kk = a.kh * DELTA_KD + (h % a.kh) * DELTA_KD;
+    const uint vv = 2 * a.kh * DELTA_KD + h * a.vd;
+    device float * Sh = S + (ulong)h * DELTA_KD * a.vd + v;
+    float s[DELTA_KD];
+    for (uint k = 0; k < DELTA_KD; ++k) s[k] = Sh[k * a.vd];
+    for (uint t = 0; t < a.n; ++t) {
+        device const float * ct = c + (ulong)t * a.ch;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint i = tid; i < DELTA_KD; i += DELTA_TG) { kv[i] = ct[kk + i]; qv[i] = ct[kq + i] * a.scale; }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        const float decay = exp(g[t * a.vh + h]), b = beta[t * a.vh + h];
+        float sk = 0.f;
+        for (uint k = 0; k < DELTA_KD; ++k) { s[k] *= decay; sk += s[k] * kv[k]; }
+        const float d = (ct[vv + v] - sk) * b;
+        float ov = 0.f;
+        for (uint k = 0; k < DELTA_KD; ++k) { s[k] += kv[k] * d; ov += s[k] * qv[k]; }
+        o[((ulong)t * a.vh + h) * a.vd + v] = ov;
     }
-    const float d = (c[vv + v] - sk) * b;
-    float ov = 0.f;
-    for (uint k = 0; k < a.kd; ++k) {
-        const float s = Sh[k * a.vd] + kv[k] * d;
-        Sh[k * a.vd] = s;
-        ov += s * qv[k];
-    }
-    o[h * a.vd + v] = ov;
+    for (uint k = 0; k < DELTA_KD; ++k) Sh[k * a.vd] = s[k];
 }
 
 struct outnorm_args { uint vd; float eps; };
@@ -297,12 +452,12 @@ kernel void q35_outnorm(constant outnorm_args & a [[buffer(0)]],
 
 // --- a full (gated attention) layer -----------------------------------------------
 
-struct qk_args { uint nh; uint nkv; uint hd; uint rope_dims; float eps; uint pos; };
+struct qk_args { uint nh; uint nkv; uint hd; uint rope_dims; float eps; uint pos0; };
 
-// Per head (a threadgroup, a thread a dimension): Q's heads come out of QG
-// ([q | gate] per head), K's from K; each is normed, then its first
-// ROPE_DIMS rotated as NEOX pairs by the table ROPE ([cos | sin]); K and V go
-// to the caches at POS.
+// Per head of each token (a threadgroup; grid x the head, y the token; a
+// thread a dimension): Q's heads come out of QG ([q | gate] per head), K's
+// from K; each is normed, then its first ROPE_DIMS rotated as NEOX pairs by
+// the token's row of ROPE ([cos | sin]); K and V go to the caches at POS0+t.
 kernel void q35_qk(constant qk_args & a [[buffer(0)]],
                    device const float * qg [[buffer(1)]], device const float * kin [[buffer(2)]],
                    device const float * vin [[buffer(3)]],
@@ -310,17 +465,21 @@ kernel void q35_qk(constant qk_args & a [[buffer(0)]],
                    device const float * rope [[buffer(6)]],
                    device float * q [[buffer(7)]], device float * gate [[buffer(8)]],
                    device float * kc [[buffer(9)]], device float * vc [[buffer(10)]],
-                   uint u [[threadgroup_position_in_grid]],
-                   uint t [[thread_position_in_threadgroup]],
-                   uint ntg [[threads_per_threadgroup]]) {
+                   uint2 tgp [[threadgroup_position_in_grid]],
+                   uint2 tpg [[thread_position_in_threadgroup]],
+                   uint2 ntg2 [[threads_per_threadgroup]]) {
+    const uint t = tpg.x, ntg = ntg2.x;
     threadgroup float sh[32];
     threadgroup float xs[512];
-    const uint hd = a.hd, kvd = a.nkv * hd;
+    const uint u = tgp.x, tk = tgp.y, pos = a.pos0 + tk;
+    const uint hd = a.hd, kvd = a.nkv * hd, qd = a.nh * hd;
     const bool isq = u < a.nh;
     const uint j = isq ? u : u - a.nh;
-    device const float * src = isq ? qg + j * 2 * hd : kin + j * hd;
+    device const float * qgt = qg + (ulong)tk * 2 * qd;
+    device const float * src = isq ? qgt + j * 2 * hd : kin + (ulong)tk * kvd + j * hd;
     device const float * nw  = isq ? qn : kn;
-    device float * dst = isq ? q + j * hd : kc + (ulong)a.pos * kvd + j * hd;
+    device float * dst = isq ? q + (ulong)tk * qd + j * hd : kc + (ulong)pos * kvd + j * hd;
+    device const float * rp = rope + tk * a.rope_dims;
     float ss = 0.f;
     for (uint i = t; i < hd; i += ntg) { const float x = src[i]; xs[i] = x; ss += x * x; }
     ss = tg_sum(ss, sh, t, ntg);
@@ -331,52 +490,58 @@ kernel void q35_qk(constant qk_args & a [[buffer(0)]],
     for (uint i = t; i < hd; i += ntg) {
         float r;
         if (i < half_) {
-            r = xs[i] * rope[i] - xs[i + half_] * rope[half_ + i];
+            r = xs[i] * rp[i] - xs[i + half_] * rp[half_ + i];
         } else if (i < a.rope_dims) {
             const uint k = i - half_;
-            r = xs[k] * rope[half_ + k] + xs[i] * rope[k];
+            r = xs[k] * rp[half_ + k] + xs[i] * rp[k];
         } else {
             r = xs[i];
         }
         dst[i] = r;
-        if (isq) gate[j * hd + i] = qg[j * 2 * hd + hd + i];
-        else     vc[(ulong)a.pos * kvd + j * hd + i] = vin[j * hd + i];
+        if (isq) gate[(ulong)tk * qd + j * hd + i] = qgt[j * 2 * hd + hd + i];
+        else     vc[(ulong)pos * kvd + j * hd + i] = vin[(ulong)tk * kvd + j * hd + i];
     }
 }
 
-struct attn_args { uint nh; uint nkv; uint hd; uint n; float scale; };
+struct attn_args { uint nh; uint nkv; uint hd; uint n0; float scale; };
 
-// One query head (a threadgroup): softmax(q.K / sqrt(hd)) . V over positions
-// 0..N-1; SC (threadgroup memory, N floats) holds the scores.
+// One query head of one token (grid x the head, y the token): softmax(q.K /
+// sqrt(hd)) . V over positions 0..N0+t-1 -- causality is the length; SC
+// (threadgroup memory) holds the scores.
 kernel void attend(constant attn_args & a [[buffer(0)]],
                    device const float * q [[buffer(1)]],
                    device const float * kc [[buffer(2)]], device const float * vc [[buffer(3)]],
                    device float * out [[buffer(4)]],
                    threadgroup float * sc [[threadgroup(0)]],
-                   uint h [[threadgroup_position_in_grid]],
-                   uint t [[thread_position_in_threadgroup]],
-                   uint ntg [[threads_per_threadgroup]]) {
+                   uint2 tgp [[threadgroup_position_in_grid]],
+                   uint2 tpg [[thread_position_in_threadgroup]],
+                   uint2 ntg2 [[threads_per_threadgroup]]) {
+    const uint t = tpg.x, ntg = ntg2.x;
     threadgroup float sh[32];
-    const uint hd = a.hd, kvd = a.nkv * hd, kvh = h / (a.nh / a.nkv);
-    device const float * qh = q + h * hd;
+    const uint h = tgp.x, tk = tgp.y, n = a.n0 + tk;
+    const uint hd = a.hd, kvd = a.nkv * hd, kvh = h / (a.nh / a.nkv), qd = a.nh * hd;
+    device const float * qh = q + (ulong)tk * qd + h * hd;
+    // the scores: a simdgroup a position, its lanes across the dimensions
+    const uint lane = t % 32, sg = t / 32, nsg = ntg / 32;
     float mx = -INFINITY;
-    for (uint p = t; p < a.n; p += ntg) {
+    for (uint p = sg; p < n; p += nsg) {
         device const float * kr = kc + (ulong)p * kvd + kvh * hd;
         float s = 0.f;
-        for (uint i = 0; i < hd; ++i) s += qh[i] * kr[i];
-        s *= a.scale;
-        sc[p] = s;
+        for (uint i = lane; i < hd; i += 32) s += qh[i] * kr[i];
+        s = simd_sum(s) * a.scale;
+        if (lane == 0) sc[p] = s;
         mx = max(mx, s);
     }
     mx = tg_max(mx, sh, t, ntg);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
     float sum = 0.f;
-    for (uint p = t; p < a.n; p += ntg) { const float e = exp(sc[p] - mx); sc[p] = e; sum += e; }
+    for (uint p = t; p < n; p += ntg) { const float e = exp(sc[p] - mx); sc[p] = e; sum += e; }
     sum = tg_sum(sum, sh, t, ntg);
     threadgroup_barrier(mem_flags::mem_threadgroup);
     const float inv = 1.0f / sum;
     for (uint i = t; i < hd; i += ntg) {
         float acc = 0.f;
-        for (uint p = 0; p < a.n; ++p) acc += sc[p] * vc[(ulong)p * kvd + kvh * hd + i];
-        out[h * hd + i] = acc * inv;
+        for (uint p = 0; p < n; ++p) acc += sc[p] * vc[(ulong)p * kvd + kvh * hd + i];
+        out[(ulong)tk * qd + h * hd + i] = acc * inv;
     }
 }
