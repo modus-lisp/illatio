@@ -51,13 +51,14 @@
   (layers #() :type simple-vector)
   (gpu-plist '()))                      ; the GPU's state, when it runs (metal-ds4f.lisp)
 
-(defvar *ds4f-gpu* #+(and sbcl darwin) '(:experts :proj :attn :decode) #-(and sbcl darwin) nil
+(defvar *ds4f-gpu* #+(and sbcl darwin) '(:experts :proj :attn :decode :decode-all) #-(and sbcl darwin) nil
   "What of DS4F the GPU runs (metal-ds4f.lisp): any of :EXPERTS (prefill's
    routed FFN), :PROJ (prefill's attention and shared expert Q8_0
    products), :ATTN (prefill's attention), :DECODE (a token's routed
    experts, from the GPU's expert cache), :DECODE-ATTN (a token's attention
    projections; off: three command buffers a layer cost more, about 1.1 ms,
-   than the CPU's products, about 0.9); T is all of them, NIL none.")
+   than the CPU's products, about 0.9), :DECODE-ALL (a token's every layer
+   on the GPU, metal-ds4f-decode.lisp); T is all of them, NIL none.")
 
 (defparameter *ds4f-prefetch-k* 8
   "How many of the next layer's experts decode reads ahead (0: none).")
@@ -324,11 +325,12 @@
 
 ;;; --- RoPE: the last N-ROT dims of each head ---------------------------------------
 
-(defun d4-rope! (m x n-heads head-dim pos il &key inverse (xo 0))
-  "rope_tail_layer_inplace: on a compressed layer, base COMP-ROPE-BASE with
-   YaRN interpolation (its magnitude factor cancelled, as DeepSeek V4's
-   reference does), else plain RoPE at ROPE-BASE."
-  (declare (type f32vec x) (type fixnum n-heads head-dim pos il xo))
+(defun d4-rope-cs! (m pos il inverse cs)
+  "rope_tail_layer_inplace's pairs' (cos, sin), the same for every head, into
+   CS (N-ROT): on a compressed layer, base COMP-ROPE-BASE with YaRN
+   interpolation (its magnitude factor cancelled, as DeepSeek V4's reference
+   does), else plain RoPE at ROPE-BASE."
+  (declare (type f32vec cs) (type fixnum pos il))
   (let* ((n-rot (ds4f-n-rot m)) (compressed (plusp (svref (ds4f-ratios m) il)))
          (base (if compressed (ds4f-comp-rope-base m) (ds4f-rope-base m)))
          (fscale (if (and compressed (plusp (ds4f-rope-factor m))) (/ 1f0 (ds4f-rope-factor m)) 1f0))
@@ -344,9 +346,8 @@
                              (* 2f0 (log base)))))
         (setf corr0 (max 0f0 (ffloor (corr (ds4f-beta-fast m))))
               corr1 (min (float (1- n-rot) 1f0) (fceiling (corr (ds4f-beta-slow m)))))))
-    ;; the pairs' cos and sin, the same for every head: computed once
-    (let ((cs (make-array n-rot :element-type 'single-float)) (theta-extrap (float pos 1f0)))
-      (declare (type single-float theta-extrap) (dynamic-extent cs))
+    (let ((theta-extrap (float pos 1f0)))
+      (declare (type single-float theta-extrap))
       (loop for i from 0 below n-rot by 2
             do (let* ((interp (* fscale theta-extrap)) (theta interp) (mscale attn))
                  (declare (type single-float interp theta mscale))
@@ -357,7 +358,16 @@
                            mscale (* mscale (+ 1f0 (* 0.1f0 (log (/ 1f0 fscale))))))))
                  (setf (aref cs i) (* (cos theta) mscale)
                        (aref cs (1+ i)) (* sin-sign (sin theta) mscale)
-                       theta-extrap (* theta-extrap theta-scale))))
+                       theta-extrap (* theta-extrap theta-scale)))))
+    cs))
+
+(defun d4-rope! (m x n-heads head-dim pos il &key inverse (xo 0))
+  "rope_tail_layer_inplace: the last N-ROT dims of each head turned by
+   D4-ROPE-CS!'s pairs."
+  (declare (type f32vec x) (type fixnum n-heads head-dim pos il xo))
+  (let* ((n-rot (ds4f-n-rot m)) (cs (make-array n-rot :element-type 'single-float)))
+    (declare (dynamic-extent cs) (type fixnum n-rot))
+    (d4-rope-cs! m pos il inverse cs)
       (dotimes (h n-heads x)
         (let ((tail (+ xo (* h head-dim) (- head-dim n-rot))))
           (declare (type fixnum tail))
@@ -365,7 +375,7 @@
                 do (let ((c (aref cs i)) (s (aref cs (1+ i)))
                          (x0 (aref x (+ tail i))) (x1 (aref x (+ tail i 1))))
                      (setf (aref x (+ tail i)) (- (* x0 c) (* x1 s))
-                           (aref x (+ tail i 1)) (+ (* x0 s) (* x1 c))))))))))
+                           (aref x (+ tail i 1)) (+ (* x0 s) (* x1 c)))))))))
 
 ;;; --- hyper-connections -------------------------------------------------------------
 
@@ -455,14 +465,16 @@
      :caches (map 'simple-vector
                   (lambda (l)
                     (let* ((ratio (dl-ratio l)) (coff (if (= ratio 4) 2 1)) (cap (+ (floor n-ctx (max ratio 1)) 2)))
-                      (flet ((neg (n) (make-array n :element-type 'single-float :initial-element -1f30)))
+                      ;; static (outside the heap, not moved): the GPU's decode reads and writes them in place
+                      (flet ((zero (n) (f32vec n :static t))
+                             (neg (n) (fill (f32vec n :static t) -1f30)))
                         (make-d4cache
-                         :raw (f32vec (* (ds4f-swa m) hd))
-                         :comp (and (plusp ratio) (f32vec (* cap hd)))
-                         :st-kv (and (plusp ratio) (f32vec (* coff ratio coff hd)))
+                         :raw (zero (* (ds4f-swa m) hd))
+                         :comp (and (plusp ratio) (zero (* cap hd)))
+                         :st-kv (and (plusp ratio) (zero (* coff ratio coff hd)))
                          :st-score (and (plusp ratio) (neg (* coff ratio coff hd)))
-                         :ix-comp (and (= ratio 4) (f32vec (* cap ixd)))
-                         :ix-kv (and (= ratio 4) (f32vec (* coff ratio coff ixd)))
+                         :ix-comp (and (= ratio 4) (zero (* cap ixd)))
+                         :ix-kv (and (= ratio 4) (zero (* coff ratio coff ixd)))
                          :ix-score (and (= ratio 4) (neg (* coff ratio coff ixd)))))))
                   (ds4f-layers m)))))
 
@@ -471,6 +483,16 @@
   "The ring row of the window's row R (0 the oldest)."
   (declare (type fixnum r cap))
   (mod (+ (- (the fixnum (dc-raw-total c)) (the fixnum (dc-n-raw c))) r) cap))
+
+(defun free-d4ctx (ctx)
+  "Give back CTX's caches (static vectors), and the GPU's views of them."
+  (loop for c across (d4ctx-caches ctx)
+        do (dolist (v (list (dc-raw c) (dc-comp c) (dc-st-kv c) (dc-st-score c)
+                            (dc-ix-comp c) (dc-ix-kv c) (dc-ix-score c)))
+             (when v
+               (when (fboundp 'forget-gpu-vector) (funcall 'forget-gpu-vector (d4ctx-model ctx) v))
+               (free-static-vector v))))
+  (setf (d4ctx-caches ctx) #()))
 
 (defun push-raw! (m c kv)
   "kv_cache_push_raw: KV, through F16, at the end of the window (the oldest
@@ -1079,6 +1101,9 @@
   #-sbcl (ds4f-forward-1 ctx token logits))
 
 (defun ds4f-forward-1 (ctx token logits)
+  #+(and sbcl darwin)
+  (when (ds4f-gpu-p :decode-all)
+    (return-from ds4f-forward-1 (ds4f-gpu-forward ctx token logits)))
   (let* ((*q8-f16-scale* *ds4f-q8-f16-scale*)
          (m (d4ctx-model ctx)) (d (ds4f-d m)) (n (ds4f-n-hc m)) (pos (d4ctx-pos ctx))
          (streams (f32vec (* n d))) (next (f32vec (* n d))) (wf (ds4f-file m)))
@@ -1280,6 +1305,7 @@
 
 (defun ds4f-context-reset (ctx)
   "Start CTX over: fresh caches and compressor windows."
+  (let ((c (getf (context-plist ctx) :ds4f))) (when c (free-d4ctx c)))
   (remf (context-plist ctx) :ds4f)
   (setf (context-pos ctx) 0)
   ctx)

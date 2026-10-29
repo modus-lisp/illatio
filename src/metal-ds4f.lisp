@@ -266,7 +266,7 @@
     (when (plusp maxc) (copy-u32-in bix idx))
     (copy-floats-in bsk (dl-sinks l) nh)
     (with-gpu-work (e gpu)
-      (dispatch gpu e "d4_attend" (list nh hd (/ 1f0 (sqrt (float hd 1f0))) (max 1 maxc))
+      (dispatch gpu e "d4_attend" (list nh hd (/ 1f0 (sqrt (float hd 1f0))) (max 1 maxc) 0 0)
                 (list bq bkr bkc bra bnr bnc bix bsk bo)
                 n 512 :shared (* 4 (+ (* 8 512) (* 64 8) (* 8 64) 128))))
     (sb-sys:with-pinned-objects (heads)
