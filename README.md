@@ -20,7 +20,9 @@ Three models run, all checked against llama.cpp: Qwen2.5-0.5B-Instruct,
 Qwen3-4B-Instruct-2507 (the `qwen2` and `qwen3` architectures; `llama`
 shares the code path), in Q8_0 and, for Qwen3-4B, Q4_K_M (Q4_K and Q6_K
 weights), and a 27B Qwen3.5 in Q6_K (`qwen35`: gated delta net and gated
-attention layers).  On an Apple M-series laptop, against
+attention layers).  And DeepSeek V4 Flash (`deepseek4`, 284B parameters
+in an 86.7 GB GGUF), checked against ds4, streaming its routed experts
+from the SSD on a 48 GB machine (below).  On an Apple M-series laptop, against
 llama.cpp's CPU backend on the same file.  Qwen2.5-0.5B:
 
 | tok/s | illatio, NEON | illatio, portable | llama.cpp CPU |
@@ -65,6 +67,11 @@ the same 512-token prefill, except its 1-thread one, on 96):
 
 On the GPU (`load-model-gpu`; `-ngl 99` for llama.cpp) it passes the same
 llama.cpp vectors at the same noise floor as the CPU.
+
+DeepSeek V4 Flash, ds4's IQ2_XXS/Q2_K build (`ds4f`), on the CPU of a 48
+GB M4 Pro: decode 3.8 tok/s (ds4 on the GPU: 4.2), prefill 5.5 tok/s.  It
+chats and calls tools through the CLI and the OpenAI endpoint; a long
+prompt is slow yet (operandi's system prompt would take about 20 minutes).
 
 Other checks:
 
@@ -200,6 +207,23 @@ folds them straight into its stream state.
   token than a short one.  The rest are written from the Lisp ops, with the
   delta rule's state k-major as on the CPU and each thread's column of it
   kept in registers across a chunk.
+- **DeepSeek V4 Flash from the SSD** (`src/ds4f.lisp`, `src/iquant.lisp`).
+  A port of ds4's CPU reference path, op for op: four hyper-connection
+  streams mixed by a Sinkhorn split, Q through a LoRA, one 512-wide KV head
+  with tail RoPE (YaRN on the compressed layers) and the FP8/FP4 round trips
+  it was trained through, a 128-row window plus 4x and 128x compressed rows
+  (the 4x ones chosen by an indexer), attention with sinks, a grouped output
+  projection, and 6 of 256 experts plus a shared one.  The 86.7 GB file is
+  mapped whole as one Lisp byte vector (`MAP-FILE-VECTOR`: the array header
+  sits in an anonymous page right before the file's first byte), so the 78
+  GB of experts are read where they lie, never loaded: the kernels (NEON,
+  with the portable ones' bits) read IQ2_XXS and Q2_K blocks in place, a
+  layer's chosen experts are read ahead on threads of their own, and the
+  page cache holds what fits.  A prompt goes layer-major, each expert's
+  weights read once for every token of a 2048-token chunk that chose it --
+  bit-identical to feeding the tokens one at a time.  Its tokenizer
+  (joyai-llm) and chat format (tool schemas, DSML tool calls, reasoning)
+  are ds4's.
 - **The forward pass** mirrors llama.cpp's graph op for op: RMSNorm with its
   sum in double, NEOX RoPE with theta advanced by repeated multiplication as
   ggml does, GQA attention with ggml's softmax, SwiGLU (`src/model.lisp`).
@@ -249,6 +273,25 @@ checks Qwen3's template when that model is in `~/models`.
 - **render-test** checks the chat template against recorded llama-server
   renderings, and tool-call parsing.
 
+DeepSeek V4 Flash has its own, against ds4 (they need the GGUF,
+`$ILLATIO_DS4F`, and for the vectors ds4's checkout):
+
+```
+sbcl --dynamic-space-size 4096 --non-interactive --load inspect/ds4f-vectors-test.lisp
+sbcl --non-interactive --load inspect/ds4f-tokenizer-test.lisp
+sbcl --non-interactive --load inspect/iquant-test.lisp
+```
+
+- **ds4f-vectors-test** teacher-forces it through ds4's tokens and compares
+  log-probabilities with ds4's CPU path (`collect-ds4f-vectors.py`).  This
+  model's noise floor is high -- discrete steps (the top-6 expert choice,
+  the FP8/FP4 roundings) turn a 3e-4 change into another token now and then;
+  illatio against itself with only a rounding changed disagrees on 3 of 72
+  argmaxes -- and the bounds are that floor with headroom.
+- **ds4f-tokenizer-test**: ds4's ids for texts that exercise the split.
+- **iquant-test**: the expert kernels on real tensors against gguf-py's
+  dequantizers (identical floats), NEON against portable (identical bits).
+
 The vectors come from a CPU-only llama-server with an f32 KV cache, which is
 the plainest ggml path. To regenerate them:
 
@@ -272,8 +315,9 @@ inspect/collect-vectors.py http://localhost:18931 inspect/vectors/qwen2.5-0.5b-q
   (8 threads give 3x) and the serial per-layer ops between the products.
 - **More formats.** Q5_K (Q5_K_M files) and Q8_0-with-K-quant mixes.
 - **Qwen3.6-35B-A3B** (`qwen35moe`): expert routing on top of `qwen35`.
-- **ds4f.** DeepSeek V4 Flash, ported from ds4's CPU reference path, with
-  SSD streaming of routed experts for machines with less RAM than the model.
+- **ds4f.** Its prefill: the experts as matrix products (SMMLA) and the
+  compressors batched on the CPU, and above all the GPU path -- ds4's own
+  primary one -- with an expert cache in GPU buffers.
 
 ## License
 
