@@ -29,7 +29,8 @@
      (:file "metal" :if-feature (:and :sbcl :darwin))        ; the GPU, through the Objective-C runtime
      (:file "metal-qwen35" :if-feature (:and :sbcl :darwin)) ; qwen35 on it (kernels: src/metal/)
      (:file "generate")    ; sampling, prompt reuse, streaming text
-     (:file "ds4f")))))    ; DeepSeek V4 Flash (deepseek4), ported from ds4.c
+     (:file "ds4f")        ; DeepSeek V4 Flash (deepseek4), ported from ds4.c
+     (:file "metal-ds4f" :if-feature (:and :sbcl :darwin)))))) ; its prefill experts on the GPU
 
 (defsystem "illatio/openai"
   :description "OpenAI chat completions computed in this image: chat templates

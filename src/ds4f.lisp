@@ -48,7 +48,11 @@
   ratios clamps                         ; per layer: compress ratio, swiglu clamp
   (n-vocab 0 :type fixnum)
   embd-off output output-norm out-hc-fn out-hc-scale out-hc-base
-  (layers #() :type simple-vector))
+  (layers #() :type simple-vector)
+  (gpu-plist '()))                      ; the GPU's state, when it runs (metal-ds4f.lisp)
+
+(defvar *ds4f-gpu* #+(and sbcl darwin) t #-(and sbcl darwin) nil
+  "Whether a DS4F prefill runs its routed experts on the GPU (metal-ds4f.lisp).")
 
 (defstruct (d4layer (:conc-name dl-))
   ratio
@@ -210,6 +214,21 @@
                                         (setf (aref out r) acc))))))))
     out))
 
+(defun f32mm! (pool w xs n out)
+  "OUT[t*rows + r] = W row r . XS row t for N rows of XS: F32MV!'s dots (the
+   same bits), each weight row against every token while it is in cache."
+  (declare (type f32mat w) (type f32vec xs out) (type fixnum n))
+  (let ((rows (f32mat-rows w)) (cols (f32mat-cols w)) (data (f32mat-data w)))
+    (declare (type fixnum rows cols) (type f32vec data))
+    (assert (zerop (mod cols 16)))
+    (pool-run pool (lambda (i c)
+                     (multiple-value-bind (s e) (share rows i c)
+                       (with-attention-kernels (dot axpy) (data data xs out)
+                         (loop for r of-type fixnum from s below e
+                               do (dotimes (tk n)
+                                    (setf (aref out (+ (* tk rows) r)) (dot (* r cols) (* tk cols) cols))))))))
+    out))
+
 (defun q8mv! (pool w x out &optional (xq (make-q8vec (q8mat-cols w))))
   "OUT = W X for a Q8MAT, X quantized to Q8_0 first."
   (quantize-q8! x xq 0 (q8mat-cols w))
@@ -309,22 +328,28 @@
                              (* 2f0 (log base)))))
         (setf corr0 (max 0f0 (ffloor (corr (ds4f-beta-fast m))))
               corr1 (min (float (1- n-rot) 1f0) (fceiling (corr (ds4f-beta-slow m)))))))
-    (dotimes (h n-heads x)
-      (let ((tail (+ xo (* h head-dim) (- head-dim n-rot))) (theta-extrap (float pos 1f0)))
-        (declare (type single-float theta-extrap))
-        (loop for i from 0 below n-rot by 2
-              do (let* ((interp (* fscale theta-extrap)) (theta interp) (mscale attn))
-                   (declare (type single-float interp theta mscale))
-                   (when (/= ext 0f0)
-                     (let* ((y (/ (- (float (floor i 2) 1f0) corr0) (max 0.001f0 (- corr1 corr0))))
-                            (ramp (* (- 1f0 (min 1f0 (max 0f0 y))) ext)))
-                       (setf theta (+ (* interp (- 1f0 ramp)) (* theta-extrap ramp))
-                             mscale (* mscale (+ 1f0 (* 0.1f0 (log (/ 1f0 fscale))))))))
-                   (let ((c (* (cos theta) mscale)) (s (* sin-sign (sin theta) mscale))
+    ;; the pairs' cos and sin, the same for every head: computed once
+    (let ((cs (make-array n-rot :element-type 'single-float)) (theta-extrap (float pos 1f0)))
+      (declare (type single-float theta-extrap) (dynamic-extent cs))
+      (loop for i from 0 below n-rot by 2
+            do (let* ((interp (* fscale theta-extrap)) (theta interp) (mscale attn))
+                 (declare (type single-float interp theta mscale))
+                 (when (/= ext 0f0)
+                   (let* ((y (/ (- (float (floor i 2) 1f0) corr0) (max 0.001f0 (- corr1 corr0))))
+                          (ramp (* (- 1f0 (min 1f0 (max 0f0 y))) ext)))
+                     (setf theta (+ (* interp (- 1f0 ramp)) (* theta-extrap ramp))
+                           mscale (* mscale (+ 1f0 (* 0.1f0 (log (/ 1f0 fscale))))))))
+                 (setf (aref cs i) (* (cos theta) mscale)
+                       (aref cs (1+ i)) (* sin-sign (sin theta) mscale)
+                       theta-extrap (* theta-extrap theta-scale))))
+      (dotimes (h n-heads x)
+        (let ((tail (+ xo (* h head-dim) (- head-dim n-rot))))
+          (declare (type fixnum tail))
+          (loop for i from 0 below n-rot by 2
+                do (let ((c (aref cs i)) (s (aref cs (1+ i)))
                          (x0 (aref x (+ tail i))) (x1 (aref x (+ tail i 1))))
                      (setf (aref x (+ tail i)) (- (* x0 c) (* x1 s))
-                           (aref x (+ tail i 1)) (+ (* x0 s) (* x1 c))))
-                   (setf theta-extrap (* theta-extrap theta-scale))))))))
+                           (aref x (+ tail i 1)) (+ (* x0 s) (* x1 c))))))))))
 
 ;;; --- hyper-connections -------------------------------------------------------------
 
@@ -364,12 +389,18 @@
       (loop repeat (1- (ds4f-sinkhorn m)) do (rows) (cols)))
     (values pre post c)))
 
-(defun hc-pre (m fn scale base streams out flat)
+(defun hc-pre (m fn scale base streams out flat &key serial)
   "hc_pre_from_state_one_scratch: OUT = the pre-weighted sum of STREAMS;
-   (values post comb)."
+   (values post comb).  SERIAL: on this thread alone, for a caller that runs
+   tokens in parallel (the same dot kernel, so the same bits)."
   (let* ((n (ds4f-n-hc m)) (d (ds4f-d m)) (mix (f32vec (f32mat-rows fn))))
     (d4-rms! streams flat (* n d) (ds4f-eps m))
-    (f32mv! (ds4f-pool m) fn flat mix)
+    (if serial
+        (let ((data (f32mat-data fn)) (cols (f32mat-cols fn)))
+          (declare (type f32vec data mix flat) (type fixnum cols))
+          (with-attention-kernels (dot axpy) (data data flat mix)
+            (dotimes (r (f32mat-rows fn)) (setf (aref mix r) (dot (* r cols) 0 cols)))))
+        (f32mv! (ds4f-pool m) fn flat mix))
     (multiple-value-bind (pre post comb) (hc-split m mix scale base)
       (declare (type f32vec pre streams out) (type fixnum n d))
       (dotimes (j d)
@@ -433,7 +464,7 @@
 
 ;;; --- the compressor ----------------------------------------------------------------
 
-(defun compress-step (m wkv wgate ape norm x st-kv st-score head-dim ratio il pos)
+(defun compress-step (m wkv wgate ape norm x st-kv st-score head-dim ratio il pos &key kv sc (o 0))
   "compressor_decode_one_decode_scratch: this token's projected row and
    score (plus the learned position term APE) into the window; every RATIO
    tokens, the window softmax-pooled per dim, normed, RoPE'd at its first
@@ -443,8 +474,11 @@
          (pos-mod (mod pos ratio)) (row (if (= ratio 4) (+ ratio pos-mod) pos-mod))
          (kv-cur (f32vec width)) (sc-cur (f32vec width)) (ape-d (f32mat-data ape)))
     (declare (type f32vec st-kv st-score kv-cur sc-cur ape-d))
-    (f32mv! pool wkv x kv-cur)
-    (f32mv! pool wgate x sc-cur)
+    (if kv                              ; projected already, for a whole chunk
+        (progn (replace kv-cur kv :start2 o :end2 (+ o width))
+               (replace sc-cur sc :start2 o :end2 (+ o width)))
+        (progn (f32mv! pool wkv x kv-cur)
+               (f32mv! pool wgate x sc-cur)))
     (dotimes (j width) (incf (aref sc-cur j) (aref ape-d (+ (* pos-mod (f32mat-cols ape)) j))))
     (replace st-kv kv-cur :start1 (* row width))
     (replace st-score sc-cur :start1 (* row width))
@@ -650,6 +684,33 @@
                 (dot-rows g4 xo (floor xo 32) (+ (* tk rows) (* 4 g4)))))))))
     out))
 
+(defun d4-hc-pre-chunk (m fn scale base norm-w cur n norms posts combs)
+  "HC-PRE then the block's RMS norm for each of N tokens (streams in CUR),
+   tokens in parallel, each on one thread: NORMS gets the normed inputs,
+   POSTS and COMBS the HC post weights."
+  (let* ((d (ds4f-d m)) (hcd (* (ds4f-n-hc m) d)) (eps (ds4f-eps m)))
+    (pool-run (ds4f-pool m)
+              (lambda (i c)
+                (multiple-value-bind (s e) (share n i c)
+                  (let ((streams (f32vec hcd)) (cur1 (f32vec d)) (flat (f32vec hcd)))
+                    (loop for tk from s below e
+                          do (replace streams cur :start2 (* tk hcd) :end2 (* (1+ tk) hcd))
+                             (multiple-value-bind (post comb) (hc-pre m fn scale base streams cur1 flat :serial t)
+                               (setf (svref posts tk) post (svref combs tk) comb))
+                             (d4-rms! cur1 norms d eps norm-w 0 (* tk d)))))))))
+
+(defun d4-shared-chunk! (m l norms n clamp)
+  "D4-SHARED! for N tokens at once (MATMUL!: each (row, token) its bits)."
+  (let* ((pool (ds4f-pool m)) (ff (ds4f-ff-exp m)) (d (ds4f-d m))
+         (g (q8mm! pool (dl-sh-gate l) norms n (f32vec (* n ff))))
+         (u (q8mm! pool (dl-sh-up l) norms n (f32vec (* n ff)))))
+    (declare (type f32vec g u))
+    (dotimes (i (* n ff))
+      (let ((gi (aref g i)) (ui (aref u i)))
+        (when (> clamp 1f-6) (setf gi (min gi clamp) ui (max (- clamp) (min ui clamp))))
+        (setf (aref g i) (* (d4-silu gi) ui))))
+    (q8mm! pool (dl-sh-down l) g n (f32vec (* n d)))))
+
 (defun d4-attention-chunk (m l li c cur next n pos0)
   "D4-ATTENTION for N tokens (their streams in CUR, a token every N-HC * D),
    the streams after it into NEXT."
@@ -659,17 +720,19 @@
          (qr (f32vec (* n lq))) (qr-norm (f32vec (* n lq))) (q (f32vec (* n nh hd)))
          (kv0 (f32vec (* n hd))) (heads (f32vec (* n nh hd)))
          (streams (f32vec hcd)) (cur1 (f32vec d)) (flat (f32vec hcd)) (norm (f32vec d)))
-    (dotimes (tk n)
-      (replace streams cur :start2 (* tk hcd) :end2 (* (1+ tk) hcd))
-      (multiple-value-bind (post comb)
-          (hc-pre m (dl-hc-attn-fn l) (dl-hc-attn-scale l) (dl-hc-attn-base l) streams cur1 flat)
-        (setf (svref posts tk) post (svref combs tk) comb))
-      (d4-rms! cur1 norms d eps (dl-attn-norm l) 0 (* tk d)))
+    (d4-hc-pre-chunk m (dl-hc-attn-fn l) (dl-hc-attn-scale l) (dl-hc-attn-base l) (dl-attn-norm l)
+                     cur n norms posts combs)
     (q8mm! pool (dl-q-a l) norms n qr)
     (dotimes (tk n) (d4-rms! qr qr-norm lq eps (dl-q-a-norm l) (* tk lq) (* tk lq)))
     (q8mm! pool (dl-q-b l) qr-norm n q)
     (dotimes (u (* n nh)) (d4-rms! q q hd eps nil (* u hd) (* u hd)))
     (q8mm! pool (dl-kv l) norms n kv0)
+    ;; the compressors' projections, for the chunk
+    (let* ((coff (if (= ratio 4) 2 1)) (cw (* coff hd)) (iw (* coff (ds4f-ix-dim m)))
+           (ckv (and (plusp ratio) (f32mm! pool (dl-comp-kv l) norms n (f32vec (* n cw)))))
+           (csc (and (plusp ratio) (f32mm! pool (dl-comp-gate l) norms n (f32vec (* n cw)))))
+           (ikv (and (= ratio 4) (f32mm! pool (dl-ixc-kv l) norms n (f32vec (* n iw)))))
+           (isc (and (= ratio 4) (f32mm! pool (dl-ixc-gate l) norms n (f32vec (* n iw))))))
     ;; token by token: the cache, the compressors, the indexer, attention
     (let ((kv (f32vec hd)) (qt (f32vec (* nh hd))) (qrt (f32vec lq)) (ht (f32vec (* nh hd))))
       (dotimes (tk n)
@@ -684,16 +747,18 @@
           (push-raw! m c kv)
           (when (plusp ratio)
             (let ((row (compress-step m (dl-comp-kv l) (dl-comp-gate l) (dl-comp-ape l) (dl-comp-norm l)
-                                      norm (dc-st-kv c) (dc-st-score c) hd ratio li pos)))
+                                      norm (dc-st-kv c) (dc-st-score c) hd ratio li pos
+                                      :kv ckv :sc csc :o (* tk cw))))
               (when row (push-comp! (dc-comp c) #'dc-n-comp hd row c) (incf (dc-n-comp c))))
             (when (= ratio 4)
               (let ((row (compress-step m (dl-ixc-kv l) (dl-ixc-gate l) (dl-ixc-ape l) (dl-ixc-norm l)
-                                        norm (dc-ix-kv c) (dc-ix-score c) (ds4f-ix-dim m) ratio li pos)))
+                                        norm (dc-ix-kv c) (dc-ix-score c) (ds4f-ix-dim m) ratio li pos
+                                        :kv ikv :sc isc :o (* tk iw))))
                 (when row (push-comp! (dc-ix-comp c) #'dc-n-ix (ds4f-ix-dim m) row c) (incf (dc-n-ix c))))))
           (let ((allowed (and (= ratio 4) (indexer-allowed m l c norm qrt li pos))))
             (d4-attend! m l qt c allowed ht)
             (d4-rope! m ht nh hd pos li :inverse t)
-            (replace heads ht :start1 (* tk nh hd))))))
+            (replace heads ht :start1 (* tk nh hd)))))))
     ;; out, for the chunk
     (let* ((groups (ds4f-out-groups m)) (rank (ds4f-lora-o m)) (gdim (* hd (floor nh groups)))
            (low (f32vec (* n groups rank))) (out (f32vec (* n d))) (o1 (f32vec d)) (out-s (f32vec hcd)))
@@ -946,14 +1011,11 @@
         (let ((norms (f32vec (* n d))) (posts (make-array n)) (combs (make-array n))
               (sels (make-array n)) (ws (make-array n)) (clamp (svref (ds4f-clamps m) li))
               (groups (make-hash-table)))
-          (dotimes (tk n)
-            (replace streams cur :start2 (* tk hcd) :end2 (* (1+ tk) hcd))
-            (let ((cur1 (f32vec d)) (flat (f32vec hcd)) (norm (f32vec d)))
-              (multiple-value-bind (post comb)
-                  (hc-pre m (dl-hc-ffn-fn l) (dl-hc-ffn-scale l) (dl-hc-ffn-base l) streams cur1 flat)
-                (setf (svref posts tk) post (svref combs tk) comb))
-              (d4-rms! cur1 norm d eps (dl-ffn-norm l))
-              (replace norms norm :start1 (* tk d))
+          (d4-hc-pre-chunk m (dl-hc-ffn-fn l) (dl-hc-ffn-scale l) (dl-hc-ffn-base l) (dl-ffn-norm l)
+                           cur n norms posts combs)
+          (let ((norm (f32vec d)))
+            (dotimes (tk n)
+              (replace norm norms :start2 (* tk d) :end2 (* (1+ tk) d))
               (multiple-value-bind (sel w) (d4-route m l li norm (svref tokv tk))
                 (setf (svref sels tk) sel (svref ws tk) w)
                 (dotimes (slot nu) (push (cons tk slot) (gethash (aref sel slot) groups))))))
@@ -962,6 +1024,10 @@
                  (ev (coerce experts 'simple-vector)) (ne (length ev))
                  (xq (make-q8kvec (* n d))) (mid (f32vec (* n nu ff))) (midq (make-q8kvec (* n nu ff)))
                  (down (f32vec (* n nu d))))
+            (if *ds4f-gpu*
+                #+(and sbcl darwin) (ds4f-gpu-experts! m l li ev users norms ws n down)
+                #-(and sbcl darwin) nil
+                (progn
             (prefetch-experts m l ev)
             (dotimes (tk n) (quantize-q8k! norms xq (* tk d) d (* tk d)))
             ;; gate and up: an item is (expert, row), against every token that chose it
@@ -1000,17 +1066,16 @@
                                              (loop for (tk . slot) across (svref users k)
                                                    do (setf (aref down (+ (* (+ (* tk nu) slot) d) r))
                                                             (q2k-row-dot* desc wf (+ doff (* (+ (* ex drows) r) drb)) nb midq
-                                                                          (* (+ (* tk nu) slot) ff)))))))))))))
+                                                                          (* (+ (* tk nu) slot) ff)))))))))))))))
             ;; per token: its experts in slot order, the shared expert, the HC post
-            (let ((moe (f32vec d)) (shared (f32vec d)) (norm (f32vec d)))
+            (let ((moe (f32vec d)) (shared (d4-shared-chunk! m l norms n clamp)))
+              (declare (type f32vec shared))
               (dotimes (tk n)
                 (dotimes (r d)
                   (let ((acc 0f0))
                     (dotimes (slot nu) (incf acc (aref down (+ (* (+ (* tk nu) slot) d) r))))
                     (setf (aref moe r) acc)))
-                (replace norm norms :start2 (* tk d))
-                (d4-shared! m l norm clamp shared)
-                (dotimes (i d) (setf (aref moe i) (+ (aref moe i) (aref shared i))))
+                (dotimes (i d) (setf (aref moe i) (+ (aref moe i) (aref shared (+ (* tk d) i)))))
                 (replace streams cur :start2 (* tk hcd) :end2 (* (1+ tk) hcd))
                 (hc-post! m out-s moe streams (svref posts tk) (svref combs tk))
                 (replace next out-s :start1 (* tk hcd))))))
