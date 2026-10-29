@@ -568,6 +568,46 @@
             (when (and (zerop (aref allowed r)) (> (aref scores r) bs)) (setf best r bs (aref scores r))))
           (setf (aref allowed best) 1))))))
 
+;;; The indexer for a chunk: what INDEXER-ALLOWED does a token at a time,
+;;; its projections as one product (F32MM!, F32MV!'s bits), the scores on
+;;; the GPU (ds4's tiled kernel), each token's TOP-K picked as INDEXER-ALLOWED
+;;; picks them (the highest first, the earlier row of equal ones).
+
+(defun top-k-rows (scores off nvis k)
+  "The K highest of SCORES[OFF..OFF+NVIS), their rows in order, the earlier
+   of equal scores first."
+  (declare (type f32vec scores) (type fixnum off nvis k))
+  (let* ((tmp (sort (subseq scores off (+ off nvis)) #'>))
+         (thr (aref tmp (1- k)))
+         (ties (- k (count-if (lambda (s) (> s thr)) tmp)))
+         (out (make-array k :element-type '(unsigned-byte 32))) (i 0))
+    (declare (type single-float thr) (type fixnum ties i))
+    (dotimes (r nvis out)
+      (let ((s (aref scores (+ off r))))
+        (when (or (> s thr) (and (= s thr) (plusp ties) (decf ties) t))
+          (setf (aref out i) r) (incf i))))))
+
+(defun indexer-chunk (m l li c qr-norm norms n pos0 vis)
+  "Per token of the chunk (its Q-LoRA rows in QR-NORM, attention norms in
+   NORMS) that sees more than TOP-K of the VIS[t] indexer rows, the TOP-K
+   rows it attends to; NIL for the ones that see all."
+  (let* ((hd (ds4f-ix-dim m)) (nh (ds4f-ix-heads m)) (pool (ds4f-pool m))
+         (top-k (ds4f-ix-top-k m)) (ncomp (dc-n-ix c))
+         (q (f32mm! pool (dl-ix-q-b l) qr-norm n (f32vec (* n nh hd))))
+         (w (f32mm! pool (dl-ix-proj l) norms n (f32vec (* n nh))))
+         (scores (f32vec (* n ncomp))) (tops (make-array n :initial-element nil))
+         (scale (/ 1f0 (sqrt (float (* hd nh) 1f0)))))
+    (declare (type f32vec q w scores))
+    (parallel-for (tk n pool)
+      (d4-rope! m q nh hd (+ pos0 tk) li :xo (* tk nh hd))
+      (dotimes (h nh) (indexer-qat! q (* (+ (* tk nh) h) hd))))
+    (dotimes (i (* n nh)) (setf (aref w i) (* (aref w i) scale)))
+    #+(and sbcl darwin) (gpu-ix-scores! m n q w (dc-ix-comp c) ncomp vis scores)
+    (parallel-for (tk n pool)
+      (when (> (aref vis tk) top-k)
+        (setf (svref tops tk) (top-k-rows scores (* tk ncomp) (aref vis tk) top-k))))
+    tops))
+
 ;;; --- attention ---------------------------------------------------------------------
 
 (defun d4-attend! (m l q c allowed heads)
@@ -764,7 +804,8 @@
            (raws (and gpu (make-array n :element-type '(unsigned-byte 32))))
            (nraw (and gpu (make-array n :element-type '(unsigned-byte 32))))
            (ncomp (and gpu (make-array n :element-type '(unsigned-byte 32))))
-           (lists (and gpu (make-array n))))
+           (lists (and gpu (make-array n)))
+           (ixvis (and gpu (= ratio 4) (make-array n :element-type '(unsigned-byte 32)))))
       (when gpu (replace kr (dc-raw c) :end2 (* prev hd)))
       (dotimes (tk n)
         (let ((pos (+ pos0 tk)))
@@ -786,7 +827,8 @@
                                         norm (dc-ix-kv c) (dc-ix-score c) (ds4f-ix-dim m) ratio li pos
                                         :kv ikv :sc isc :o (* tk iw))))
                 (when row (push-comp! (dc-ix-comp c) #'dc-n-ix (ds4f-ix-dim m) row c) (incf (dc-n-ix c))))))
-          (let ((allowed (and (= ratio 4) (indexer-allowed m l c norm qrt li pos))))
+          (when ixvis (setf (aref ixvis tk) (dc-n-ix c)))
+          (let ((allowed (and (= ratio 4) (not gpu) (indexer-allowed m l c norm qrt li pos))))
             (if gpu
                 (let ((row (+ prev tk)))
                   ;; the row as the cache holds it (through F16), at its place
@@ -804,6 +846,14 @@
                   (d4-attend! m l qt c allowed ht)
                   (d4-rope! m ht nh hd pos li :inverse t)
                   (replace heads ht :start1 (* tk nh hd)))))))
+      (when (and ixvis (> (dc-n-ix c) (ds4f-ix-top-k m)))
+        ;; the indexer for the chunk at once: the tokens that see more than
+        ;; TOP-K compressed rows attend only to the TOP-K it scores highest
+        (let ((tops (indexer-chunk m l li c qr-norm norms n pos0 ixvis)))
+          (dotimes (tk n)
+            (when (svref tops tk)
+              (setf (svref lists tk) (svref tops tk)
+                    (aref ncomp tk) (length (svref tops tk)))))))
       (when gpu
         (let* ((maxc (reduce #'max ncomp :initial-value 0))
                (idx (make-array (* n (max 1 maxc)) :element-type '(unsigned-byte 32)))

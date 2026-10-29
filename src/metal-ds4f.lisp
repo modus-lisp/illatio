@@ -262,3 +262,24 @@
     (sb-sys:with-pinned-objects (heads)
       (sap-copy (sb-sys:vector-sap heads) (gbuf-sap bo) (* 4 qn)))
     heads))
+
+(defun gpu-ix-scores! (m n q w k ncomp vis scores)
+  "D4_IX_SCORES for N tokens: their indexer queries Q (N x heads x 128,
+   RoPE'd and FP4-rounded) and scaled head weights W (N x heads) against the
+   NCOMP indexer rows K; token t sees VIS[t] of them.  SCORES, N x NCOMP,
+   -inf past what a token sees."
+  (let* ((st (ds4f-gpu-state m)) (gpu (d4gpu-gpu st))
+         (nh (ds4f-ix-heads m)) (hd (ds4f-ix-dim m)) (qn (* n nh hd))
+         (bq (d4gpu-buf st :iq (* 4 qn))) (bw (d4gpu-buf st :iw (* 4 n nh)))
+         (bk (d4gpu-buf st :ik (* 4 ncomp hd))) (bv (d4gpu-buf st :ivis (* 4 n)))
+         (bs (d4gpu-buf st :iscores (* 4 n ncomp))))
+    (assert (= hd 128) () "d4_ix_scores is written for 128-wide indexer heads")
+    (copy-floats-in bq q qn) (copy-floats-in bw w (* n nh))
+    (copy-floats-in bk k (* ncomp hd)) (copy-u32-in bv vis)
+    (with-gpu-work (e gpu)
+      (dispatch gpu e "d4_ix_scores" (list n ncomp nh) (list bq bw bk bv bs)
+                (list (ceiling ncomp 32) (ceiling n 8)) 128
+                :shared (* 4 (+ (* 8 128) (* 32 128) (* 8 32)))))
+    (sb-sys:with-pinned-objects (scores)
+      (sap-copy (sb-sys:vector-sap scores) (gbuf-sap bs) (* 4 n ncomp)))
+    scores))

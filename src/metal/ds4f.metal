@@ -347,3 +347,71 @@ kernel void d4_attend(constant d4_attn_args & a [[buffer(0)]],
         simdgroup_store(o[c], ot + c * 8, D4_HD);
     }
 }
+
+// --- the indexer's scores for a chunk ---------------------------------------------
+
+struct d4_ixs_args { uint n; uint ncomp; uint nh; };
+
+// ds4's kernel_dsv4_indexer_scores_tiled_f32 (MIT, antirez/ds4): SCORES[t][r]
+// = sum over heads h of relu(Q[t][h] . K[r]) * W[t][h] (W scaled), for the
+// rows token t sees (VIS[t]), -inf past them.  A threadgroup (4 simdgroups)
+// takes 8 tokens x 32 rows; the 128-wide dots are 8x8 simdgroup matrices.
+kernel void d4_ix_scores(constant d4_ixs_args & a [[buffer(0)]],
+                         device const float * q [[buffer(1)]],
+                         device const float * w [[buffer(2)]],
+                         device const float * k [[buffer(3)]],
+                         device const uint  * vis [[buffer(4)]],
+                         device float * scores [[buffer(5)]],
+                         threadgroup float * shmem [[threadgroup(0)]],
+                         uint2 tg [[threadgroup_position_in_grid]],
+                         ushort tid [[thread_index_in_threadgroup]],
+                         ushort lane [[thread_index_in_simdgroup]],
+                         ushort sg [[simdgroup_index_in_threadgroup]]) {
+    constexpr uint TM = 8, TN = 32, TS = 8, D = 128;
+    const uint c0 = tg.x * TN, t0 = tg.y * TM;
+    threadgroup float * qtg = shmem;            // [8][128]
+    threadgroup float * ktg = qtg + TM * D;     // [32][128]
+    threadgroup float * dot = ktg + TN * D;     // [8][32]
+    uint maxvis = 0;
+    for (uint r = 0; r < TM; r++) if (t0 + r < a.n) maxvis = max(maxvis, vis[t0 + r]);
+    if (c0 >= maxvis) {
+        for (uint i = tid; i < TM * TN; i += 128) {
+            const uint t = t0 + i / TN, c = c0 + i % TN;
+            if (t < a.n && c < a.ncomp) scores[(uint64_t)t * a.ncomp + c] = -INFINITY;
+        }
+        return;
+    }
+    for (uint i = tid; i < TN * D; i += 128) {
+        const uint c = c0 + i / D;
+        ktg[i] = c < a.ncomp ? k[(uint64_t)c * D + i % D] : 0.f;
+    }
+    const uint cell0 = lane, cell1 = lane + 32u;
+    const uint row0 = cell0 >> 3, row1 = cell1 >> 3;
+    const uint col0 = (uint)sg * TS + (cell0 & 7u), col1 = (uint)sg * TS + (cell1 & 7u);
+    const uint tok0 = t0 + row0, tok1 = t0 + row1, cmp0 = c0 + col0, cmp1 = c0 + col1;
+    float acc0 = 0.f, acc1 = 0.f;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint h = 0; h < a.nh; h++) {
+        for (uint i = tid; i < TM * D; i += 128) {
+            const uint t = t0 + i / D;
+            qtg[i] = t < a.n ? q[((uint64_t)t * a.nh + h) * D + i % D] : 0.f;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        simdgroup_float8x8 md = make_filled_simdgroup_matrix<float, 8>(0.f);
+        for (uint db = 0; db < D / TS; db++) {
+            simdgroup_float8x8 mq, mk;
+            simdgroup_load(mq, qtg + db * TS, D, 0, false);
+            simdgroup_load(mk, ktg + ((uint)sg * TS) * D + db * TS, D, 0, true);
+            simdgroup_multiply_accumulate(md, mq, mk, md);
+        }
+        simdgroup_store(md, dot + (uint)sg * TS, TN, 0, false);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (tok0 < a.n) acc0 += max(dot[row0 * TN + col0], 0.f) * w[tok0 * a.nh + h];
+        if (tok1 < a.n) acc1 += max(dot[row1 * TN + col1], 0.f) * w[tok1 * a.nh + h];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (tok0 < a.n && cmp0 < a.ncomp)
+        scores[(uint64_t)tok0 * a.ncomp + cmp0] = cmp0 < vis[tok0] ? acc0 : -INFINITY;
+    if (tok1 < a.n && cmp1 < a.ncomp)
+        scores[(uint64_t)tok1 * a.ncomp + cmp1] = cmp1 < vis[tok1] ? acc1 : -INFINITY;
+}
