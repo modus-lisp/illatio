@@ -98,26 +98,37 @@
           (second dims) (first dims))))
 
 (defvar *ds4f-cpu-q8* #+(and sbcl darwin) nil #-(and sbcl darwin) t
-  "Whether LOAD-DS4F loads the attention's and shared expert's Q8_0 matrices
-   for the CPU (8.5 GB).  With the GPU they run there, from its own copy of
-   the raw blocks; a CPU path that wants them loads them then
-   (DS4F-CPU-Q8!).")
+  "Whether LOAD-DS4F loads the CPU's copies of what the GPU runs from its
+   own: the attention's and shared expert's Q8_0 matrices (8.5 GB), the F16
+   ones widened to F32 (the compressors', the indexer's, the router's, HC's:
+   2.2 GB), the output head (0.65 GB).  A CPU path that wants them loads
+   them then (DS4F-CPU-Q8!).")
 
 (defparameter +ds4f-cpu-q8+
   '((dl-q-a "attn_q_a.weight") (dl-q-b "attn_q_b.weight") (dl-kv "attn_kv.weight")
     (dl-out-a "attn_output_a.weight") (dl-out-b "attn_output_b.weight")
     (dl-sh-gate "ffn_gate_shexp.weight") (dl-sh-up "ffn_up_shexp.weight") (dl-sh-down "ffn_down_shexp.weight")))
 
+(defparameter +ds4f-cpu-f32+
+  '((dl-comp-kv "attn_compressor_kv.weight") (dl-comp-gate "attn_compressor_gate.weight")
+    (dl-ix-q-b "indexer.attn_q_b.weight") (dl-ix-proj "indexer.proj.weight")
+    (dl-ixc-kv "indexer_compressor_kv.weight") (dl-ixc-gate "indexer_compressor_gate.weight")
+    (dl-gate-inp "ffn_gate_inp.weight") (dl-hc-attn-fn "hc_attn_fn.weight") (dl-hc-ffn-fn "hc_ffn_fn.weight")))
+
 (defun ds4f-cpu-q8! (m)
-  "M's attention and shared expert Q8_0 matrices for the CPU, loaded if
-   LOAD-DS4F left them to the GPU."
-  (let ((l0 (svref (ds4f-layers m) 0)))
-    (unless (dl-q-a l0)
+  "M's weights for the CPU, loaded if LOAD-DS4F left them to the GPU."
+  (let ((g (ds4f-gguf m)))
+    (unless (ds4f-output m)
+      (setf (ds4f-output m) (load-q8mat g "output.weight")
+            (ds4f-out-hc-fn m) (load-f32mat g "output_hc_fn.weight"))
       (dotimes (li (ds4f-n-layer m))
         (let ((l (svref (ds4f-layers m) li)))
-          (loop for (acc short) in +ds4f-cpu-q8+
-                do (funcall (fdefinition (list 'setf acc))
-                            (load-q8mat (ds4f-gguf m) (format nil "blk.~D.~A" li short)) l))))))
+          (flet ((n (short) (format nil "blk.~D.~A" li short)))
+            (loop for (acc short) in +ds4f-cpu-q8+
+                  do (funcall (fdefinition (list 'setf acc)) (load-q8mat g (n short)) l))
+            (loop for (acc short) in +ds4f-cpu-f32+
+                  when (gguf-tensor g (n short) nil)
+                    do (funcall (fdefinition (list 'setf acc)) (load-f32mat g (n short)) l)))))))
   m)
 
 (defun load-ds4f (path &key (threads (default-thread-count)))
@@ -128,6 +139,7 @@
     (flet ((k (key &optional default) (or (arch-key g a key) default))
            (q8 (name) (load-q8mat g name))
            (q8-cpu (name) (and *ds4f-cpu-q8* (load-q8mat g name)))
+           (fm-cpu (name) (and *ds4f-cpu-q8* (load-f32mat g name)))
            (f32 (name) (load-f32 g name))
            (fm (name) (load-f32mat g name))
            (opt (name f) (and (gguf-tensor g name nil) (funcall f name))))
@@ -156,8 +168,8 @@
                  :clamps (map 'simple-vector (lambda (x) (coerce x 'single-float)) (k "swiglu_clamp_exp"))
                  :n-vocab (k "vocab_size")
                  :embd-off (+ (gguf-data-offset g) (tensor-info-offset (gguf-tensor g "token_embd.weight")))
-                 :output (q8 "output.weight") :output-norm (f32 "output_norm.weight")
-                 :out-hc-fn (fm "output_hc_fn.weight") :out-hc-scale (f32 "output_hc_scale.weight")
+                 :output (q8-cpu "output.weight") :output-norm (f32 "output_norm.weight")
+                 :out-hc-fn (fm-cpu "output_hc_fn.weight") :out-hc-scale (f32 "output_hc_scale.weight")
                  :out-hc-base (f32 "output_hc_base.weight"))))
         (setf (ds4f-layers m)
               (coerce
@@ -172,18 +184,18 @@
                                   :kv (q8-cpu (n "attn_kv.weight")) :kv-norm (f32 (n "attn_kv_a_norm.weight"))
                                   :sinks (f32 (n "attn_sinks.weight"))
                                   :out-a (q8-cpu (n "attn_output_a.weight")) :out-b (q8-cpu (n "attn_output_b.weight"))
-                                  :comp-kv (opt (n "attn_compressor_kv.weight") #'fm)
-                                  :comp-gate (opt (n "attn_compressor_gate.weight") #'fm)
+                                  :comp-kv (opt (n "attn_compressor_kv.weight") #'fm-cpu)
+                                  :comp-gate (opt (n "attn_compressor_gate.weight") #'fm-cpu)
                                   :comp-ape (opt (n "attn_compressor_ape.weight") #'fm)
                                   :comp-norm (opt (n "attn_compressor_norm.weight") #'f32)
-                                  :ix-q-b (opt (n "indexer.attn_q_b.weight") #'fm)
-                                  :ix-proj (opt (n "indexer.proj.weight") #'fm)
-                                  :ixc-kv (opt (n "indexer_compressor_kv.weight") #'fm)
-                                  :ixc-gate (opt (n "indexer_compressor_gate.weight") #'fm)
+                                  :ix-q-b (opt (n "indexer.attn_q_b.weight") #'fm-cpu)
+                                  :ix-proj (opt (n "indexer.proj.weight") #'fm-cpu)
+                                  :ixc-kv (opt (n "indexer_compressor_kv.weight") #'fm-cpu)
+                                  :ixc-gate (opt (n "indexer_compressor_gate.weight") #'fm-cpu)
                                   :ixc-ape (opt (n "indexer_compressor_ape.weight") #'fm)
                                   :ixc-norm (opt (n "indexer_compressor_norm.weight") #'f32)
                                   :ffn-norm (f32 (n "ffn_norm.weight"))
-                                  :gate-inp (fm (n "ffn_gate_inp.weight"))
+                                  :gate-inp (fm-cpu (n "ffn_gate_inp.weight"))
                                   :probs-b (opt (n "exp_probs_b.bias") #'f32)
                                   :tid2eid (opt (n "ffn_gate_tid2eid.weight") (lambda (nm) (load-i32-tensor g nm)))
                                   :gate-exps (expert-tensor g (n "ffn_gate_exps.weight"))
@@ -191,9 +203,9 @@
                                   :down-exps (expert-tensor g (n "ffn_down_exps.weight"))
                                   :sh-gate (q8-cpu (n "ffn_gate_shexp.weight")) :sh-up (q8-cpu (n "ffn_up_shexp.weight"))
                                   :sh-down (q8-cpu (n "ffn_down_shexp.weight"))
-                                  :hc-attn-fn (fm (n "hc_attn_fn.weight")) :hc-attn-scale (f32 (n "hc_attn_scale.weight"))
+                                  :hc-attn-fn (fm-cpu (n "hc_attn_fn.weight")) :hc-attn-scale (f32 (n "hc_attn_scale.weight"))
                                   :hc-attn-base (f32 (n "hc_attn_base.weight"))
-                                  :hc-ffn-fn (fm (n "hc_ffn_fn.weight")) :hc-ffn-scale (f32 (n "hc_ffn_scale.weight"))
+                                  :hc-ffn-fn (fm-cpu (n "hc_ffn_fn.weight")) :hc-ffn-scale (f32 (n "hc_ffn_scale.weight"))
                                   :hc-ffn-base (f32 (n "hc_ffn_base.weight"))))))
                'simple-vector))
         m))))
@@ -1195,7 +1207,7 @@
   #+(and sbcl darwin)
   (when (ds4f-gpu-p :prefill-all)
     (return-from ds4f-prefill-1 (ds4f-gpu-prefill-1 ctx tokens logits)))
-  (unless (ds4f-gpu-p :proj) (ds4f-cpu-q8! (d4ctx-model ctx)))
+  (ds4f-cpu-q8! (d4ctx-model ctx))
   (let* ((*q8-f16-scale* *ds4f-q8-f16-scale*)
          (m (d4ctx-model ctx)) (d (ds4f-d m)) (n-hc (ds4f-n-hc m)) (hcd (* n-hc d))
          (pos0 (d4ctx-pos ctx)) (n (length tokens)) (tokv (coerce tokens 'simple-vector))

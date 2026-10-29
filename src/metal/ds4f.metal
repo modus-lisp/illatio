@@ -1364,3 +1364,42 @@ kernel void d4_group_scatter(constant d4_group_args & a [[buffer(0)]],
     const uint row = bases[sel[gid]] + rank[gid];
     rmap[row] = gid / a.nu; smap[gid] = row; wrow[row] = w[gid];
 }
+
+// Y = W X, W's rows F16 (the file's): D4_MV_F32's shape, half the bytes.
+kernel void d4_mv_f16(constant d4_mvf_args & a [[buffer(0)]],
+                      device const half * w [[buffer(1)]], device const float * x [[buffer(2)]],
+                      device float * y [[buffer(3)]],
+                      threadgroup float * red [[threadgroup(0)]],
+                      uint tg [[threadgroup_position_in_grid]], ushort tid [[thread_index_in_threadgroup]]) {
+    const uint r0 = tg * 4;
+    float s[4] = {0.f, 0.f, 0.f, 0.f};
+    device const float4 * x4 = (device const float4 *)x;
+    const uint n4 = a.ncols / 4;
+    for (uint i = tid; i < n4; i += 256) {
+        const float4 xv = x4[i];
+        for (short r = 0; r < 4; ++r)
+            if (r0 + r < a.nrows) s[r] += dot(float4(((device const half4 *)(w + (uint64_t)(r0 + r) * a.ncols))[i]), xv);
+    }
+    for (short r = 0; r < 4; ++r) {
+        const float t = d4_tg_sum(s[r], red, tid, 256);
+        if (tid == 0 && r0 + r < a.nrows) y[r0 + r] = t;
+    }
+}
+
+// The output head's mix: W[h] = sigmoid(PRE[h] SCALE + BASE[h]) + EPS, OUT[j]
+// = sum_h STREAMS[h][j] W[h] (output_logits_one, before its norm).
+struct d4_hmix_args { uint d; uint n; float eps; };
+
+kernel void d4_head_mix(constant d4_hmix_args & a [[buffer(0)]],
+                        device const float * pre [[buffer(1)]], device const float * scale [[buffer(2)]],
+                        device const float * base [[buffer(3)]], device const float * streams [[buffer(4)]],
+                        device float * out [[buffer(5)]], uint j [[thread_position_in_grid]]) {
+    if (j >= a.d) return;
+    float acc = 0.f;
+    for (uint h = 0; h < a.n; ++h) {
+        const float z = pre[h] * scale[0] + base[h];
+        const float sg = z >= 0.f ? 1.f / (1.f + exp(-z)) : exp(z) / (1.f + exp(z));
+        acc += streams[h * a.d + j] * (sg + a.eps);
+    }
+    out[j] = acc;
+}

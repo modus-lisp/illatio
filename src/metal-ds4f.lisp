@@ -191,13 +191,14 @@
   (let ((st (ds4f-gpu-state m)))
     (or (getf (ds4f-gpu-plist m) :weights)
         (let* ((g (ds4f-gguf m)) (table (make-hash-table :test 'equal)) (total 0) (jobs '()))
-          (dotimes (li (ds4f-n-layer m))
-            (dolist (short +ds4f-gpu-q8-tensors+)
-              (let* ((name (format nil "blk.~D.~A" li short)) (ti (gguf-tensor g name))
+          (dolist (name (cons "output.weight"
+                              (loop for li below (ds4f-n-layer m)
+                                    append (mapcar (lambda (short) (format nil "blk.~D.~A" li short)) +ds4f-gpu-q8-tensors+))))
+              (let* ((ti (gguf-tensor g name))
                      (dims (tensor-info-dims ti)) (bytes (tensor-bytes ti)) (rows (reduce #'* (rest dims))))
                 (setf (gethash name table) (list total (floor bytes rows) rows (first dims)))
                 (push (list total (+ (gguf-data-offset g) (tensor-info-offset ti)) bytes) jobs)
-                (incf total (* 64 (ceiling bytes 64))))))
+                (incf total (* 64 (ceiling bytes 64)))))
           (let ((buf (lock-buffer (gpu-buffer (d4gpu-gpu st) total) "Q8_0 weights")) (fd (ds4f-fd m))
                 (jobs (coerce jobs 'simple-vector)))
             (parallel-for (k (length jobs) (ds4f-pool m))
@@ -321,12 +322,12 @@
 
 (defvar *ds4f-expert-cache-gb* nil
   "The expert pool's size, in GB (an expert is about 7 MB); NIL: what the
-   rest of the model leaves of this machine's memory (27 GB of 48; no more
+   rest of the model leaves of this machine's memory (28 GB of 48; no more
    than 28, one Metal buffer).")
 
 (defun expert-cache-gb ()
-  ;; the pool takes what prefill's staging buffers had too (3.6 GB)
-  (or *ds4f-expert-cache-gb* (max 4 (min 28 (- (physical-memory-gb) 21)))))
+  ;; what the rest leaves: the GPU's weights (7.4 GB), activations, the system
+  (or *ds4f-expert-cache-gb* (max 4 (min 28 (- (physical-memory-gb) 20)))))
 
 ;;; The expert pool: one GPU buffer of expert slots that prefill and decode
 ;;; share.  Work in flight comes first, new loads go around it: a slot a
@@ -595,15 +596,16 @@
              (cond ((funcall keep s) (setf (aref (dx-used xc) s) tick (aref (dx-fresh xc) s) 0))
                    ((and (= 1 (aref (dx-fresh xc) s)) (zerop (aref pin s))) (cache-release xc s))))))
 
-(defun predict-experts (m li x token k)
+(defun predict-experts (m li x token k &optional logits-in)
   "A guess at layer LI's experts for the token whose previous layer's FFN
-   input is X: its hash table's, else the top K of its router on X."
+   input is X: its hash table's, else the top K of its router on X (or its
+   router's LOGITS-IN, the GPU's)."
   (let* ((l (svref (ds4f-layers m) li)) (nu (ds4f-n-used m)))
     (if (dl-tid2eid l)
         (loop for i below nu collect (aref (dl-tid2eid l) (+ (* token nu) i)))
         (let* ((ne (ds4f-n-expert m)) (logits (f32vec ne)) (b (dl-probs-b l)))
           (declare (type f32vec logits))
-          (f32mv! (ds4f-pool m) (dl-gate-inp l) x logits)
+          (if logits-in (replace logits logits-in) (f32mv! (ds4f-pool m) (dl-gate-inp l) x logits))
           (dotimes (i ne) (setf (aref logits i) (+ (sqrt (d4-softplus (aref logits i))) (if b (aref b i) 0f0))))
           (loop repeat k
                 collect (let ((best (let ((bi 0)) (dotimes (i ne bi) (when (> (aref logits i) (aref logits bi)) (setf bi i))))))
