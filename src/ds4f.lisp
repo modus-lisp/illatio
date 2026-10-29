@@ -622,6 +622,89 @@
             (dot-rows g4 xo (floor xo 32) (* 4 g4))))))
     out))
 
+;;; --- attention for a chunk (prefill) ----------------------------------------------
+;;; The projections in and out depend only on each token's own streams, so
+;;; they multiply the whole chunk at once (MATMUL!, each (row, token) the
+;;; matvec's bits); only the cache, the compressors, the indexer and the
+;;; attention itself go token by token.
+
+(defun q8mm! (pool w xs n out)
+  "OUT (N rows of W's rows) = W XS (N rows of W's cols), as Q8MV! a row each."
+  (declare (ignorable pool))
+  (let ((xb (make-q8batch n (q8mat-cols w))))
+    ;; on this thread: *Q8-F16-SCALE*'s binding is this thread's alone
+    (quantize-batch! xs n xb)
+    (matmul! pool w xb out)))
+
+(defun grouped-q8mm! (pool w xs n groups gdim rank out)
+  "GROUPED-Q8MV! for N tokens (row r of W against group r/RANK of each)."
+  ;; (WITH-DOT-ROWS binds COLS, W's, around its body: the token stride is XW)
+  (let* ((xw (* groups gdim)) (rows (q8mat-rows w)) (xb (make-q8batch n xw)))
+    (quantize-batch! xs n xb)
+    (let ((xqq (q8batch-quants xb)) (xsc (q8batch-scales xb)))
+      (with-dot-rows (dot-rows w xqq xsc out)
+        (parallel-for (g4 (floor rows 4) pool)
+          (let ((goff (* (floor (* 4 g4) rank) gdim)))
+            (dotimes (tk n)
+              (let ((xo (+ (* tk xw) goff)))
+                (dot-rows g4 xo (floor xo 32) (+ (* tk rows) (* 4 g4)))))))))
+    out))
+
+(defun d4-attention-chunk (m l li c cur next n pos0)
+  "D4-ATTENTION for N tokens (their streams in CUR, a token every N-HC * D),
+   the streams after it into NEXT."
+  (let* ((d (ds4f-d m)) (hd (ds4f-head-dim m)) (nh (ds4f-n-head m)) (pool (ds4f-pool m))
+         (hcd (* (ds4f-n-hc m) d)) (ratio (dl-ratio l)) (eps (ds4f-eps m)) (lq (ds4f-lora-q m))
+         (norms (f32vec (* n d))) (posts (make-array n)) (combs (make-array n))
+         (qr (f32vec (* n lq))) (qr-norm (f32vec (* n lq))) (q (f32vec (* n nh hd)))
+         (kv0 (f32vec (* n hd))) (heads (f32vec (* n nh hd)))
+         (streams (f32vec hcd)) (cur1 (f32vec d)) (flat (f32vec hcd)) (norm (f32vec d)))
+    (dotimes (tk n)
+      (replace streams cur :start2 (* tk hcd) :end2 (* (1+ tk) hcd))
+      (multiple-value-bind (post comb)
+          (hc-pre m (dl-hc-attn-fn l) (dl-hc-attn-scale l) (dl-hc-attn-base l) streams cur1 flat)
+        (setf (svref posts tk) post (svref combs tk) comb))
+      (d4-rms! cur1 norms d eps (dl-attn-norm l) 0 (* tk d)))
+    (q8mm! pool (dl-q-a l) norms n qr)
+    (dotimes (tk n) (d4-rms! qr qr-norm lq eps (dl-q-a-norm l) (* tk lq) (* tk lq)))
+    (q8mm! pool (dl-q-b l) qr-norm n q)
+    (dotimes (u (* n nh)) (d4-rms! q q hd eps nil (* u hd) (* u hd)))
+    (q8mm! pool (dl-kv l) norms n kv0)
+    ;; token by token: the cache, the compressors, the indexer, attention
+    (let ((kv (f32vec hd)) (qt (f32vec (* nh hd))) (qrt (f32vec lq)) (ht (f32vec (* nh hd))))
+      (dotimes (tk n)
+        (let ((pos (+ pos0 tk)))
+          (replace norm norms :start2 (* tk d) :end2 (* (1+ tk) d))
+          (replace qrt qr-norm :start2 (* tk lq) :end2 (* (1+ tk) lq))
+          (replace qt q :start2 (* tk nh hd) :end2 (* (1+ tk) nh hd))
+          (d4-rms! kv0 kv hd eps (dl-kv-norm l) (* tk hd) 0)
+          (d4-rope! m qt nh hd pos li)
+          (d4-rope! m kv 1 hd pos li)
+          (fp8-kv-round! kv 0 hd (ds4f-n-rot m))
+          (push-raw! m c kv)
+          (when (plusp ratio)
+            (let ((row (compress-step m (dl-comp-kv l) (dl-comp-gate l) (dl-comp-ape l) (dl-comp-norm l)
+                                      norm (dc-st-kv c) (dc-st-score c) hd ratio li pos)))
+              (when row (push-comp! (dc-comp c) #'dc-n-comp hd row c) (incf (dc-n-comp c))))
+            (when (= ratio 4)
+              (let ((row (compress-step m (dl-ixc-kv l) (dl-ixc-gate l) (dl-ixc-ape l) (dl-ixc-norm l)
+                                        norm (dc-ix-kv c) (dc-ix-score c) (ds4f-ix-dim m) ratio li pos)))
+                (when row (push-comp! (dc-ix-comp c) #'dc-n-ix (ds4f-ix-dim m) row c) (incf (dc-n-ix c))))))
+          (let ((allowed (and (= ratio 4) (indexer-allowed m l c norm qrt li pos))))
+            (d4-attend! m l qt c allowed ht)
+            (d4-rope! m ht nh hd pos li :inverse t)
+            (replace heads ht :start1 (* tk nh hd))))))
+    ;; out, for the chunk
+    (let* ((groups (ds4f-out-groups m)) (rank (ds4f-lora-o m)) (gdim (* hd (floor nh groups)))
+           (low (f32vec (* n groups rank))) (out (f32vec (* n d))) (o1 (f32vec d)) (out-s (f32vec hcd)))
+      (grouped-q8mm! pool (dl-out-a l) heads n groups gdim rank low)
+      (q8mm! pool (dl-out-b l) low n out)
+      (dotimes (tk n)
+        (replace streams cur :start2 (* tk hcd) :end2 (* (1+ tk) hcd))
+        (replace o1 out :start2 (* tk d) :end2 (* (1+ tk) d))
+        (hc-post! m out-s o1 streams (svref posts tk) (svref combs tk))
+        (replace next out-s :start1 (* tk hcd))))))
+
 ;;; --- the FFN -----------------------------------------------------------------------
 
 (defun prefetch-file-range (w start bytes)
@@ -850,12 +933,7 @@
     (dotimes (li (ds4f-n-layer m))
       (let ((l (svref (ds4f-layers m) li)) (c (svref (d4ctx-caches ctx) li))
             (streams (f32vec hcd)) (out-s (f32vec hcd)))
-        ;; attention, token by token
-        (dotimes (tk n)
-          (replace streams cur :start2 (* tk hcd) :end2 (* (1+ tk) hcd))
-          (multiple-value-bind (out post comb) (d4-attention m l li c streams (+ pos0 tk))
-            (hc-post! m out-s out streams post comb))
-          (replace next out-s :start1 (* tk hcd)))
+        (d4-attention-chunk m l li c cur next n pos0)
         (rotatef cur next)
         ;; the FFN: route every token, then each expert once
         (let ((norms (f32vec (* n d))) (posts (make-array n)) (combs (make-array n))
