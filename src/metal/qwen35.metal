@@ -652,3 +652,117 @@ kernel void attend(constant attn_args & a [[buffer(0)]],
         out[(ulong)tk * qd + h * hd + i] = acc * inv;
     }
 }
+
+struct fa_args { uint nh; uint nkv; uint n; float scale; uint pos0; };
+
+#define FA_D 256                        // the head width: the host checks
+#define FA_KB 32                        // keys a step
+
+// Prefill attention, flash style: a threadgroup (one simdgroup) takes 8
+// query rows (tokens tk0..tk0+7) of head H and walks the keys FA_KB at a
+// time, causal per row, with S = Q K^T and O += P V as 8x8 simdgroup
+// matrices and the softmax kept running (max M and sum L per row): K and V
+// are read once for 8 rows, not once a row.  The four 8x8 score blocks of a
+// step accumulate independently, so their multiplies overlap; the softmax
+// runs four lanes a row.  Q is staged in threadgroup memory.  All in f32.
+kernel void attend_fa(constant fa_args & a [[buffer(0)]],
+                      device const float * q [[buffer(1)]],
+                      device const float * kc [[buffer(2)]], device const float * vc [[buffer(3)]],
+                      device float * out [[buffer(4)]],
+                      threadgroup float * shmem [[threadgroup(0)]],
+                      uint2 tgp [[threadgroup_position_in_grid]],
+                      ushort lane [[thread_index_in_simdgroup]]) {
+    const uint h = tgp.x, tk0 = tgp.y * 8;
+    const uint qd = a.nh * FA_D, kvd = a.nkv * FA_D, kvh = h / (a.nh / a.nkv);
+    threadgroup float * qs  = shmem;                  // 8 x FA_D
+    threadgroup float * ps  = qs + 8 * FA_D;          // 8 x FA_KB: S, then P
+    threadgroup float * dsh = ps + 8 * FA_KB;         // 8 x 8: diag(alpha), then diag(1/L)
+
+    // Q's rows (a row past N repeats N-1's: it is computed, never stored)
+    for (uint i = lane; i < 8 * FA_D; i += 32) {
+        const uint r = i / FA_D, tk = min(tk0 + r, a.n - 1);
+        qs[i] = q[(ulong)tk * qd + h * FA_D + (i % FA_D)];
+    }
+    for (uint i = lane; i < 64; i += 32) dsh[i] = 0.f;
+    const uint r = lane / 4, part = lane % 4;          // this lane's row, and its 8 of a step's keys
+    const uint lim = a.pos0 + min(tk0 + r, a.n - 1);   // the last key its row sees
+    float m = -INFINITY, l = 0.f;
+    simdgroup_barrier(mem_flags::mem_threadgroup);
+
+    device const float * kb = kc + kvh * FA_D;
+    device const float * vb = vc + kvh * FA_D;
+    simdgroup_float8x8 o[FA_D / 8];
+    for (short c = 0; c < FA_D / 8; ++c) o[c] = make_filled_simdgroup_matrix<float, 8>(0.f);
+
+    const uint last = a.pos0 + min(tk0 + 7, a.n - 1);
+    for (uint pb = 0; pb <= last; pb += FA_KB) {
+        simdgroup_float8x8 s0 = make_filled_simdgroup_matrix<float, 8>(0.f), s1 = s0, s2 = s0, s3 = s0;
+        device const float * kp = kb + (ulong)pb * kvd;
+        for (short c = 0; c < FA_D / 8; ++c) {
+            simdgroup_float8x8 qm, k0, k1, k2, k3;
+            simdgroup_load(qm, qs + c * 8, FA_D);
+            simdgroup_load(k0, kp + c * 8,           kvd, 0, true);
+            simdgroup_load(k1, kp + 8 * kvd + c * 8,  kvd, 0, true);
+            simdgroup_load(k2, kp + 16 * kvd + c * 8, kvd, 0, true);
+            simdgroup_load(k3, kp + 24 * kvd + c * 8, kvd, 0, true);
+            simdgroup_multiply_accumulate(s0, qm, k0, s0);
+            simdgroup_multiply_accumulate(s1, qm, k1, s1);
+            simdgroup_multiply_accumulate(s2, qm, k2, s2);
+            simdgroup_multiply_accumulate(s3, qm, k3, s3);
+        }
+        simdgroup_store(s0, ps,      FA_KB);
+        simdgroup_store(s1, ps + 8,  FA_KB);
+        simdgroup_store(s2, ps + 16, FA_KB);
+        simdgroup_store(s3, ps + 24, FA_KB);
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+        // the running softmax: four lanes a row, eight keys each
+        float v[8], mx = -INFINITY;
+        for (short j = 0; j < 8; ++j) {
+            const uint p = pb + part * 8 + j;
+            v[j] = (p <= lim) ? ps[r * FA_KB + part * 8 + j] * a.scale : -INFINITY;
+            mx = max(mx, v[j]);
+        }
+        mx = max(mx, simd_shuffle_xor(mx, 1));
+        mx = max(mx, simd_shuffle_xor(mx, 2));
+        const float mn = max(m, mx);
+        const float alpha = exp(m - mn);
+        float sum = 0.f;
+        for (short j = 0; j < 8; ++j) { const float e = exp(v[j] - mn); ps[r * FA_KB + part * 8 + j] = e; sum += e; }
+        sum += simd_shuffle_xor(sum, 1);
+        sum += simd_shuffle_xor(sum, 2);
+        l = l * alpha + sum;
+        m = mn;
+        if (part == 0) dsh[r * 8 + r] = alpha;
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+        simdgroup_float8x8 p0, p1, p2, p3, dg;
+        simdgroup_load(p0, ps,      FA_KB);
+        simdgroup_load(p1, ps + 8,  FA_KB);
+        simdgroup_load(p2, ps + 16, FA_KB);
+        simdgroup_load(p3, ps + 24, FA_KB);
+        simdgroup_load(dg, dsh, 8);
+        device const float * vp = vb + (ulong)pb * kvd;
+        for (short c = 0; c < FA_D / 8; ++c) {
+            simdgroup_float8x8 v0, v1, v2, v3;
+            simdgroup_load(v0, vp + c * 8,            kvd);
+            simdgroup_load(v1, vp + 8 * kvd + c * 8,  kvd);
+            simdgroup_load(v2, vp + 16 * kvd + c * 8, kvd);
+            simdgroup_load(v3, vp + 24 * kvd + c * 8, kvd);
+            simdgroup_multiply(o[c], dg, o[c]);
+            simdgroup_multiply_accumulate(o[c], p0, v0, o[c]);
+            simdgroup_multiply_accumulate(o[c], p1, v1, o[c]);
+            simdgroup_multiply_accumulate(o[c], p2, v2, o[c]);
+            simdgroup_multiply_accumulate(o[c], p3, v3, o[c]);
+        }
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (part == 0) dsh[r * 8 + r] = 1.0f / l;
+    simdgroup_barrier(mem_flags::mem_threadgroup);
+    simdgroup_float8x8 dg;
+    simdgroup_load(dg, dsh, 8);
+    // rows past N are stored too, into the scratch's unused rows (the host sizes it)
+    device float * ob = out + (ulong)tk0 * qd + h * FA_D;
+    for (short c = 0; c < FA_D / 8; ++c) {
+        simdgroup_multiply(o[c], dg, o[c]);
+        simdgroup_store(o[c], ob + c * 8, qd);
+    }
+}

@@ -40,6 +40,7 @@
     ;; the kernels' fixed shapes (src/metal/qwen35.metal)
     (assert (= (model-ssm-k-dim m) 128) () "q35_delta is written for 128-wide K heads")
     (assert (zerop (mod (model-ssm-v-dim m) 32)) () "q35_delta takes values 32 at a time")
+    (assert (= (model-head-dim m) 256) () "attend_fa is written for 256-wide heads")
     (let ((gpu (open-gpu)) (g (model-gguf m)))
       (multiple-value-bind (sap bytes) (mmap-file path)
         (let ((gm (%make-gmodel :gpu gpu :file (gpu-wrap gpu sap bytes))))
@@ -89,10 +90,11 @@
                 (%make-gctx :x (fb (* n d)) :h (fb (* n d)) :qkv (fb (* n ch)) :z (fb (* n od))
                             :alpha (fb (* n vh)) :beta (fb (* n vh))
                             :c (fb (* n ch)) :o (fb (* n od)) :qg (fb (* n 2 qd)) :q (fb (* n qd))
-                            :gate (fb (* n qd)) :k (fb (* n kvd)) :v (fb (* n kvd)) :att (fb (* n qd))
+                            :gate (fb (* n qd)) :k (fb (* n kvd)) :v (fb (* n kvd)) :att (fb (* (+ n 8) qd))
                             :fa (fb (* n f)) :fb (fb (* n f))
                             :logits (fb (model-n-vocab m)) :rope (fb (* n (model-rope-dims m)))
-                            :kc (per-layer :full (* n-ctx kvd)) :vc (per-layer :full (* n-ctx kvd))
+                            ;; 32 positions of zeros past the end: ATTEND_FA reads keys 32 at a time
+                            :kc (per-layer :full (* (+ n-ctx 32) kvd)) :vc (per-layer :full (* (+ n-ctx 32) kvd))
                             :conv (per-layer :linear (* ch (1- (model-ssm-conv m))))
                             :ssm (per-layer :linear (* vh (model-ssm-k-dim m) (model-ssm-v-dim m)))))))))
 
@@ -121,6 +123,8 @@
             (dispatch gpu e "mm_q6k" (list (gmat-cols w) (gmat-rows w) n (gmat-row-bytes w))
                       (list wb x y) (list (ceiling n 32) (ceiling (gmat-rows w) 64) 1) 128
                       :shared 8192)))))
+
+(defvar *flash* t "Whether a prefill's attention is ATTEND_FA (flash style).")
 
 (defvar *mm-64* t "Whether a prefill's products take 64-token tiles (MM_Q6K_64).")
 
@@ -194,9 +198,13 @@
                                      (gctx-rope st) (gctx-q st) (gctx-gate st)
                                      (svref (gctx-kc st) li) (svref (gctx-vc st) li))
                                (list (+ nh nkv) n) hd)
-                     (dispatch gpu e "attend" (list nh nkv hd (1+ pos0) (/ 1f0 (sqrt (coerce hd 'single-float))))
-                               (list (gctx-q st) (svref (gctx-kc st) li) (svref (gctx-vc st) li) (gctx-att st))
-                               (list nh n) 256 :shared (* 4 (max 4 (+ pos0 n))))
+                     (if (and *flash* (> n 1))
+                         (dispatch gpu e "attend_fa" (list nh nkv n (/ 1f0 (sqrt (coerce hd 'single-float))) pos0)
+                                   (list (gctx-q st) (svref (gctx-kc st) li) (svref (gctx-vc st) li) (gctx-att st))
+                                   (list nh (ceiling n 8)) 32 :shared (* 4 (+ (* 8 256) (* 8 32) 64)))
+                         (dispatch gpu e "attend" (list nh nkv hd (1+ pos0) (/ 1f0 (sqrt (coerce hd 'single-float))))
+                                   (list (gctx-q st) (svref (gctx-kc st) li) (svref (gctx-vc st) li) (gctx-att st))
+                                   (list nh n) 256 :shared (* 4 (max 4 (+ pos0 n)))))
                      (dispatch gpu e "gate_mul" (list (* n qd)) (list (gctx-att st) (gctx-gate st))
                                (ceiling (* n qd) 256) 256)
                      (mat gm e (layer-wo l) (gctx-att st) h n)))
