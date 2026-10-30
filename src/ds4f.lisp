@@ -51,7 +51,7 @@
   (layers #() :type simple-vector)
   (gpu-plist '()))                      ; the GPU's state, when it runs (metal-ds4f.lisp)
 
-(defvar *ds4f-gpu* #+(and sbcl darwin) '(:decode :prefill) #-(and sbcl darwin) nil
+(defvar *ds4f-gpu* #+(and sbcl darwin) '(:decode :prefill) #+(and sbcl linux) '(:decode) #-sbcl nil
   "What of DS4F runs on the GPU: :DECODE, a token's every layer
    (metal-ds4f-decode.lisp), :PREFILL, a prompt chunk's
    (metal-ds4f-prefill.lisp); T is both, NIL neither -- the CPU's reference
@@ -93,12 +93,18 @@
           (floor (tensor-bytes ti) (* (second dims) (third dims)))
           (second dims) (first dims))))
 
-(defvar *ds4f-cpu-q8* #+(and sbcl darwin) nil #-(and sbcl darwin) t
+(defvar *ds4f-cpu-q8* #+(and sbcl darwin) nil #+(and sbcl linux) :auto #-sbcl t
   "Whether LOAD-DS4F loads the CPU's copies of what the GPU runs from its
    own: the attention's and shared expert's Q8_0 matrices (8.5 GB), the F16
    ones widened to F32 (the compressors', the indexer's, the router's, HC's:
    2.2 GB), the output head (0.65 GB).  A CPU path that wants them loads
-   them then (DS4F-CPU-Q8!).")
+   them then (DS4F-CPU-Q8!).  :AUTO: unless decode runs on a CUDA device
+   (cuda-ds4f.lisp).")
+
+(defun ds4f-cpu-q8-p ()
+  (if (eq *ds4f-cpu-q8* :auto)
+      (not (and (fboundp 'ds4f-cuda-p) (funcall 'ds4f-cuda-p)))
+      *ds4f-cpu-q8*))
 
 (defparameter +ds4f-cpu-q8+
   '((dl-q-a "attn_q_a.weight") (dl-q-b "attn_q_b.weight") (dl-kv "attn_kv.weight")
@@ -131,11 +137,11 @@
   "DeepSeek V4 Flash at PATH: the non-routed weights in memory (Q8_0 as
    Q8MATs, F16 widened to F32), the routed experts left in the file, which is
    mapped whole (MAP-FILE-VECTOR) so they stream."
-  (let* ((g (read-gguf path)) (a "deepseek4"))
+  (let* ((g (read-gguf path)) (a "deepseek4") (cpu-q8 (ds4f-cpu-q8-p)))
     (flet ((k (key &optional default) (or (arch-key g a key) default))
            (q8 (name) (load-q8mat g name))
-           (q8-cpu (name) (and *ds4f-cpu-q8* (load-q8mat g name)))
-           (fm-cpu (name) (and *ds4f-cpu-q8* (load-f32mat g name)))
+           (q8-cpu (name) (and cpu-q8 (load-q8mat g name)))
+           (fm-cpu (name) (and cpu-q8 (load-f32mat g name)))
            (f32 (name) (load-f32 g name))
            (fm (name) (load-f32mat g name))
            (opt (name f) (and (gguf-tensor g name nil) (funcall f name))))
@@ -1031,6 +1037,9 @@
   #-sbcl (ds4f-forward-1 ctx token logits))
 
 (defun ds4f-forward-1 (ctx token logits)
+  #+(and sbcl linux)
+  (when (ds4f-cuda-p)
+    (return-from ds4f-forward-1 (ds4f-cuda-forward ctx token logits)))
   #+(and sbcl darwin)
   (when (ds4f-gpu-p :decode)
     (return-from ds4f-forward-1 (ds4f-gpu-forward ctx token logits)))
@@ -1095,6 +1104,11 @@
   ctx)
 
 (defun ds4f-prefill-1 (ctx tokens logits)
+  #+(and sbcl linux)
+  (when (ds4f-cuda-p)
+    ;; a token at a time: decode's caches are the device's
+    (loop for (tk . rest) on tokens do (ds4f-cuda-forward ctx tk (and logits (null rest))))
+    (return-from ds4f-prefill-1 ctx))
   #+(and sbcl darwin)
   (when (ds4f-gpu-p :prefill)
     (return-from ds4f-prefill-1 (ds4f-gpu-prefill-1 ctx tokens logits)))

@@ -324,3 +324,69 @@
             (sb-alien:unsigned shared) (sb-sys:system-area-pointer (cudev-stream dev))
             (sb-sys:system-area-pointer (sb-sys:sap+ pv (* 8 64)))
             (sb-sys:system-area-pointer (sb-sys:int-sap 0)))))))
+
+;;; --- pinned host memory, more streams, events ----------------------------------
+;;; For what streams from host memory while the device computes (DS4F's
+;;; routed experts, cuda-ds4f.lisp): host memory the device copies from by
+;;; DMA, a stream of its own for the copies, events to order the two.
+
+(defun cuda-host-register (sap bytes)
+  "Pin BYTES at SAP (page-aligned host memory) for every context (PORTABLE),
+   so copies from it are DMA's, asynchronous."
+  (with-cuda
+    (cu "cuMemHostRegister_v2" (sb-sys:system-area-pointer sap) (sb-alien:unsigned-long bytes)
+        (sb-alien:unsigned 1)))            ; CU_MEMHOSTREGISTER_PORTABLE
+  sap)
+
+(defun cuda-host-unregister (sap)
+  (with-cuda (cu "cuMemHostUnregister" (sb-sys:system-area-pointer sap))))
+
+(defun cuda-host-alloc (bytes)
+  "BYTES of pinned host memory (portable): its SAP."
+  (with-cuda
+    (with-out (p)
+      (cu "cuMemHostAlloc" (sb-sys:system-area-pointer (out-ptr p)) (sb-alien:unsigned-long (max bytes 64))
+          (sb-alien:unsigned 1))           ; CU_MEMHOSTALLOC_PORTABLE
+      (sb-sys:int-sap p))))
+
+(defun cuda-host-free (sap)
+  (with-cuda (cu "cuMemFreeHost" (sb-sys:system-area-pointer sap))))
+
+(defun cuda-stream-create (dev)
+  "A new stream on DEV that doesn't wait for its default stream."
+  (with-cuda
+    (cuda-current dev)
+    (with-out (s)
+      (cu "cuStreamCreate" (sb-sys:system-area-pointer (out-ptr s)) (sb-alien:unsigned 1)) ; NON_BLOCKING
+      (sb-sys:int-sap s))))
+
+(defun cuda-event-create (dev)
+  (with-cuda
+    (cuda-current dev)
+    (with-out (e)
+      (cu "cuEventCreate" (sb-sys:system-area-pointer (out-ptr e)) (sb-alien:unsigned 2)) ; DISABLE_TIMING
+      (sb-sys:int-sap e))))
+
+(defun cuda-event-record (event stream)
+  (with-cuda (cu "cuEventRecord" (sb-sys:system-area-pointer event) (sb-sys:system-area-pointer stream))))
+
+(defun cuda-stream-wait (stream event)
+  "STREAM's later work waits for EVENT."
+  (with-cuda (cu "cuStreamWaitEvent" (sb-sys:system-area-pointer stream) (sb-sys:system-area-pointer event)
+                 (sb-alien:unsigned 0))))
+
+(defun cuda-stream-sync (stream)
+  (with-cuda (cu "cuStreamSynchronize" (sb-sys:system-area-pointer stream))))
+
+(defun cuda-copy-in (b offset sap bytes &optional (stream (cudev-stream (dbuf-dev b))))
+  "BYTES at host SAP into B at OFFSET, queued on STREAM: asynchronous when
+   SAP is pinned, so the host memory must stay as it is until the copy runs."
+  (with-cuda
+    (cu "cuMemcpyHtoDAsync_v2" (sb-alien:unsigned-long (+ (dbuf-ptr b) offset))
+        (sb-sys:system-area-pointer sap) (sb-alien:unsigned-long bytes) (sb-sys:system-area-pointer stream))))
+
+(defun cuda-copy-out (sap b offset bytes)
+  "BYTES of B at OFFSET to host SAP, queued on B's device's stream (no wait)."
+  (with-cuda
+    (cu "cuMemcpyDtoHAsync_v2" (sb-sys:system-area-pointer sap) (sb-alien:unsigned-long (+ (dbuf-ptr b) offset))
+        (sb-alien:unsigned-long bytes) (sb-sys:system-area-pointer (cudev-stream (dbuf-dev b))))))

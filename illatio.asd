@@ -36,6 +36,7 @@
      (:file "ds4f")        ; DeepSeek V4 Flash (deepseek4), ported from ds4.c
      (:file "ds4f-kv")      ; its state saved: a long prompt prefilled once
      (:file "ds4f-hotlist") ; its most used experts (ds4's profile)
+     (:file "cuda-ds4f" :if-feature (:and :sbcl :linux)) ; its decode on an NVIDIA GPU, experts in host memory
      (:file "metal-ds4f" :if-feature (:and :sbcl :darwin)) ; it on the GPU: prefill, decode's experts
      (:file "metal-ds4f-decode" :if-feature (:and :sbcl :darwin)) ; a token's every layer on it
      (:file "metal-ds4f-prefill" :if-feature (:and :sbcl :darwin)) ; a prefill chunk's
