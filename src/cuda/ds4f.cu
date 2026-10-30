@@ -730,12 +730,14 @@ extern "C" __global__ void d4_mv_q2_k(int ncols, int nrows, int row_bytes, long 
   }
 }
 
-// MOE[r] = sum of the K experts' rows of DOWN, in order, plus SHARED.
-extern "C" __global__ void d4_moe_sum(int d, int k, const float* down, const float* shared_, float* moe) {
+// MOE[r] = sum of the K experts' rows of DOWN, in order, plus SHARED:
+// expert i's row PERM[i] (i when PERM is null; the rows are by device).
+extern "C" __global__ void d4_moe_sum(int d, int k, const float* down, const float* shared_, float* moe,
+                                      const unsigned* perm) {
   int r = blockIdx.x * blockDim.x + threadIdx.x;
   if (r >= d) return;
   float acc = 0.f;
-  for (int i = 0; i < k; ++i) acc += down[i * d + r];
+  for (int i = 0; i < k; ++i) acc += down[(perm ? perm[i] : i) * d + r];
   moe[r] = acc + shared_[r];
 }
 

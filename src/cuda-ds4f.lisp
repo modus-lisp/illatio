@@ -28,6 +28,8 @@
   "Device memory left free when the expert pool is sized: the scratch
    buffers, the caches of a context, the driver's own.")
 
+(defvar *ds4f-route-trace* nil "A stream each layer's routing is written to (layer, experts), or NIL.")
+
 (defvar *ds4f-cuda-pool-gb* nil "The expert pool's size in GB; NIL: what the device has left.")
 
 (defstruct (d4cuda (:conc-name dk-))
@@ -41,7 +43,28 @@
   host (host-bytes 0)                   ; the file, in pinned host memory
   pool (n-slots 0) (slot-bytes 0) (gate-bytes 0)
   slot-of owner used pin (tick 0) (free 0)
+  tier                                  ; the second device's experts (D4TIER), or NIL
   (hits 0) (misses 0) (prefetched 0) (copied 0))
+
+(defvar *ds4f-cuda-tier-device* 1
+  "A second device whose memory holds more of the experts -- the next most
+   used after the first device's, fixed -- and computes them, or NIL.")
+
+;;; The second device's experts: a pool seeded once from the hotlist (past
+;;; what the first device's holds) and never changed (its link is the
+;;; slower), its experts computed there.  A layer's experts there get the
+;;; FFN input, their pointers and weights in one copy from pinned memory;
+;;; their down rows come back to pinned memory, and the first device's
+;;; stream waits for that (an event of the second's) before copying them
+;;; in beside its own rows -- the CPU waits for neither.
+
+(defstruct (d4tier (:conc-name dt-))
+  dev event pool (n 0) slot-of
+  host-in in host-out                   ; pinned staging, and the device's copy of the inputs
+  gu mid down (hits 0))
+
+(defconstant +dt-ptrs+ (* 4 4096) "Where the experts' pointers are in a tier's inputs (after X).")
+(defconstant +dt-w+ (+ +dt-ptrs+ (* 8 32)) "Where their weights are.")
 
 (defvar *cuda-device-count* nil)
 
@@ -62,6 +85,12 @@
                        fd (sb-sys:sap+ sap done) (- bytes done) (+ offset done))))
              (when (<= got 0) (error "pread of ~:D bytes at ~:D failed" bytes offset))
              (incf done got))))
+
+(defun d4-memcpy (dst src bytes)
+  (sb-alien:alien-funcall
+   (sb-alien:extern-alien "memcpy" (function sb-sys:system-area-pointer sb-sys:system-area-pointer
+                                             sb-sys:system-area-pointer sb-alien:unsigned-long))
+   dst src bytes))
 
 (defun d4-host-copy (m)
   "(values sap bytes): the whole of DS4F M's file in host memory, read by
@@ -148,7 +177,11 @@
           (multiple-value-bind (sap bytes) (d4-host-copy m)
             (setf (dk-host st) sap (dk-host-bytes st) bytes))
           (d4-upload-weights m st)
-          (d4-make-pool m st))
+          (d4-make-pool m st)
+          (when (and *ds4f-cuda-tier-device* (> (cuda-device-count) *ds4f-cuda-tier-device*)
+                     (/= *ds4f-cuda-tier-device* *ds4f-cuda-device*))
+            (setf (dk-tier st) (d4-make-tier m st (open-cuda *ds4f-cuda-tier-device*)))
+            (cuda-current dev)))
         (setf (getf (ds4f-gpu-plist m) :cuda) st))))
 
 ;;; --- device copies of host vectors, scratch, the arena --------------------------------
@@ -228,6 +261,44 @@
         (cuda-stream-sync (dk-copy-stream st))))
     st))
 
+(defun d4-make-tier (m st dev)
+  "The second device's pool: as many of the hotlist's experts after the
+   first device's as it has room for."
+  (cuda-current dev)
+  (let* ((sb (dk-slot-bytes st)) (d (ds4f-d m)) (ff (ds4f-ff-exp m)) (k (ds4f-n-used m))
+         (stream (cuda-stream-create dev))
+         (scratch (+ (* 4 3 k ff) (* 4 k d) (* 2 +dt-w+)))
+         (free (- (cuda-mem-info dev) scratch (* 0.6d9)))
+         (first (dk-free st))
+         (n (max 0 (min (floor free sb) (- (floor (length +ds4f-hotlist+) 2) first))))
+         (keys (* (ds4f-n-layer m) (ds4f-n-expert m)))
+         (tr (make-d4tier :dev dev :event (cuda-event-create dev) :n n
+                          :slot-of (make-array keys :element-type 'fixnum :initial-element -1)
+                          :host-in (cuda-host-alloc (* 2 +dt-w+)) :in (cuda-alloc dev (* 2 +dt-w+))
+                          :host-out (cuda-host-alloc (* 4 k d))
+                          :gu (cuda-alloc dev (* 4 2 k ff)) :mid (cuda-alloc dev (* 4 k ff))
+                          :down (cuda-alloc dev (* 4 k d)))))
+    (assert (= d 4096) () "a tier's inputs are laid out for 4096 wide")
+    ;; the device's own stream is its compute stream; copies go on another
+    (setf (dt-pool tr) (cuda-alloc dev (* (max n 1) sb) :zero nil))
+    (when (plusp n)
+      (dotimes (s n)
+        (let* ((h (+ first s)) (li (aref +ds4f-hotlist+ (* 2 h))) (e (aref +ds4f-hotlist+ (1+ (* 2 h))))
+               (l (svref (ds4f-layers m) li)) (host (dk-host st)) (gb (dk-gate-bytes st)) (at (* s sb)))
+          (setf (aref (dt-slot-of tr) (+ (* li (ds4f-n-expert m)) e)) s)
+          (destructuring-bind (goff grb grows gcols) (dl-gate-exps l)
+            (declare (ignore gcols))
+            (destructuring-bind (uoff urb urows ucols) (dl-up-exps l)
+              (declare (ignore urows ucols))
+              (destructuring-bind (doff drb drows dcols) (dl-down-exps l)
+                (declare (ignore dcols))
+                (cuda-copy-in (dt-pool tr) at (sb-sys:sap+ host (+ goff (* e grows grb))) gb stream)
+                (cuda-copy-in (dt-pool tr) (+ at gb) (sb-sys:sap+ host (+ uoff (* e grows urb))) gb stream)
+                (cuda-copy-in (dt-pool tr) (+ at (* 2 gb)) (sb-sys:sap+ host (+ doff (* e drows drb))) (* drows drb) stream))))))
+      (cuda-stream-sync stream))
+    (format *error-output* "illatio: and ~D more (~,1F GB) on ~A~%" n (/ (* n sb) 1d9) (cudev-name dev))
+    tr))
+
 (defun d4-copy-expert (m st li e s)
   "Queue layer LI's expert E's copy into slot S, on the copy stream."
   (let* ((l (svref (ds4f-layers m) li)) (host (dk-host st)) (gb (dk-gate-bytes st))
@@ -266,34 +337,75 @@
     (d4-copy-expert m st li e s)
     s))
 
-(defun d4-cache-experts (m st li sel prev)
-  "The slots of layer LI's experts SEL, pinned (PREV's, the last layer's,
-   let go): the missing ones' copies queued, and the compute stream made
-   to wait for every copy queued so far."
-  (let* ((ne (ds4f-n-expert m)) (k (length sel)) (slots (make-array k :element-type 'fixnum))
-         (slot-of (dk-slot-of st)) (used (dk-used st)) (pin (dk-pin st)) (tick (incf (dk-tick st))))
+(defstruct (d4plan (:conc-name dp-))
+  a-slots a-idx                         ; the first device's experts: its slots, their places in SEL
+  b-slots b-idx)                        ; the second's
+
+(defun d4-plan (m st li sel prev)
+  "Where layer LI's experts SEL are computed: the first device's slots
+   (pinned, PREV's let go; the missing ones claimed and their copies
+   queued, and the compute stream made to wait for every copy so far), and
+   the second's."
+  (let* ((ne (ds4f-n-expert m)) (k (length sel)) (tr (dk-tier st))
+         (slot-of (dk-slot-of st)) (used (dk-used st)) (pin (dk-pin st)) (tick (incf (dk-tick st)))
+         (as '()) (ai '()) (bs '()) (bi '()))
     (declare (type (simple-array fixnum (*)) slot-of used pin))
-    (when prev (loop for s across prev do (decf (aref pin s))))
+    (when prev (loop for s across (dp-a-slots prev) do (decf (aref pin s))))
     (dotimes (i k)
-      (let ((s (aref slot-of (+ (* li ne) (aref sel i)))))
-        (if (>= s 0)
-            (progn (setf (aref used s) tick) (incf (dk-hits st)))
-            (progn (setf s (d4-claim m st li (aref sel i))) (incf (dk-misses st))))
-        (setf (aref slots i) s)
-        (incf (aref pin s))))
+      (let* ((key (+ (* li ne) (aref sel i))) (s (aref slot-of key))
+             (s2 (if (and tr (minusp s)) (aref (dt-slot-of tr) key) -1)))
+        (cond ((>= s 0) (setf (aref used s) tick) (incf (dk-hits st)) (push s as) (push i ai))
+              ((>= s2 0) (incf (dt-hits tr)) (push s2 bs) (push i bi))
+              (t (setf s (d4-claim m st li (aref sel i))) (incf (dk-misses st)) (push s as) (push i ai)))
+        (when (>= s 0) (incf (aref pin s)))))
     (cuda-event-record (dk-event st) (dk-copy-stream st))
     (cuda-stream-wait (cudev-stream (dk-dev st)) (dk-event st))
-    slots))
+    (flet ((v (l) (coerce (nreverse l) '(simple-array fixnum (*)))))
+      (make-d4plan :a-slots (v as) :a-idx (v ai) :b-slots (v bs) :b-idx (v bi)))))
+
+(defun d4-tier-launch (m st l plan w)
+  "The second device's share of a layer's experts, queued on it: the FFN
+   input (the first device's, come back in RB) and the experts' pointers
+   and weights copied in, gate/up, SWIGLU, down, the down rows copied out,
+   the event recorded."
+  (let* ((tr (dk-tier st)) (dev (dt-dev tr)) (k (length (dp-b-slots plan)))
+         (d (ds4f-d m)) (ff (ds4f-ff-exp m)) (h (dt-host-in tr)) (sb (dk-slot-bytes st)) (gb (dk-gate-bytes st))
+         (base (dbuf-ptr (dt-pool tr))) (in (dt-in tr)) (li (position l (ds4f-layers m))))
+    (cuda-current dev)
+    (d4-memcpy h (sb-sys:sap+ (dk-rb st) 4096) (* 4 d))
+    (loop for s across (dp-b-slots plan) for i from 0
+          do (setf (sb-sys:sap-ref-64 h (+ +dt-ptrs+ (* 8 i))) (+ base (* s sb))
+                   (sb-sys:sap-ref-64 h (+ +dt-ptrs+ (* 8 (+ k i)))) (+ base (* s sb) gb)))
+    (loop for i across (dp-b-idx plan) for j from 0
+          do (setf (sb-sys:sap-ref-single h (+ +dt-w+ (* 4 j))) (aref w i)))
+    (cuda-copy-in in 0 h (+ +dt-w+ (* 4 k)) (cudev-stream dev))
+    (launch dev "d4_mv_iq2_xxs" (list (ceiling ff 8) 1 (* 2 k)) 64
+            (list d ff (second (dl-gate-exps l)) (list :i64 0) 0 ff (cons in +dt-ptrs+) in (dt-gu tr)))
+    (launch dev "d4_swiglu_w" (ceiling (* k ff) 256) 256
+            (list k ff (svref (ds4f-clamps m) li) (dt-gu tr) (cons (dt-gu tr) (* 4 k ff)) (cons in +dt-w+) (dt-mid tr)))
+    (launch dev "d4_mv_q2_k" (list (ceiling d 8) 1 k) 64
+            (list ff d (second (dl-down-exps l)) (list :i64 (* 2 gb)) ff d (cons in +dt-ptrs+) (dt-mid tr) (dt-down tr)))
+    (cuda-copy-out (dt-host-out tr) (dt-down tr) 0 (* 4 k d))
+    (cuda-event-record (dt-event tr) (cudev-stream dev))
+    (cuda-current (dk-dev st))))
+
+(defvar *ds4f-prefetch-max* 0
+  "At most this many of the guessed experts a layer are copied ahead: about
+   what the link moves while the device computes a layer (a copy ahead
+   that is still running holds up the next layer's own).  0 here: a layer
+   computes in about the time the link takes to move one expert, and a
+   wrong guess costs a copy, so copying ahead loses more than it saves.")
 
 (defun d4-prefetch (m st li experts)
-  "Queue copies of layer LI's EXPERTS the pool lacks (behind the demand)."
-  (let ((ne (ds4f-n-expert m)) (slot-of (dk-slot-of st)))
+  "Queue copies of the first *DS4F-PREFETCH-MAX* of layer LI's EXPERTS (the
+   likeliest first) that neither device holds (behind the demand)."
+  (let ((ne (ds4f-n-expert m)) (slot-of (dk-slot-of st)) (tr (dk-tier st)) (budget *ds4f-prefetch-max*))
     (declare (type (simple-array fixnum (*)) slot-of))
     (dolist (e experts)
-      (let ((s (aref slot-of (+ (* li ne) e))))
-        (if (>= s 0)
-            (setf (aref (dk-used st) s) (dk-tick st))
-            (progn (d4-claim m st li e) (incf (dk-prefetched st))))))))
+      (let* ((key (+ (* li ne) e)) (s (aref slot-of key)))
+        (cond ((>= s 0) (setf (aref (dk-used st) s) (dk-tick st)))
+              ((and tr (>= (aref (dt-slot-of tr) key) 0)))
+              ((plusp budget) (decf budget) (d4-claim m st li e) (incf (dk-prefetched st))))))))
 
 (defun d4-predict (m li token k router-logits)
   "A guess at layer LI's experts: its hash table's, else the top K of
@@ -439,7 +551,7 @@
     (dk-hc-pre m st (lname li "hc_ffn_fn.weight") (dl-hc-ffn-scale l) (dl-hc-ffn-base l) sb cur pcf)
     (dk-rms dev cur (dvec st (dl-ffn-norm l)) norm2 d 1 (ds4f-eps m))
     (dk-mv16 st (lname li "ffn_gate_inp.weight") norm2 logits)
-    (when (and (plusp *ds4f-prefetch-k*) (< (1+ li) (ds4f-n-layer m))
+    (when (and (plusp *ds4f-prefetch-k*) (plusp *ds4f-prefetch-max*) (< (1+ li) (ds4f-n-layer m))
                (null (dl-tid2eid (svref (ds4f-layers m) (1+ li)))))
       (dk-mv16 st (lname (1+ li) "ffn_gate_inp.weight") norm2 (cons logits (* 4 ne))))
     (dk-q8mv st (lname li "ffn_gate_shexp.weight") norm2 sg)
@@ -447,26 +559,37 @@
     (launch dev "d4_swiglu_w" (ceiling ff 256) 256 (list 1 ff (svref (ds4f-clamps m) li) sg su one smid))
     (dk-q8mv st (lname li "ffn_down_shexp.weight") smid sout)))
 
-(defun dk-ffn-tail (m st l li slots w sb sa)
-  "Layer LI's routed experts (pool SLOTS, weights W) on its FFN input, summed
-   with the shared expert, and its FFN's HC post: streams SB into SA."
-  (let* ((dev (dk-dev st)) (d (ds4f-d m)) (ff (ds4f-ff-exp m)) (k (length slots))
+(defun dk-ffn-tail (m st l li plan w sb sa)
+  "Layer LI's routed experts (PLAN's, weights W) on its FFN input, summed
+   with the shared expert, and its FFN's HC post: streams SB into SA.  The
+   first device's experts' down rows first, then the second's (copied in
+   when it is done), summed in the experts' order."
+  (let* ((dev (dk-dev st)) (d (ds4f-d m)) (ff (ds4f-ff-exp m))
+         (slots (dp-a-slots plan)) (k1 (length slots)) (k2 (length (dp-b-slots plan))) (k (+ k1 k2))
          (clamp (svref (ds4f-clamps m) li)) (sbytes (dk-slot-bytes st)) (gb (dk-gate-bytes st))
          (base (dbuf-ptr (dk-pool st)))
-         (ptrs (dk-put st (append (loop for s across slots collect (+ base (* s sbytes)))
-                                  (loop for s across slots collect (+ base (* s sbytes) gb)))
-                       :type :u64))
-         (bw (dk-put st (coerce w 'list) :type :f32))
          (norm2 (dbuf-of st :norm2 (* 4 d)))
          (bgu (dbuf-of st :dgu (* 4 2 k ff))) (bm (dbuf-of st :dmid (* 4 k ff)))
          (bd (dbuf-of st :ddown (* 4 k d))) (moe (dbuf-of st :moe (* 4 d)))
-         (grb (second (dl-gate-exps l))) (drb (second (dl-down-exps l))))
-    (launch dev "d4_mv_iq2_xxs" (list (ceiling ff 8) 1 (* 2 k)) 64
-            (list d ff grb (list :i64 0) 0 ff ptrs norm2 bgu))
-    (launch dev "d4_swiglu_w" (ceiling (* k ff) 256) 256 (list k ff clamp bgu (cons bgu (* 4 k ff)) bw bm))
-    (launch dev "d4_mv_q2_k" (list (ceiling d 8) 1 k) 64
-            (list ff d drb (list :i64 (* 2 gb)) ff d ptrs bm bd))
-    (launch dev "d4_moe_sum" (ceiling d 256) 256 (list d k bd (dbuf-of st :sout (* 4 d)) moe))
+         (perm (let ((p (make-list k)))
+                 (loop for i across (dp-a-idx plan) for j from 0 do (setf (nth i p) j))
+                 (loop for i across (dp-b-idx plan) for j from k1 do (setf (nth i p) j))
+                 (dk-put st p :type :u32))))
+    (when (plusp k1)
+      (let ((ptrs (dk-put st (append (loop for s across slots collect (+ base (* s sbytes)))
+                                     (loop for s across slots collect (+ base (* s sbytes) gb)))
+                          :type :u64))
+            (bw (dk-put st (loop for i across (dp-a-idx plan) collect (aref w i)) :type :f32)))
+        (launch dev "d4_mv_iq2_xxs" (list (ceiling ff 8) 1 (* 2 k1)) 64
+                (list d ff (second (dl-gate-exps l)) (list :i64 0) 0 ff ptrs norm2 bgu))
+        (launch dev "d4_swiglu_w" (ceiling (* k1 ff) 256) 256 (list k1 ff clamp bgu (cons bgu (* 4 k1 ff)) bw bm))
+        (launch dev "d4_mv_q2_k" (list (ceiling d 8) 1 k1) 64
+                (list ff d (second (dl-down-exps l)) (list :i64 (* 2 gb)) ff d ptrs bm bd))))
+    (when (plusp k2)
+      (let ((tr (dk-tier st)))
+        (cuda-stream-wait (cudev-stream dev) (dt-event tr))
+        (cuda-copy-in bd (* 4 k1 d) (dt-host-out tr) (* 4 k2 d))))
+    (launch dev "d4_moe_sum" (ceiling d 256) 256 (list d k bd (dbuf-of st :sout (* 4 d)) moe perm))
     (dk-hc-post m st moe sb (dbuf-of st :pcf (* 4 32)) sa)))
 
 (defun dk-head (m st streams)
@@ -509,22 +632,25 @@
           (dk-ffn-head m st l li sb)
           ;; the routing, on the CPU
           (cuda-copy-out rb (dbuf-of st :logits 0) 0 (* 4 2 ne))
+          (when (dk-tier st) (cuda-copy-out (sb-sys:sap+ rb 4096) (dbuf-of st :norm2 0) 0 (* 4 d)))
           (cuda-sync dev)
           (dotimes (i ne)
             (setf (aref lg i) (sb-sys:sap-ref-single rb (* 4 i))
                   (aref pl i) (sb-sys:sap-ref-single rb (* 4 (+ ne i)))))
           (multiple-value-bind (sel w) (d4-route m l li nil token lg)
-            (let ((slots (d4-cache-experts m st li sel prev)))
-              (when (and (plusp *ds4f-prefetch-k*) (< (1+ li) nl))
+            (when *ds4f-route-trace* (format *ds4f-route-trace* "~D~{ ~D~}~%" li (coerce sel 'list)))
+            (let ((plan (d4-plan m st li sel prev)))
+              (when (plusp (length (dp-b-slots plan))) (d4-tier-launch m st l plan w))
+              (when (and (plusp *ds4f-prefetch-k*) (plusp *ds4f-prefetch-max*) (< (1+ li) nl))
                 (d4-prefetch m st (1+ li) (d4-predict m (1+ li) token *ds4f-prefetch-k* pl)))
-              (setf pending (list l li slots w) prev slots)))))
+              (setf pending (list l li plan w) prev plan)))))
       (dk-arena-reset st)
       (apply #'dk-ffn-tail m st (append pending (list sb sa)))
       (when logits
         (let ((out (dk-head m st sa)) (v (d4ctx-logits ctx)))
           (sb-sys:with-pinned-objects (v)
             (cuda-download out (sb-sys:vector-sap v) (* 4 (ds4f-n-vocab m))))))
-      (loop for s across prev do (decf (aref (dk-pin st) s)))
+      (loop for s across (dp-a-slots prev) do (decf (aref (dk-pin st) s)))
       (cuda-sync dev))
     (incf (d4ctx-pos ctx))
     ctx))
@@ -533,7 +659,8 @@
   "The expert pool's counts so far, a string."
   (let ((st (getf (ds4f-gpu-plist m) :cuda)))
     (if st
-        (format nil "experts: ~D hits, ~D misses (~,1F%), ~D prefetched, ~D copied"
-                (dk-hits st) (dk-misses st)
-                (* 100 (/ (dk-hits st) (max 1 (+ (dk-hits st) (dk-misses st))))) (dk-prefetched st) (dk-copied st))
+        (let ((h2 (if (dk-tier st) (dt-hits (dk-tier st)) 0)))
+          (format nil "experts: ~D hits, ~D on the second device, ~D misses (~,1F%), ~D prefetched, ~D copied"
+                  (dk-hits st) h2 (dk-misses st)
+                  (* 100 (/ (+ h2 (dk-hits st)) (max 1 (+ h2 (dk-hits st) (dk-misses st))))) (dk-prefetched st) (dk-copied st)))
         "no device state")))
