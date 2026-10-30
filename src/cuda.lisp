@@ -62,7 +62,9 @@
   (index 0 :type fixnum)
   name ctx stream module arch
   (total-memory 0)
+  (max-shared 49152)                    ; bytes of shared memory a block may opt in to
   (functions (make-hash-table :test 'equal))
+  (shared-set (make-hash-table :test 'equal)) ; kernel -> the dynamic shared size allowed it
   ;; cuLaunchKernel's argument block: 64 values of 8 bytes, then 64 pointers to them
   (params (sb-sys:int-sap 0)))
 
@@ -111,7 +113,11 @@
                               (cu "cuDeviceGetAttribute" ((* sb-alien:int) (sb-alien:addr v))
                                   (sb-alien:int a) (sb-alien:int d))
                               v)))
-                     (+ (* 10 (attr 75)) (attr 76))))) ; compute capability major, minor
+                     (+ (* 10 (attr 75)) (attr 76)))) ; compute capability major, minor
+             (max-shared (sb-alien:with-alien ((v sb-alien:int 0))
+                           (cu "cuDeviceGetAttribute" ((* sb-alien:int) (sb-alien:addr v))
+                               (sb-alien:int 97) (sb-alien:int d)) ; ..._PER_BLOCK_OPTIN
+                           v)))
         (cu "cuDevicePrimaryCtxRetain" (sb-sys:system-area-pointer (out-ptr ctx)) (sb-alien:int d))
         (cu "cuCtxSetCurrent" (sb-sys:system-area-pointer (sb-sys:int-sap ctx)))
         (cu "cuStreamCreate" (sb-sys:system-area-pointer (out-ptr stream)) (sb-alien:unsigned 0))
@@ -123,7 +129,7 @@
                   (sb-sys:system-area-pointer (sb-sys:vector-sap cubin))))
             (%make-cudev :index index :name name :arch arch
                          :ctx (sb-sys:int-sap ctx) :stream (sb-sys:int-sap stream)
-                         :module (sb-sys:int-sap module) :total-memory mem
+                         :module (sb-sys:int-sap module) :total-memory mem :max-shared max-shared
                          :params (sb-sys:int-sap (%mmap-anon (* 2 64 8))))))))))
 
 (defun cuda-function (dev name)
@@ -304,6 +310,12 @@
                (integer (setf (sb-sys:sap-ref-32 slot 0) (ldb (byte 32 0) a)))
                (single-float (setf (sb-sys:sap-ref-single slot 0) a)))
              (setf (sb-sys:sap-ref-sap pv (* 8 (+ 64 i))) slot))
+    (when (> shared (gethash kernel (cudev-shared-set dev) 49152))
+      ;; past 48 KB a kernel must be allowed its dynamic shared memory
+      (with-cuda
+        (cu "cuFuncSetAttribute" (sb-sys:system-area-pointer (cuda-function dev kernel))
+            (sb-alien:int 8) (sb-alien:int shared))) ; CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES
+      (setf (gethash kernel (cudev-shared-set dev)) shared))
     (flet ((dim (x k) (let ((l (if (listp x) x (list x)))) (or (nth k l) 1))))
       (with-cuda
         (cu "cuLaunchKernel" (sb-sys:system-area-pointer (cuda-function dev kernel))

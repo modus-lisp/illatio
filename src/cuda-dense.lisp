@@ -74,7 +74,13 @@
   tokens x xq xs q k v att fa fb logits part rope kc vc
   (max-split 0 :type fixnum))
 
-(defconstant +att-chunk+ 256 "Positions a block of ATTN_SPLIT takes, at least.")
+(defconstant +att-chunk+ 64 "Positions a block of ATTN_DECODE takes at most (AD_CHUNK).")
+
+(defun decode-chunk (visible)
+  "Positions a block of ATTN_DECODE takes for a context of VISIBLE: fewer
+   while the context is short, so the device still has blocks enough (about
+   48 splits), between 16 and +ATT-CHUNK+."
+  (max 16 (min +att-chunk+ (* 16 (ceiling visible (* 16 48))))))
 
 (defun cuda-state (ctx)
   (or (getf (context-plist ctx) :cuda)
@@ -86,15 +92,15 @@
          (d (model-d m)) (f (model-ffn m)) (hd (model-head-dim m))
          (nh (model-n-head m)) (qd (model-q-dim m)) (kvd (* (model-n-kv-head m) hd))
          (wide (max d qd f))
-         (max-split (ceiling n-ctx +att-chunk+)))
+         (max-split (ceiling n-ctx 16)))
     (flet ((fb (k) (cuda-alloc dev (* 4 k))))
       (let ((st (%make-cctx
                  :tokens (fb n) :x (fb (* n d))
                  :xq (cuda-alloc dev (* n wide)) :xs (fb (ceiling (* n wide) 32))
                  :q (fb (* n qd)) :k (fb (* n kvd)) :v (fb (* n kvd)) :att (fb (* n qd))
                  :fa (fb (* n f)) :fb (fb (* n f)) :logits (fb (model-n-vocab m))
-                 ;; a decode's splits reach the whole context; a prefill's at most 4
-                 :part (fb (* (max max-split (* n 4)) nh (+ hd 2)))
+                 ;; a decode's splits, for ATTN_MERGE
+                 :part (fb (* max-split nh (+ hd 2)))
                  :max-split max-split
                  :rope (fb (* n-ctx hd))
                  :kc (map 'simple-vector (lambda (l) (declare (ignore l)) (fb (* n-ctx kvd))) (model-layers m))
@@ -126,8 +132,19 @@
     (if (= n 1)
         (launch dev "mv_q8" (ceiling rows 4) 128
                 (list (cmat-qs w) (cmat-d w) xq xs y bias rows cols (if acc 1 0)))
-        (launch dev "mm_q8" (list (ceiling n 64) (ceiling rows 64)) 256
-                (list (cmat-qs w) (cmat-d w) xq xs y bias rows cols n (if acc 1 0))))))
+        (if (>= (cudev-arch dev) 80)
+            (launch dev "mm_q8_mma" (list (ceiling n 64) (ceiling rows 128)) 256
+                    (list (cmat-qs w) (cmat-d w) xq xs y bias rows cols n (if acc 1 0)))
+            (launch dev "mm_q8" (list (ceiling n 64) (ceiling rows 64)) 256
+                    (list (cmat-qs w) (cmat-d w) xq xs y bias rows cols n (if acc 1 0)))))))
+
+(defun attn-prefill-shape (dev hd)
+  "(VALUES queries-per-warp shared-bytes) for ATTN_PREFILL: as many queries
+   a warp as the device's shared memory takes, up to 8."
+  (loop for qpw from 8 downto 1
+        for bytes = (* 4 (+ (* hd 33) (* 32 hd) (* 4 qpw hd)))
+        when (<= bytes (cudev-max-shared dev)) return (values qpw bytes)
+        finally (error "ATTN_PREFILL: heads of ~D do not fit in shared memory" hd)))
 
 (defun cuda-forward (ctx token logits)
   (cuda-forward-n ctx (list token) logits))
@@ -150,10 +167,7 @@
          (qd (model-q-dim m))
          (x (cctx-x st)) (xq (cctx-xq st)) (xs (cctx-xs st))
          (visible (+ pos0 n))
-         ;; a decode splits its keys finely; a prefill has blocks enough
-         (chunk (if (= n 1)
-                    +att-chunk+
-                    (max +att-chunk+ (ceiling visible 4))))
+         (chunk (decode-chunk visible))
          (nsplit (ceiling visible chunk))
          (scale (/ 1f0 (sqrt (coerce hd 'single-float)))))
     (assert (<= 1 n *cuda-chunk*))
@@ -175,11 +189,19 @@
                              (cvec-of cm (layer-q-norm l)) (cvec-of cm (layer-k-norm l))
                              (cctx-rope st) (svref (cctx-kc st) li) (svref (cctx-vc st) li)
                              nh nkv hd pos0 eps (if (model-rope-neox m) 1 0)))
-               (launch dev "attn_split" (list nh nsplit n) 128
-                       (list (cctx-q st) (svref (cctx-kc st) li) (svref (cctx-vc st) li) (cctx-part st)
-                             nh nkv hd pos0 chunk nsplit scale))
-               (launch dev "attn_merge" (list nh n) (max 32 hd)
-                       (list (cctx-part st) (cctx-att st) nh hd pos0 chunk nsplit))
+               (if (= n 1)
+                   (progn
+                     (launch dev "attn_decode" (list nkv nsplit) 128
+                             (list (cctx-q st) (svref (cctx-kc st) li) (svref (cctx-vc st) li) (cctx-part st)
+                                   nh nkv hd pos0 chunk nsplit scale)
+                             :shared (* 4 (max (* hd (1+ +att-chunk+)) (* 8 hd (floor nh nkv)))))
+                     (launch dev "attn_merge" (list nh n) (max 32 hd)
+                             (list (cctx-part st) (cctx-att st) nh hd pos0 chunk nsplit)))
+                   (multiple-value-bind (qpw bytes) (attn-prefill-shape dev hd)
+                     (launch dev "attn_prefill" (list nh (ceiling n (* 4 qpw))) 128
+                             (list (cctx-q st) (svref (cctx-kc st) li) (svref (cctx-vc st) li) (cctx-att st)
+                                   nh nkv hd pos0 n scale qpw)
+                             :shared bytes)))
                (launch dev "quant_q8" (ceiling (* n qd) 256) 256
                        (list (cctx-att st) xq xs (list :i64 (floor (* n qd) 32))))
                (cmat-mul dev (cmat-of cm (layer-wo l)) xq xs x n :acc t)

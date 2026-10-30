@@ -13,6 +13,7 @@ typedef signed char i8;
 typedef unsigned char u8;
 typedef unsigned short u16;
 #define INFINITY __int_as_float(0x7f800000)
+#define ATT_MAXE 8                      // attention: HD/32 elements a lane, HD up to 256
 
 __device__ __forceinline__ float h2f(u16 h) {
   float f; asm("cvt.f32.f16 %0, %1;" : "=f"(f) : "h"(h)); return f;
@@ -293,54 +294,119 @@ extern "C" __global__ void qk_rope(float* __restrict__ q, float* __restrict__ k,
   }
 }
 
-// Attention, split along the keys: block (head, split, token) attends the
-// token's query to positions [split*CHUNK, ...) up to its own, keeping a
-// running max, sum and weighted V per warp; the warps' are merged and the
-// split's (max, sum, out[HD]) written to PART.  ATTN_MERGE folds the
-// splits.  HD up to 256 (8 elements a lane).
-#define ATT_MAXE 8
-extern "C" __global__ void attn_split(const float* __restrict__ q, const float* __restrict__ kc,
-                                      const float* __restrict__ vc, float* __restrict__ part,
-                                      int nh, int nkv, int hd, int pos0, int chunk, int nsplit, float scale) {
-  __shared__ float sm[4], sl[4];
-  __shared__ float so[4][256];
-  int head = blockIdx.x, split = blockIdx.y, t = blockIdx.z;
-  int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
-  int ne = hd >> 5;
-  int n = pos0 + t + 1;                 // positions this token sees
-  int p0 = split * chunk, p1 = min(n, p0 + chunk);
-  int kvh = head / (nh / nkv);
+// Decode attention, split along the keys: block (KV head, split) attends
+// the query heads that share the KV head (GQA's group, up to 8) to CHUNK
+// positions (at most 64) of [split*CHUNK, POS0+1), so each key and value
+// is read from memory once.  Memory-level parallelism is the point: K's
+// chunk comes in as float4s, all of a thread's at once, into shared memory
+// transposed; a thread scores a key for half the group; a warp takes a
+// query's softmax; then V is read as float4s, a thread four columns of a
+// part of the keys for every query, the parts summed in shared memory.
+// Each split's (max, sum, out[HD]) goes to PART for ATTN_MERGE.  HD a
+// multiple of 16, up to 256.
+#define AD_CHUNK 64
+#define AD_MAXG 8
+extern "C" __global__ void __launch_bounds__(128)
+attn_decode(const float* __restrict__ q, const float* __restrict__ kc,
+            const float* __restrict__ vc, float* __restrict__ part,
+            int nh, int nkv, int hd, int pos0, int chunk, int nsplit, float scale) {
+  extern __shared__ float dsm[];
+  float* sk = dsm;                            // [hd][AD_CHUNK+1]; later the V parts
+  __shared__ float sq[AD_MAXG * 256];
+  __shared__ float sp[AD_MAXG][AD_CHUNK];
+  __shared__ float smx[AD_MAXG], ssum[AD_MAXG];
+  int kvh = blockIdx.x, split = blockIdx.y, tid = threadIdx.x;
+  int group = nh / nkv;
+  int n = pos0 + 1;
+  int p0 = split * chunk, cnt = min(chunk, n - p0);
   int kvd = nkv * hd;
-  const float* qr = q + (long long)t * nh * hd + head * hd;
-  float qv[ATT_MAXE], o[ATT_MAXE];
-  for (int e = 0; e < ne; e++) { qv[e] = qr[lane + 32 * e]; o[e] = 0.0f; }
-  float m = -INFINITY, l = 0.0f;
-  for (int p = p0 + warp; p < p1; p += 4) {
-    const float* kr = kc + (long long)p * kvd + kvh * hd;
-    float s = 0.0f;
-    for (int e = 0; e < ne; e++) s += qv[e] * kr[lane + 32 * e];
-    s = warp_sum(s) * scale;
-    float mn = fmaxf(m, s);
-    float f = expf(m - mn), w = expf(s - mn);
-    const float* vr = vc + (long long)p * kvd + kvh * hd;
-    for (int e = 0; e < ne; e++) o[e] = o[e] * f + w * vr[lane + 32 * e];
-    l = l * f + w;
-    m = mn;
+  if (cnt <= 0) {
+    if (tid < group) {
+      float* pr = part + ((long long)(kvh * group + tid) * nsplit + split) * (hd + 2);
+      pr[0] = -INFINITY; pr[1] = 0.0f;
+    }
+    return;
   }
-  if (lane == 0) { sm[warp] = m; sl[warp] = l; }
-  for (int e = 0; e < ne; e++) so[warp][lane + 32 * e] = o[e];
+  for (int e = tid; e < group * hd; e += blockDim.x) sq[e] = q[kvh * group * hd + e] * scale;
+  int h4 = hd >> 2;                           // float4s a row
+  const float* kb = kc + (long long)p0 * kvd + kvh * hd;
+  const float* vb = vc + (long long)p0 * kvd + kvh * hd;
+  {
+    float4 r[16];                             // 64 rows x 64 float4 at most / 128 threads
+#pragma unroll
+    for (int u = 0; u < 16; u++) {
+      int e = tid + u * 128, kk = e / h4, c = e % h4;
+      r[u] = (kk < cnt) ? __ldg((const float4*)(kb + (long long)kk * kvd) + c) : make_float4(0, 0, 0, 0);
+    }
+#pragma unroll
+    for (int u = 0; u < 16; u++) {
+      int e = tid + u * 128, kk = e / h4, c = e % h4;
+      if (kk < AD_CHUNK) {
+        sk[(4 * c + 0) * (AD_CHUNK + 1) + kk] = r[u].x; sk[(4 * c + 1) * (AD_CHUNK + 1) + kk] = r[u].y;
+        sk[(4 * c + 2) * (AD_CHUNK + 1) + kk] = r[u].z; sk[(4 * c + 3) * (AD_CHUNK + 1) + kk] = r[u].w;
+      }
+    }
+  }
   __syncthreads();
-  float* pr = part + (((long long)t * nh + head) * nsplit + split) * (hd + 2);
-  float mx = fmaxf(fmaxf(sm[0], sm[1]), fmaxf(sm[2], sm[3]));
-  for (int j = threadIdx.x; j < hd; j += blockDim.x) {
-    float acc = 0.0f;
-    for (int w = 0; w < 4; w++) if (sm[w] != -INFINITY) acc += so[w][j] * expf(sm[w] - mx);
-    pr[2 + j] = acc;
+  {
+    int kk = tid & 63;
+    for (int g = tid >> 6; g < group; g += 2) {
+      float s = -INFINITY;
+      if (kk < cnt) {
+        const float* qg = sq + g * hd;
+        float a0 = 0.0f, a1 = 0.0f, a2 = 0.0f, a3 = 0.0f;
+        for (int j = 0; j < hd; j += 4) {
+          a0 += qg[j] * sk[j * (AD_CHUNK + 1) + kk];
+          a1 += qg[j + 1] * sk[(j + 1) * (AD_CHUNK + 1) + kk];
+          a2 += qg[j + 2] * sk[(j + 2) * (AD_CHUNK + 1) + kk];
+          a3 += qg[j + 3] * sk[(j + 3) * (AD_CHUNK + 1) + kk];
+        }
+        s = (a0 + a1) + (a2 + a3);
+      }
+      sp[g][kk] = s;
+    }
   }
-  if (threadIdx.x == 0) {
-    float ls = 0.0f;
-    for (int w = 0; w < 4; w++) if (sm[w] != -INFINITY) ls += sl[w] * expf(sm[w] - mx);
-    pr[0] = mx; pr[1] = ls;
+  __syncthreads();
+  {
+    int warp = tid >> 5, lane = tid & 31;
+    for (int g = warp; g < group; g += 4) {
+      float s0 = sp[g][lane], s1 = sp[g][lane + 32];
+      float mx = warp_max(fmaxf(s0, s1));
+      float w0 = lane < cnt ? expf(s0 - mx) : 0.0f, w1 = lane + 32 < cnt ? expf(s1 - mx) : 0.0f;
+      sp[g][lane] = w0; sp[g][lane + 32] = w1;
+      float ls = warp_sum(w0 + w1);
+      if (lane == 0) { smx[g] = mx; ssum[g] = ls; }
+    }
+  }
+  __syncthreads();                            // sp, smx, ssum; sk is free for the V parts
+  {
+    int c = tid % h4, qt = tid / h4;          // four columns; which part of the keys
+    int nq = 128 / h4;                        // parts: 4 for HD 128, 2 for 256, 8 for 64
+    float4 acc[AD_MAXG];
+#pragma unroll
+    for (int g = 0; g < AD_MAXG; g++) acc[g] = make_float4(0, 0, 0, 0);
+    for (int kk = qt; kk < cnt; kk += nq) {
+      float4 v = __ldg((const float4*)(vb + (long long)kk * kvd) + c);
+#pragma unroll
+      for (int g = 0; g < AD_MAXG; g++) {
+        if (g < group) {
+          float pw = sp[g][kk];
+          acc[g].x += pw * v.x; acc[g].y += pw * v.y; acc[g].z += pw * v.z; acc[g].w += pw * v.w;
+        }
+      }
+    }
+#pragma unroll
+    for (int g = 0; g < AD_MAXG; g++)
+      if (g < group) *(float4*)(sk + (qt * group + g) * hd + 4 * c) = acc[g];
+    __syncthreads();
+    for (int e = tid; e < group * hd; e += blockDim.x) {
+      int g = e / hd, j = e % hd;
+      float o = 0.0f;
+      for (int u = 0; u < nq; u++) o += sk[(u * group + g) * hd + j];
+      float* pr = part + ((long long)(kvh * group + g) * nsplit + split) * (hd + 2);
+      pr[2 + j] = o;
+      if (j == 0) { pr[0] = smx[g]; pr[1] = ssum[g]; }
+    }
   }
 }
 
@@ -352,6 +418,7 @@ extern "C" __global__ void attn_merge(const float* __restrict__ part, float* __r
   int n = pos0 + t + 1;
   int used = min(nsplit, (n + chunk - 1) / chunk);
   const float* pr = part + ((long long)t * nh + head) * nsplit * (hd + 2);
+  if (used < 1) return;
   float mx = -INFINITY;
   for (int s = 0; s < used; s++) mx = fmaxf(mx, pr[s * (hd + 2)]);
   float l = 0.0f, acc = 0.0f;
@@ -363,4 +430,196 @@ extern "C" __global__ void attn_merge(const float* __restrict__ part, float* __r
     if (j < hd) acc += p[2 + j] * f;
   }
   if (j < hd) out[(long long)t * nh * hd + head * hd + j] = acc / l;
+}
+
+// --- prefill attention ----------------------------------------------------------
+// Flash style: a block takes one query head and 4*QPW of the chunk's tokens
+// (a warp QPW of them) and walks the keys 32 at a time through shared
+// memory -- K transposed and padded, so lane j reading key j's element e is
+// conflict-free -- a lane a key for the scores and a lane HD/32 elements for
+// the output, keeping each query's running max and sum.  Causal: token T
+// sees positions up to POS0+T.  HD up to 256, QPW up to 8.
+#define FA_K 32
+extern "C" __global__ void __launch_bounds__(128)
+attn_prefill(const float* __restrict__ q, const float* __restrict__ kc, const float* __restrict__ vc,
+             float* __restrict__ out, int nh, int nkv, int hd, int pos0, int n, float scale, int qpw) {
+  extern __shared__ float fsm[];
+  float* sk = fsm;                            // [hd][FA_K+1]
+  float* sv = sk + hd * (FA_K + 1);           // [FA_K][hd]
+  float* sq = sv + FA_K * hd;                 // [4*qpw][hd]
+  int nq = 4 * qpw;
+  int head = blockIdx.x, t0 = blockIdx.y * nq;
+  int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+  int ne = hd >> 5;
+  int kvh = head / (nh / nkv), kvd = nkv * hd, qd = nh * hd;
+  for (int e = threadIdx.x; e < nq * hd; e += blockDim.x) {
+    int tq = e / hd, j = e % hd;
+    sq[e] = (t0 + tq < n) ? q[(long long)(t0 + tq) * qd + head * hd + j] * scale : 0.0f;
+  }
+  float o[8][ATT_MAXE], m[8], l[8];
+  for (int i = 0; i < 8; i++) { m[i] = -INFINITY; l[i] = 0.0f; for (int e = 0; e < ATT_MAXE; e++) o[i][e] = 0.0f; }
+  int last = pos0 + min(n, t0 + nq) - 1;      // the furthest position a query here sees
+  for (int p0 = 0; p0 <= last; p0 += FA_K) {
+    __syncthreads();
+    for (int e = threadIdx.x; e < FA_K * hd; e += blockDim.x) {
+      int kk = e / hd, j = e % hd, p = p0 + kk;
+      bool ok = p <= last;
+      sk[j * (FA_K + 1) + kk] = ok ? kc[(long long)p * kvd + kvh * hd + j] : 0.0f;
+      sv[kk * hd + j] = ok ? vc[(long long)p * kvd + kvh * hd + j] : 0.0f;
+    }
+    __syncthreads();
+    int p = p0 + lane;
+    int tw = t0 + warp * qpw;                 // the warp's first token
+    if (tw >= n || p0 > pos0 + min(n - 1, tw + qpw - 1)) continue;
+    // scores: a lane a key, the warp's queries at once; Q read four at a time
+    float sc[8];
+#pragma unroll
+    for (int i = 0; i < 8; i++) sc[i] = 0.0f;
+    for (int j = 0; j < hd; j += 4) {
+      float k0 = sk[(j + 0) * (FA_K + 1) + lane], k1 = sk[(j + 1) * (FA_K + 1) + lane];
+      float k2 = sk[(j + 2) * (FA_K + 1) + lane], k3 = sk[(j + 3) * (FA_K + 1) + lane];
+#pragma unroll
+      for (int i = 0; i < 8; i++) {
+        if (i < qpw) {
+          float4 qv = *(const float4*)(sq + (warp * qpw + i) * hd + j);
+          sc[i] += qv.x * k0 + qv.y * k1 + qv.z * k2 + qv.w * k3;
+        }
+      }
+    }
+    float pw[8];
+#pragma unroll
+    for (int i = 0; i < 8; i++) {
+      pw[i] = 0.0f;
+      if (i < qpw && tw + i < n) {
+        int qpos = pos0 + tw + i;
+        float s = p > qpos ? -INFINITY : sc[i];
+        float mn = fmaxf(m[i], warp_max(s));
+        float pr = mn == -INFINITY ? 0.0f : expf(s - mn);
+        float f = mn == -INFINITY ? 1.0f : expf(m[i] - mn);
+        l[i] = l[i] * f + warp_sum(pr);
+#pragma unroll
+        for (int e = 0; e < ATT_MAXE; e++) o[i][e] *= f;
+        m[i] = mn;
+        pw[i] = pr;
+      }
+    }
+    // the output: each key's V row once, for every query of the warp
+    for (int kk = 0; kk < FA_K; kk++) {
+      float v[ATT_MAXE];
+      const float* vr = sv + kk * hd;
+#pragma unroll
+      for (int e = 0; e < ATT_MAXE; e++) v[e] = e < ne ? vr[lane + 32 * e] : 0.0f;
+#pragma unroll
+      for (int i = 0; i < 8; i++) {
+        if (i < qpw) {
+          float w = __shfl_sync(0xffffffff, pw[i], kk);
+#pragma unroll
+          for (int e = 0; e < ATT_MAXE; e++) o[i][e] += w * v[e];
+        }
+      }
+    }
+  }
+#pragma unroll
+  for (int i = 0; i < 8; i++) {
+    if (i >= qpw) break;
+    int t = t0 + warp * qpw + i;
+    if (t >= n) break;
+    float inv = 1.0f / l[i];
+#pragma unroll
+    for (int e = 0; e < ATT_MAXE; e++)
+      if (e < ne) out[(long long)t * qd + head * hd + lane + 32 * e] = o[i][e] * inv;
+  }
+}
+
+// --- matrix x matrix on the tensor cores (sm_80 and up) --------------------------
+// mma.m16n8k32.s8: one instruction is one Q8_0 block of a 16-row x 8-token
+// tile, its int32 sums exact; each is then scaled by its row's and token's
+// block scales into float accumulators.  A block takes 128 rows x 64 tokens,
+// 8 warps of 32 x 32, and K four blocks (128 columns) at a time.
+
+#define MMA_R 128
+#define MMA_T 64
+#define MMA_W 36                                // words a row in shared: 32 + 4 against bank conflicts
+
+__device__ __forceinline__ void mma_s8(int* c, int a0, int a1, int a2, int a3, int b0, int b1) {
+#if __CUDA_ARCH__ >= 800
+  asm volatile("mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
+               : "+r"(c[0]), "+r"(c[1]), "+r"(c[2]), "+r"(c[3])
+               : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
+#endif
+}
+
+extern "C" __global__ void __launch_bounds__(256)
+mm_q8_mma(const i8* __restrict__ wq, const u16* __restrict__ wd,
+          const i8* __restrict__ xq, const float* __restrict__ xs,
+          float* __restrict__ y, const float* __restrict__ bias,
+          int rows, int cols, int n, int acc) {
+  __shared__ int sw[MMA_R * MMA_W];
+  __shared__ int sx[MMA_T * MMA_W];
+  __shared__ float swd[MMA_R][4];
+  __shared__ float sxd[MMA_T][4];
+  int r0 = blockIdx.y * MMA_R, t0 = blockIdx.x * MMA_T;
+  int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
+  int g = lane >> 2, tg = lane & 3;
+  int wr = (warp >> 1) * 32, wt = (warp & 1) * 32;   // this warp's 32 rows, 32 tokens
+  int nb = cols >> 5;
+  float c[2][4][4];
+  for (int i = 0; i < 2; i++) for (int j = 0; j < 4; j++) for (int k = 0; k < 4; k++) c[i][j][k] = 0.0f;
+  for (int kb = 0; kb < nb; kb += 4) {
+    // 128 rows x 8 int4 and 64 tokens x 8 int4: 256 threads, 4 + 2 each
+    for (int e = tid; e < MMA_R * 8; e += 256) {
+      int rr = e >> 3, c4 = e & 7, r = r0 + rr, b = kb + (c4 >> 1);
+      int4 v = make_int4(0, 0, 0, 0);
+      if (r < rows && b < nb) v = __ldg((const int4*)(wq + (long long)r * cols + (long long)kb * 32) + c4);
+      *(int4*)(sw + rr * MMA_W + c4 * 4) = v;
+    }
+    for (int e = tid; e < MMA_T * 8; e += 256) {
+      int tt = e >> 3, c4 = e & 7, t = t0 + tt, b = kb + (c4 >> 1);
+      int4 v = make_int4(0, 0, 0, 0);
+      if (t < n && b < nb) v = __ldg((const int4*)(xq + (long long)t * cols + (long long)kb * 32) + c4);
+      *(int4*)(sx + tt * MMA_W + c4 * 4) = v;
+    }
+    for (int e = tid; e < MMA_R * 4; e += 256) {
+      int rr = e >> 2, bb = e & 3, r = r0 + rr, b = kb + bb;
+      swd[rr][bb] = (r < rows && b < nb) ? h2f(__ldg(wd + (long long)r * nb + b)) : 0.0f;
+    }
+    {
+      int e = tid; int tt = e >> 2, bb = e & 3, t = t0 + tt, b = kb + bb;
+      sxd[tt][bb] = (t < n && b < nb) ? __ldg(xs + (long long)t * nb + b) : 0.0f;
+    }
+    __syncthreads();
+    for (int bb = 0; bb < 4; bb++) {
+      int a[2][4], b[4][2];
+      for (int i = 0; i < 2; i++) {
+        const int* p = sw + (wr + i * 16 + g) * MMA_W + bb * 8 + tg;
+        a[i][0] = p[0]; a[i][1] = p[8 * MMA_W]; a[i][2] = p[4]; a[i][3] = p[8 * MMA_W + 4];
+      }
+      for (int j = 0; j < 4; j++) {
+        const int* p = sx + (wt + j * 8 + g) * MMA_W + bb * 8 + tg;
+        b[j][0] = p[0]; b[j][1] = p[4];
+      }
+      for (int i = 0; i < 2; i++) {
+        float d0 = swd[wr + i * 16 + g][bb], d1 = swd[wr + i * 16 + g + 8][bb];
+        for (int j = 0; j < 4; j++) {
+          int s[4] = {0, 0, 0, 0};
+          mma_s8(s, a[i][0], a[i][1], a[i][2], a[i][3], b[j][0], b[j][1]);
+          float x0 = sxd[wt + j * 8 + tg * 2][bb], x1 = sxd[wt + j * 8 + tg * 2 + 1][bb];
+          c[i][j][0] += (float)s[0] * (d0 * x0);
+          c[i][j][1] += (float)s[1] * (d0 * x1);
+          c[i][j][2] += (float)s[2] * (d1 * x0);
+          c[i][j][3] += (float)s[3] * (d1 * x1);
+        }
+      }
+    }
+    __syncthreads();
+  }
+  for (int i = 0; i < 2; i++) for (int j = 0; j < 4; j++) for (int k = 0; k < 4; k++) {
+    int r = r0 + wr + i * 16 + g + (k >> 1) * 8;
+    int t = t0 + wt + j * 8 + tg * 2 + (k & 1);
+    if (r < rows && t < n) {
+      float v = c[i][j][k] + (bias ? bias[r] : 0.0f);
+      long long o = (long long)t * rows + r;
+      y[o] = acc ? y[o] + v : v;
+    }
+  }
 }
