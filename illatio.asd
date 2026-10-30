@@ -38,6 +38,12 @@
      (:file "metal-ds4f-prefill" :if-feature (:and :sbcl :darwin)) ; a prefill chunk's
      (:file "ds4f-spec" :if-feature (:and :sbcl :darwin)))))) ; a few tokens a step, guessed from the context
 
+(defsystem "illatio/train"
+  :description "Training: GPT-2's forward, backward and AdamW in f32, ported
+                from llm.c's CPU reference."
+  :depends-on ("illatio")
+  :components ((:module "src" :components ((:file "gpt2-train")))))
+
 (defsystem "illatio/openai"
   :description "OpenAI chat completions computed in this image: chat templates
                 rendered in Lisp, tool calls parsed out of the reply."
