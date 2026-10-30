@@ -27,6 +27,12 @@
 - The Q8_0 products (d4_mvq8, the largest kernel) and IQ2_XXS's closer to
   the memory's speed; fewer, larger launches.
 
+- A 3090 alone (no second device; *ds4f-cuda-tier-device* NIL): decode
+  23.9 t/s (28.9 with the P40), prefill the same (4.1 s for 1904 tokens),
+  repeating text 25.5 t/s speculating (18.4 not); guesses cost more there
+  (each extra token's experts are mostly misses), so speculating loses on
+  code and prose (-7 to -11%) -- its guesses want a stricter bar alone.
+
 ## CUDA, generally
 
 - K-quant prefill (behind llama.cpp's on Qwen3-4B Q4_K_M); P40 prefill.
