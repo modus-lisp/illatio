@@ -42,7 +42,9 @@
   :description "Training: GPT-2's forward, backward and AdamW in f32, ported
                 from llm.c's CPU reference."
   :depends-on ("illatio")
-  :components ((:module "src" :components ((:file "gpt2-train")))))
+  :components ((:module "src" :serial t
+                :components ((:file "gpt2-train")
+                             (:file "metal-gpt2-train" :if-feature (:and :sbcl :darwin))))))
 
 (defsystem "illatio/openai"
   :description "OpenAI chat completions computed in this image: chat templates
