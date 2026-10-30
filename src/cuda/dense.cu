@@ -625,7 +625,7 @@ attn_prefill(const float* __restrict__ q, const float* __restrict__ kc, const fl
 
 __device__ __forceinline__ void mma_s8(int* c, int a0, int a1, int a2, int a3, int b0, int b1) {
 #if __CUDA_ARCH__ >= 800
-  asm volatile("mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
+  asm("mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
                : "+r"(c[0]), "+r"(c[1]), "+r"(c[2]), "+r"(c[3])
                : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
 #endif
@@ -827,4 +827,153 @@ attn_prefill2(const float* __restrict__ q, const float* __restrict__ kc, const f
             make_float4(o[i][4 * w] * inv, o[i][4 * w + 1] * inv, o[i][4 * w + 2] * inv, o[i][4 * w + 3] * inv);
     }
   }
+}
+
+// --- matrix x matrix on the tensor cores, pipelined (sm_80 and up) ------------------
+// MM_Q8_MMA with its tiles brought in by cp.async, two stages deep, so the
+// next four blocks of K load while these multiply; fragments read by
+// ldmatrix; and an int32 block sum (|s| < 2^22) turned into a float by
+// adding it to 1.5*2^23's bits, exact and cheaper than a conversion.  Up to
+// three matrices sharing X in one launch (Q, K and V): row tiles [0, R0/128)
+// are W0's, then W1's, then W2's.  COLS a multiple of 128, every R a
+// multiple of 128 when there is more than one.
+
+#define M2_STAGE_INTS ((MMA_R + MMA_T) * MMA_W)
+#define M2_SHARED (2 * (M2_STAGE_INTS * 4 + MMA_R * 8 + MMA_T * 16))
+
+__device__ __forceinline__ unsigned smem_addr(const void* p) {
+  return (unsigned)__cvta_generic_to_shared(p);
+}
+__device__ __forceinline__ void cp_async16(void* dst, const void* src, bool ok) {
+  asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;" :: "r"(smem_addr(dst)), "l"(src), "r"(ok ? 16 : 0));
+}
+__device__ __forceinline__ void cp_async8(void* dst, const void* src, bool ok) {
+  asm volatile("cp.async.ca.shared.global [%0], [%1], 8, %2;" :: "r"(smem_addr(dst)), "l"(src), "r"(ok ? 8 : 0));
+}
+__device__ __forceinline__ void cp_commit() { asm volatile("cp.async.commit_group;"); }
+__device__ __forceinline__ void cp_wait1() { asm volatile("cp.async.wait_group 1;"); }
+__device__ __forceinline__ void cp_wait0() { asm volatile("cp.async.wait_group 0;"); }
+__device__ __forceinline__ void ldsm_x4(int& r0, int& r1, int& r2, int& r3, const void* p) {
+  asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];"
+               : "=r"(r0), "=r"(r1), "=r"(r2), "=r"(r3) : "r"(smem_addr(p)));
+}
+__device__ __forceinline__ float i2f_exact(int s) {
+  return __int_as_float(s + 0x4B400000) - 12582912.0f;
+}
+
+extern "C" __global__ void __launch_bounds__(256)
+mm_q8_mma2(const i8* __restrict__ w0, const u16* __restrict__ d0, float* __restrict__ y0, const float* __restrict__ b0, int rows0,
+           const i8* __restrict__ w1, const u16* __restrict__ d1, float* __restrict__ y1, const float* __restrict__ b1, int rows1,
+           const i8* __restrict__ w2, const u16* __restrict__ d2, float* __restrict__ y2, const float* __restrict__ b2, int rows2,
+           const i8* __restrict__ xq, const float* __restrict__ xs, int cols, int n, int acc) {
+  extern __shared__ __align__(16) int m2s[];
+  // which matrix this block's rows are
+  int rt = blockIdx.y, t0 = blockIdx.x * MMA_T;
+  int tiles0 = (rows0 + MMA_R - 1) / MMA_R, tiles1 = (rows1 + MMA_R - 1) / MMA_R;
+  const i8* wq; const u16* wd; float* y; const float* bias; int rows;
+  if (rt < tiles0) { wq = w0; wd = d0; y = y0; bias = b0; rows = rows0; }
+  else if (rt < tiles0 + tiles1) { rt -= tiles0; wq = w1; wd = d1; y = y1; bias = b1; rows = rows1; }
+  else { rt -= tiles0 + tiles1; wq = w2; wd = d2; y = y2; bias = b2; rows = rows2; }
+  int r0 = rt * MMA_R;
+  int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
+  int g = lane >> 2, tg = lane & 3;
+  int wr = (warp >> 1) * 32, wt = (warp & 1) * 32;
+  int nb = cols >> 5, nk = nb >> 2;           // K steps of four blocks
+  int* sw[2]; int* sx[2]; u16* swd[2]; float* sxd[2];
+  for (int st = 0; st < 2; st++) {
+    int* base = m2s + st * (M2_STAGE_INTS + MMA_R * 2 + MMA_T * 4);
+    sw[st] = base; sx[st] = base + MMA_R * MMA_W;
+    swd[st] = (u16*)(base + M2_STAGE_INTS); sxd[st] = (float*)(base + M2_STAGE_INTS + MMA_R * 2);
+  }
+  auto load = [&](int st, int ks) {
+    int kb = ks * 4;
+#pragma unroll
+    for (int u = 0; u < 4; u++) {
+      int e = tid + u * 256, rr = e >> 3, c4 = e & 7, r = r0 + rr;
+      cp_async16(sw[st] + rr * MMA_W + c4 * 4, wq + (long long)min(r, rows - 1) * cols + kb * 32 + c4 * 16, r < rows);
+    }
+#pragma unroll
+    for (int u = 0; u < 2; u++) {
+      int e = tid + u * 256, tt = e >> 3, c4 = e & 7, t = t0 + tt;
+      cp_async16(sx[st] + tt * MMA_W + c4 * 4, xq + (long long)min(t, n - 1) * cols + kb * 32 + c4 * 16, t < n);
+    }
+    if (tid < MMA_R) { int r = r0 + tid; cp_async8(swd[st] + tid * 4, wd + (long long)min(r, rows - 1) * nb + kb, r < rows); }
+    else if (tid < MMA_R + MMA_T) { int tt = tid - MMA_R, t = t0 + tt;
+      cp_async16(sxd[st] + tt * 4, xs + (long long)min(t, n - 1) * nb + kb, t < n); }
+    cp_commit();
+  };
+  float c[2][4][4];
+#pragma unroll
+  for (int i = 0; i < 2; i++)
+#pragma unroll
+    for (int j = 0; j < 4; j++)
+#pragma unroll
+      for (int k = 0; k < 4; k++) c[i][j][k] = 0.0f;
+  load(0, 0);
+  for (int ks = 0; ks < nk; ks++) {
+    int st = ks & 1;
+    if (ks + 1 < nk) { load(st ^ 1, ks + 1); cp_wait1(); } else cp_wait0();
+    __syncthreads();
+    const int* W = sw[st]; const int* X = sx[st];
+#pragma unroll
+    for (int bb = 0; bb < 4; bb++) {
+      int a[2][4], b[4][2];
+#pragma unroll
+      for (int i = 0; i < 2; i++)
+        ldsm_x4(a[i][0], a[i][1], a[i][2], a[i][3],
+                (const char*)(W + (wr + i * 16 + (lane & 15)) * MMA_W) + bb * 32 + (lane >> 4) * 16);
+#pragma unroll
+      for (int j = 0; j < 4; j += 2)
+        ldsm_x4(b[j][0], b[j][1], b[j + 1][0], b[j + 1][1],
+                (const char*)(X + (wt + j * 8 + (lane & 7) + ((lane >> 4) << 3)) * MMA_W) + bb * 32 + ((lane >> 3) & 1) * 16);
+      float dr[2][2], dx[4][2];
+#pragma unroll
+      for (int i = 0; i < 2; i++) {
+        dr[i][0] = h2f(swd[st][(wr + i * 16 + g) * 4 + bb]);
+        dr[i][1] = h2f(swd[st][(wr + i * 16 + g + 8) * 4 + bb]);
+      }
+#pragma unroll
+      for (int j = 0; j < 4; j++) {
+        dx[j][0] = sxd[st][(wt + j * 8 + tg * 2) * 4 + bb];
+        dx[j][1] = sxd[st][(wt + j * 8 + tg * 2 + 1) * 4 + bb];
+      }
+      // the step's eight products first, then their scaling: no mma waits on the last
+      int s[2][4][4];
+#pragma unroll
+      for (int i = 0; i < 2; i++)
+#pragma unroll
+        for (int j = 0; j < 4; j++) {
+          s[i][j][0] = s[i][j][1] = s[i][j][2] = s[i][j][3] = 0;
+          mma_s8(s[i][j], a[i][0], a[i][1], a[i][2], a[i][3], b[j][0], b[j][1]);
+        }
+#pragma unroll
+      for (int i = 0; i < 2; i++)
+#pragma unroll
+        for (int j = 0; j < 4; j++) {
+          c[i][j][0] += i2f_exact(s[i][j][0]) * (dr[i][0] * dx[j][0]);
+          c[i][j][1] += i2f_exact(s[i][j][1]) * (dr[i][0] * dx[j][1]);
+          c[i][j][2] += i2f_exact(s[i][j][2]) * (dr[i][1] * dx[j][0]);
+          c[i][j][3] += i2f_exact(s[i][j][3]) * (dr[i][1] * dx[j][1]);
+        }
+    }
+    __syncthreads();
+  }
+#pragma unroll
+  for (int i = 0; i < 2; i++)
+#pragma unroll
+    for (int j = 0; j < 4; j++)
+#pragma unroll
+      for (int k = 0; k < 4; k += 2) {
+        int r = r0 + wr + i * 16 + g + (k >> 1) * 8;
+        int t = t0 + wt + j * 8 + tg * 2;
+        if (r < rows) {
+          float bv = bias ? bias[r] : 0.0f;
+          for (int kk = 0; kk < 2; kk++)
+            if (t + kk < n) {
+              long long o = (long long)(t + kk) * rows + r;
+              float v = c[i][j][k + kk] + bv;
+              y[o] = acc ? y[o] + v : v;
+            }
+        }
+      }
 }

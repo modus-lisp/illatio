@@ -163,7 +163,8 @@
          (qd (model-q-dim model))
          (kv (* (model-n-kv-head model) (model-head-dim model)))
          (f (model-ffn model)))
-    (own-context-caches
+    (prepare-context
+     (own-context-caches
      (%make-context
      :model model :n-ctx n-ctx
      ;; static on modus: a 4B model's cache at 4096 tokens is 1.2 GB, more
@@ -177,7 +178,12 @@
      :x (f32vec d) :h (f32vec d) :q (f32vec qd) :k (f32vec kv) :v (f32vec kv)
      :att (f32vec qd) :ffn-a (f32vec f) :ffn-b (f32vec f)
      :xq (make-qact (max d qd) (model-act-kinds model)) :hq (make-qact f (model-act-kinds model))
-     :logits (f32vec (model-n-vocab model))))))
+     :logits (f32vec (model-n-vocab model)))))))
+
+(defun prepare-context (ctx)
+  "Whatever a context's device needs made before it runs (its CUDA buffers)."
+  #+(and sbcl linux) (when (model-cuda (context-model ctx)) (cuda-state ctx))
+  ctx)
 
 (defun context-static-vectors (ctx)
   "The vectors of CTX outside the heap: its KV cache and recurrent state."

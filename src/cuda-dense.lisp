@@ -103,8 +103,10 @@
                  :part (fb (* max-split nh (+ hd 2)))
                  :max-split max-split
                  :rope (fb (* n-ctx hd))
-                 :kc (map 'simple-vector (lambda (l) (declare (ignore l)) (fb (* n-ctx kvd))) (model-layers m))
-                 :vc (map 'simple-vector (lambda (l) (declare (ignore l)) (fb (* n-ctx kvd))) (model-layers m)))))
+                 ;; every layer's cache in one allocation each for K and V: a
+                 ;; layer's is (buffer . its offset)
+                 :kc (layer-slices (fb (* (model-n-layer m) n-ctx kvd)) (model-n-layer m) (* 4 n-ctx kvd))
+                 :vc (layer-slices (fb (* (model-n-layer m) n-ctx kvd)) (model-n-layer m) (* 4 n-ctx kvd)))))
         ;; every position's RoPE table, as the CPU computes it (ROPE-TABLE), once
         (let ((tab (f32vec (* n-ctx hd))))
           (dotimes (p n-ctx)
@@ -114,29 +116,49 @@
           (cuda-upload-vector (cctx-rope st) tab))
         st))))
 
+(defun layer-slices (buf n bytes)
+  (coerce (loop for i below n collect (cons buf (* i bytes))) 'simple-vector))
+
 (defun free-cuda-state (ctx)
   (let ((st (getf (context-plist ctx) :cuda)))
     (when st
       (dolist (s '(tokens x xq xs q k v att fa fb logits part rope))
         (cuda-free (slot-value st s)))
-      (map nil #'cuda-free (cctx-kc st))
-      (map nil #'cuda-free (cctx-vc st))
+      (cuda-free (car (svref (cctx-kc st) 0)))
+      (cuda-free (car (svref (cctx-vc st) 0)))
       (remf (context-plist ctx) :cuda))))
 
 ;;; --- a pass ---------------------------------------------------------------------------
+
+(defconstant +mm2-shared+ (* 2 (+ (* 4 192 36) (* 128 8) (* 64 16)))
+  "MM_Q8_MMA2's shared memory: two stages of 128 rows and 64 tokens (M2_SHARED).")
+
+(defun mm2-p (dev cols) (and (>= (cudev-arch dev) 80) (zerop (mod cols 128))))
 
 (defun cmat-mul (dev w xq xs y n &key bias acc)
   "Y = W X for N tokens (token t's X at t*cols, its Y at t*rows), or Y += it
    when ACC: a matrix-vector product for one, the tiled product for more."
   (let ((rows (cmat-rows w)) (cols (cmat-cols w)))
-    (if (= n 1)
-        (launch dev "mv_q8" (ceiling rows 4) 128
-                (list (cmat-qs w) (cmat-d w) xq xs y bias rows cols (if acc 1 0)))
-        (if (>= (cudev-arch dev) 80)
-            (launch dev "mm_q8_mma" (list (ceiling n 64) (ceiling rows 128)) 256
-                    (list (cmat-qs w) (cmat-d w) xq xs y bias rows cols n (if acc 1 0)))
-            (launch dev "mm_q8" (list (ceiling n 64) (ceiling rows 64)) 256
-                    (list (cmat-qs w) (cmat-d w) xq xs y bias rows cols n (if acc 1 0)))))))
+    (cond ((= n 1)
+           (launch dev "mv_q8" (ceiling rows 4) 128
+                   (list (cmat-qs w) (cmat-d w) xq xs y bias rows cols (if acc 1 0))))
+          ((mm2-p dev cols) (cmat-mul-n dev (list (list w y bias)) xq xs n :acc acc))
+          ((>= (cudev-arch dev) 80)
+           (launch dev "mm_q8_mma" (list (ceiling n 64) (ceiling rows 128)) 256
+                   (list (cmat-qs w) (cmat-d w) xq xs y bias rows cols n (if acc 1 0))))
+          (t
+           (launch dev "mm_q8" (list (ceiling n 64) (ceiling rows 64)) 256
+                   (list (cmat-qs w) (cmat-d w) xq xs y bias rows cols n (if acc 1 0)))))))
+
+(defun cmat-mul-n (dev parts xq xs n &key acc)
+  "PARTS, up to three (W Y BIAS) sharing X, in one launch of MM_Q8_MMA2."
+  (let ((args (loop for k below 3
+                    for (w y bias) = (nth k parts)
+                    append (if w (list (cmat-qs w) (cmat-d w) y bias (cmat-rows w)) (list nil nil nil nil 0)))))
+    (launch dev "mm_q8_mma2"
+            (list (ceiling n 64) (loop for (w) in parts sum (ceiling (cmat-rows w) 128))) 256
+            (append args (list xq xs (cmat-cols (first (first parts))) n (if acc 1 0)))
+            :shared +mm2-shared+)))
 
 (defun rmsnorm-q8 (dev x w xq xs d eps n)
   "RMSNORM! of N rows of X (D wide) by W, quantized into XQ / XS.  A single
@@ -193,10 +215,13 @@
                              (list (cmat-qs wq) (cmat-d wq) (cmat-qs wk) (cmat-d wk) (cmat-qs wv) (cmat-d wv)
                                    xq xs (cctx-q st) (cctx-k st) (cctx-v st) bq bk bv
                                    (cmat-rows wq) (cmat-rows wk) (cmat-rows wv) d))
-                     (progn
-                       (cmat-mul dev wq xq xs (cctx-q st) n :bias bq)
-                       (cmat-mul dev wk xq xs (cctx-k st) n :bias bk)
-                       (cmat-mul dev wv xq xs (cctx-v st) n :bias bv))))
+                     (if (and (mm2-p dev d) (every (lambda (w) (zerop (mod (cmat-rows w) 128))) (list wq wk wv)))
+                         (cmat-mul-n dev (list (list wq (cctx-q st) bq) (list wk (cctx-k st) bk) (list wv (cctx-v st) bv))
+                                     xq xs n)
+                         (progn
+                           (cmat-mul dev wq xq xs (cctx-q st) n :bias bq)
+                           (cmat-mul dev wk xq xs (cctx-k st) n :bias bk)
+                           (cmat-mul dev wv xq xs (cctx-v st) n :bias bv)))))
                (launch dev "qk_rope" (list (+ nh nkv) n) (max 32 (floor hd 2))
                        (list (cctx-q st) (cctx-k st) (cctx-v st)
                              (cvec-of cm (layer-q-norm l)) (cvec-of cm (layer-k-norm l))
