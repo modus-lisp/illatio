@@ -172,8 +172,11 @@
            (if (= n 1)
                (launch dev "mv_k" (ceiling rows 4) 128
                        (list (kquant-code (cmat-type w)) (cmat-qs w) xq xs xsum y bias rows cols (if acc 1 0)))
-               (launch dev "mm_k" (list (ceiling n 64) (ceiling rows 64)) 256
-                       (list (kquant-code (cmat-type w)) (cmat-qs w) xq xs xsum y bias rows cols n (if acc 1 0)))))
+               (if (>= (cudev-arch dev) 80)
+                   (launch dev "mm_k_mma" (list (ceiling n 64) (ceiling rows 128)) 256
+                           (list (kquant-code (cmat-type w)) (cmat-qs w) xq xs xsum y bias rows cols n (if acc 1 0)))
+                   (launch dev "mm_k" (list (ceiling n 64) (ceiling rows 64)) 256
+                           (list (kquant-code (cmat-type w)) (cmat-qs w) xq xs xsum y bias rows cols n (if acc 1 0))))))
           ((= n 1)
            (launch dev "mv_q8" (ceiling rows 4) 128
                    (list (cmat-qs w) (cmat-d w) xq xs y bias rows cols (if acc 1 0))))

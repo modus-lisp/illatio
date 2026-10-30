@@ -76,6 +76,75 @@ __device__ __forceinline__ void kgroup_at(int type, const u8* __restrict__ w, lo
   else kgroup_q6k(w + sb * Q6P, gi & 7, o);
 }
 
+// The same, in two steps: KRAW_LOAD the group's bytes (at most six int4:
+// header and scales, high bits, quants), KRAW_UNPACK them, so a pipelined
+// kernel can have the next loads in flight while it computes.
+struct kraw { int4 v[6]; };
+
+__device__ __forceinline__ void kraw_load(int type, const u8* __restrict__ w, long long r, int cols, int gi, kraw& k) {
+  int nsb = cols >> 8, gg = gi & 7;
+  long long sb = r * nsb + (gi >> 3);
+  if (type == 0) {
+    const u8* blk = w + sb * 144;
+    k.v[0] = __ldg((const int4*)blk);
+    k.v[1] = __ldg((const int4*)(blk + 16 + (gg >> 1) * 32)); k.v[2] = __ldg((const int4*)(blk + 32 + (gg >> 1) * 32));
+  } else if (type == 1) {
+    const u8* blk = w + sb * 176;
+    k.v[0] = __ldg((const int4*)blk);
+    k.v[1] = __ldg((const int4*)(blk + 48 + (gg >> 1) * 32)); k.v[2] = __ldg((const int4*)(blk + 64 + (gg >> 1) * 32));
+    k.v[3] = __ldg((const int4*)(blk + 16)); k.v[4] = __ldg((const int4*)(blk + 32));
+  } else {
+    const u8* blk = w + sb * Q6P;
+    int c = gg >> 2, p = gg & 3;
+    k.v[1] = __ldg((const int4*)(blk + c * 64 + (p & 1) * 32)); k.v[2] = __ldg((const int4*)(blk + c * 64 + (p & 1) * 32 + 16));
+    k.v[3] = __ldg((const int4*)(blk + 128 + c * 32)); k.v[4] = __ldg((const int4*)(blk + 144 + c * 32));
+    k.v[0] = __ldg((const int4*)(blk + 192)); k.v[5] = __ldg((const int4*)(blk + 208));
+  }
+}
+
+// Byte I (0..15) of V, without taking V's address (which would put it in
+// local memory).
+__device__ __forceinline__ int byte_of(const int4& v, int i) {
+  int w = i < 8 ? (i < 4 ? v.x : v.y) : (i < 12 ? v.z : v.w);
+  return (w >> (8 * (i & 3))) & 0xFF;
+}
+
+__device__ __forceinline__ void kraw_unpack(int type, int gi, const kraw& k, kgroup& o) {
+  int gg = gi & 7;
+  int w[8] = {k.v[1].x, k.v[1].y, k.v[1].z, k.v[1].w, k.v[2].x, k.v[2].y, k.v[2].z, k.v[2].w};
+  if (type <= 1) {
+    int sh = (gg & 1) * 4;
+    if (type == 0) {
+#pragma unroll
+      for (int i = 0; i < 8; i++) o.q[i] = (w[i] >> sh) & 0x0F0F0F0F;
+    } else {
+      int h[8] = {k.v[3].x, k.v[3].y, k.v[3].z, k.v[3].w, k.v[4].x, k.v[4].y, k.v[4].z, k.v[4].w};
+#pragma unroll
+      for (int i = 0; i < 8; i++) o.q[i] = ((w[i] >> sh) & 0x0F0F0F0F) | (((h[i] >> gg) & 0x01010101) << 4);
+    }
+    // get_scale_min_k4 on the header's bytes 4..15
+    int sc, m;
+    if (gg < 4) { sc = byte_of(k.v[0], 4 + gg) & 63; m = byte_of(k.v[0], 8 + gg) & 63; }
+    else {
+      sc = (byte_of(k.v[0], 8 + gg) & 0xF) | ((byte_of(k.v[0], gg) >> 6) << 4);
+      m = (byte_of(k.v[0], 8 + gg) >> 4) | ((byte_of(k.v[0], 4 + gg) >> 6) << 4);
+    }
+    float d = h2f((u16)(k.v[0].x & 0xFFFF)), dmin = h2f((u16)((unsigned)k.v[0].x >> 16));
+    o.alo = o.ahi = d * (float)sc; o.b = dmin * (float)m;
+  } else {
+    int p = gg & 3;
+    int h[8] = {k.v[3].x, k.v[3].y, k.v[3].z, k.v[3].w, k.v[4].x, k.v[4].y, k.v[4].z, k.v[4].w};
+    int sl = (p >> 1) * 4, shh = 2 * p;
+#pragma unroll
+    for (int i = 0; i < 8; i++)
+      o.q[i] = __vsub4(((w[i] >> sl) & 0x0F0F0F0F) | (((h[i] >> shh) & 0x03030303) << 4), 0x20202020);
+    float d = h2f((u16)(k.v[5].x & 0xFFFF));
+    o.alo = d * (float)(signed char)byte_of(k.v[0], 2 * gg);
+    o.ahi = d * (float)(signed char)byte_of(k.v[0], 2 * gg + 1);
+    o.b = 0.0f;
+  }
+}
+
 // A group against activation block X (ints XQ, scale S, sum XSUM).
 __device__ __forceinline__ float kgroup_dot(const kgroup& g, const int4* xq, float s, int ysum) {
   int4 a = __ldg(xq), b = __ldg(xq + 1);
@@ -226,4 +295,160 @@ mm_k(int type, const u8* __restrict__ w, const i8* __restrict__ xq, const float*
         y[o] = acc ? y[o] + v : v;
       }
     }
+}
+
+// --- matrix x matrix on the tensor cores (sm_80 and up) --------------------------------
+// MM_K's work in MM_Q8_MMA's shape (128 rows x 64 tokens, 8 warps of 32 x
+// 32, four groups a step): each step's groups unpacked into int8 tiles in
+// shared memory with their scales, then a group is one m16n8k32 for Q4_K
+// and Q5_K (one scale for the 32) and two m16n8k16 for Q6_K (one each 16).
+
+__device__ __forceinline__ void mma_s8_k16(int* c, int a0, int a1, int b0) {
+#if __CUDA_ARCH__ >= 800
+  asm("mma.sync.aligned.m16n8k16.row.col.s32.s8.s8.s32 {%0,%1,%2,%3}, {%4,%5}, {%6}, {%0,%1,%2,%3};"
+      : "+r"(c[0]), "+r"(c[1]), "+r"(c[2]), "+r"(c[3]) : "r"(a0), "r"(a1), "r"(b0));
+#endif
+}
+
+extern "C" __global__ void __launch_bounds__(256)
+mm_k_mma(int type, const u8* __restrict__ w, const i8* __restrict__ xq, const float* __restrict__ xs,
+         const int* __restrict__ xsum, float* __restrict__ y, const float* __restrict__ bias,
+         int rows, int cols, int n, int acc) {
+#if __CUDA_ARCH__ >= 800
+  __shared__ __align__(16) int sw[MMA_R * MMA_W];
+  __shared__ __align__(16) int sx[MMA_T * MMA_W];
+  __shared__ float sa[MMA_R][4][3];           // a group's alo, ahi, b
+  __shared__ float sxd[MMA_T][4][2];          // a token block's s, s*sum
+  int r0 = blockIdx.y * MMA_R, t0 = blockIdx.x * MMA_T;
+  int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
+  int g = lane >> 2, tg = lane & 3;
+  int wr = (warp >> 1) * 32, wt = (warp & 1) * 32;
+  int ng = cols >> 5;
+  bool split = type == 2;                     // Q6_K: a scale a 16
+  float c[2][4][4];
+#pragma unroll
+  for (int i = 0; i < 2; i++)
+#pragma unroll
+    for (int j = 0; j < 4; j++)
+#pragma unroll
+      for (int k = 0; k < 4; k++) c[i][j][k] = 0.0f;
+  // the next step's raw groups and activations in registers while this one computes
+  kraw kr[2]; int4 xr[2]; float xsr = 0.0f, xyr = 0.0f;
+  auto fetch = [&](int g0) {
+#pragma unroll
+    for (int u = 0; u < 2; u++) {             // 128 rows x 4 groups: two a thread
+      int e = tid + u * 256, rr = e >> 2, gg = e & 3, r = r0 + rr, gi = g0 + gg;
+      if (r < rows && gi < ng) kraw_load(type, w, r, cols, gi, kr[u]);
+      else for (int v = 0; v < 6; v++) kr[u].v[v] = make_int4(0, 0, 0, 0);
+    }
+#pragma unroll
+    for (int u = 0; u < 2; u++) {             // 64 tokens x 8 int4
+      int e = tid + u * 256, tt = e >> 3, c4 = e & 7, t = t0 + tt, gi = g0 + (c4 >> 1);
+      xr[u] = (t < n && gi < ng) ? __ldg((const int4*)(xq + (long long)t * cols + (long long)g0 * 32) + c4)
+                                 : make_int4(0, 0, 0, 0);
+    }
+    int tt = tid >> 2, gg = tid & 3, t = t0 + tt, gi = g0 + gg;
+    bool ok = t < n && gi < ng;
+    xsr = ok ? __ldg(xs + (long long)t * ng + gi) : 0.0f;
+    xyr = ok ? xsr * (float)__ldg(xsum + (long long)t * ng + gi) : 0.0f;
+  };
+  fetch(0);
+  for (int g0 = 0; g0 < ng; g0 += 4) {
+#pragma unroll
+    for (int u = 0; u < 2; u++) {
+      int e = tid + u * 256, rr = e >> 2, gg = e & 3, r = r0 + rr, gi = g0 + gg;
+      kgroup kg;
+      if (r < rows && gi < ng) kraw_unpack(type, gi, kr[u], kg);
+      else { for (int i = 0; i < 8; i++) kg.q[i] = 0; kg.alo = kg.ahi = kg.b = 0.0f; }
+      int4* dst = (int4*)(sw + rr * MMA_W + gg * 8);
+      dst[0] = make_int4(kg.q[0], kg.q[1], kg.q[2], kg.q[3]);
+      dst[1] = make_int4(kg.q[4], kg.q[5], kg.q[6], kg.q[7]);
+      sa[rr][gg][0] = kg.alo; sa[rr][gg][1] = kg.ahi; sa[rr][gg][2] = kg.b;
+    }
+#pragma unroll
+    for (int u = 0; u < 2; u++) {
+      int e = tid + u * 256, tt = e >> 3, c4 = e & 7;
+      *(int4*)(sx + tt * MMA_W + c4 * 4) = xr[u];
+    }
+    { int tt = tid >> 2, gg = tid & 3; sxd[tt][gg][0] = xsr; sxd[tt][gg][1] = xyr; }
+    __syncthreads();
+    if (g0 + 4 < ng) fetch(g0 + 4);
+#pragma unroll
+    for (int bb = 0; bb < 4; bb++) {
+      int a[2][4], b[4][2];
+#pragma unroll
+      for (int i = 0; i < 2; i++)
+        ldsm_x4(a[i][0], a[i][1], a[i][2], a[i][3],
+                (const char*)(sw + (wr + i * 16 + (lane & 15)) * MMA_W) + bb * 32 + (lane >> 4) * 16);
+#pragma unroll
+      for (int j = 0; j < 4; j += 2)
+        ldsm_x4(b[j][0], b[j][1], b[j + 1][0], b[j + 1][1],
+                (const char*)(sx + (wt + j * 8 + (lane & 7) + ((lane >> 4) << 3)) * MMA_W) + bb * 32 + ((lane >> 3) & 1) * 16);
+      float al[2][2], ah[2][2], bo[2][2], xd[4][2], xy[4][2];
+#pragma unroll
+      for (int i = 0; i < 2; i++)
+#pragma unroll
+        for (int h = 0; h < 2; h++) {
+          int rr = wr + i * 16 + g + 8 * h;
+          al[i][h] = sa[rr][bb][0]; ah[i][h] = sa[rr][bb][1]; bo[i][h] = sa[rr][bb][2];
+        }
+#pragma unroll
+      for (int j = 0; j < 4; j++)
+#pragma unroll
+        for (int h = 0; h < 2; h++) {
+          int tt = wt + j * 8 + tg * 2 + h;
+          xd[j][h] = sxd[tt][bb][0]; xy[j][h] = sxd[tt][bb][1];
+        }
+      if (!split) {
+        int s[2][4][4];
+#pragma unroll
+        for (int i = 0; i < 2; i++)
+#pragma unroll
+          for (int j = 0; j < 4; j++) {
+            s[i][j][0] = s[i][j][1] = s[i][j][2] = s[i][j][3] = 0;
+            mma_s8(s[i][j], a[i][0], a[i][1], a[i][2], a[i][3], b[j][0], b[j][1]);
+          }
+#pragma unroll
+        for (int i = 0; i < 2; i++)
+#pragma unroll
+          for (int j = 0; j < 4; j++)
+#pragma unroll
+            for (int k = 0; k < 4; k++) {
+              int h = k >> 1, kk = k & 1;
+              c[i][j][k] += i2f_exact(s[i][j][k]) * (al[i][h] * xd[j][kk]) - bo[i][h] * xy[j][kk];
+            }
+      } else {
+        // a tile's two halves, then its scaling: few sums live at once
+#pragma unroll
+        for (int i = 0; i < 2; i++)
+#pragma unroll
+          for (int j = 0; j < 4; j++) {
+            int sl[4] = {0, 0, 0, 0}, sh[4] = {0, 0, 0, 0};
+            mma_s8_k16(sl, a[i][0], a[i][1], b[j][0]);
+            mma_s8_k16(sh, a[i][2], a[i][3], b[j][1]);
+#pragma unroll
+            for (int k = 0; k < 4; k++) {
+              int h = k >> 1, kk = k & 1;
+              c[i][j][k] += xd[j][kk] * (al[i][h] * i2f_exact(sl[k]) + ah[i][h] * i2f_exact(sh[k]));
+            }
+          }
+      }
+    }
+    __syncthreads();
+  }
+#pragma unroll
+  for (int i = 0; i < 2; i++)
+#pragma unroll
+    for (int j = 0; j < 4; j++)
+#pragma unroll
+      for (int k = 0; k < 4; k++) {
+        int r = r0 + wr + i * 16 + g + (k >> 1) * 8;
+        int t = t0 + wt + j * 8 + tg * 2 + (k & 1);
+        if (r < rows && t < n) {
+          float v = c[i][j][k] + (bias ? bias[r] : 0.0f);
+          long long o = (long long)t * rows + r;
+          y[o] = acc ? y[o] + v : v;
+        }
+      }
+#endif
 }

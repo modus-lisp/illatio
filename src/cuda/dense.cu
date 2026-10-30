@@ -900,27 +900,27 @@ mm_q8_mma2(const i8* __restrict__ w0, const u16* __restrict__ d0, float* __restr
   int g = lane >> 2, tg = lane & 3;
   int wr = (warp >> 1) * 32, wt = (warp & 1) * 32;
   int nb = cols >> 5, nk = nb >> 2;           // K steps of four blocks
-  int* sw[2]; int* sx[2]; u16* swd[2]; float* sxd[2];
-  for (int st = 0; st < 2; st++) {
-    int* base = m2s + st * (M2_STAGE_INTS + MMA_R * 2 + MMA_T * 4);
-    sw[st] = base; sx[st] = base + MMA_R * MMA_W;
-    swd[st] = (u16*)(base + M2_STAGE_INTS); sxd[st] = (float*)(base + M2_STAGE_INTS + MMA_R * 2);
-  }
+  // stage ST's tiles, computed rather than kept in arrays (which would live in local memory)
+  const int stride = M2_STAGE_INTS + MMA_R * 2 + MMA_T * 4;
+#define SW(st) (m2s + (st) * stride)
+#define SX(st) (m2s + (st) * stride + MMA_R * MMA_W)
+#define SWD(st) ((u16*)(m2s + (st) * stride + M2_STAGE_INTS))
+#define SXD(st) ((float*)(m2s + (st) * stride + M2_STAGE_INTS + MMA_R * 2))
   auto load = [&](int st, int ks) {
     int kb = ks * 4;
 #pragma unroll
     for (int u = 0; u < 4; u++) {
       int e = tid + u * 256, rr = e >> 3, c4 = e & 7, r = r0 + rr;
-      cp_async16(sw[st] + rr * MMA_W + c4 * 4, wq + (long long)min(r, rows - 1) * cols + kb * 32 + c4 * 16, r < rows);
+      cp_async16(SW(st) + rr * MMA_W + c4 * 4, wq + (long long)min(r, rows - 1) * cols + kb * 32 + c4 * 16, r < rows);
     }
 #pragma unroll
     for (int u = 0; u < 2; u++) {
       int e = tid + u * 256, tt = e >> 3, c4 = e & 7, t = t0 + tt;
-      cp_async16(sx[st] + tt * MMA_W + c4 * 4, xq + (long long)min(t, n - 1) * cols + kb * 32 + c4 * 16, t < n);
+      cp_async16(SX(st) + tt * MMA_W + c4 * 4, xq + (long long)min(t, n - 1) * cols + kb * 32 + c4 * 16, t < n);
     }
-    if (tid < MMA_R) { int r = r0 + tid; cp_async8(swd[st] + tid * 4, wd + (long long)min(r, rows - 1) * nb + kb, r < rows); }
+    if (tid < MMA_R) { int r = r0 + tid; cp_async8(SWD(st) + tid * 4, wd + (long long)min(r, rows - 1) * nb + kb, r < rows); }
     else if (tid < MMA_R + MMA_T) { int tt = tid - MMA_R, t = t0 + tt;
-      cp_async16(sxd[st] + tt * 4, xs + (long long)min(t, n - 1) * nb + kb, t < n); }
+      cp_async16(SXD(st) + tt * 4, xs + (long long)min(t, n - 1) * nb + kb, t < n); }
     cp_commit();
   };
   float c[2][4][4];
@@ -935,7 +935,7 @@ mm_q8_mma2(const i8* __restrict__ w0, const u16* __restrict__ d0, float* __restr
     int st = ks & 1;
     if (ks + 1 < nk) { load(st ^ 1, ks + 1); cp_wait1(); } else cp_wait0();
     __syncthreads();
-    const int* W = sw[st]; const int* X = sx[st];
+    const int* W = SW(st); const int* X = SX(st);
 #pragma unroll
     for (int bb = 0; bb < 4; bb++) {
       int a[2][4], b[4][2];
@@ -950,13 +950,13 @@ mm_q8_mma2(const i8* __restrict__ w0, const u16* __restrict__ d0, float* __restr
       float dr[2][2], dx[4][2];
 #pragma unroll
       for (int i = 0; i < 2; i++) {
-        dr[i][0] = h2f(swd[st][(wr + i * 16 + g) * 4 + bb]);
-        dr[i][1] = h2f(swd[st][(wr + i * 16 + g + 8) * 4 + bb]);
+        dr[i][0] = h2f(SWD(st)[(wr + i * 16 + g) * 4 + bb]);
+        dr[i][1] = h2f(SWD(st)[(wr + i * 16 + g + 8) * 4 + bb]);
       }
 #pragma unroll
       for (int j = 0; j < 4; j++) {
-        dx[j][0] = sxd[st][(wt + j * 8 + tg * 2) * 4 + bb];
-        dx[j][1] = sxd[st][(wt + j * 8 + tg * 2 + 1) * 4 + bb];
+        dx[j][0] = SXD(st)[(wt + j * 8 + tg * 2) * 4 + bb];
+        dx[j][1] = SXD(st)[(wt + j * 8 + tg * 2 + 1) * 4 + bb];
       }
       // the step's eight products first, then their scaling: no mma waits on the last
       int s[2][4][4];
@@ -998,4 +998,8 @@ mm_q8_mma2(const i8* __restrict__ w0, const u16* __restrict__ d0, float* __restr
         }
       }
 #endif
+#undef SW
+#undef SX
+#undef SWD
+#undef SXD
 }
