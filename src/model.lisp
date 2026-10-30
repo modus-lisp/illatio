@@ -57,9 +57,10 @@
 
 (defun load-model (path &key (threads (default-thread-count)))
   "Read the GGUF model at PATH: weights, tokenizer, and a pool of THREADS."
-  (if (equal (meta (read-gguf path) "general.architecture") "deepseek4")
-      (load-ds4f-model path threads)
-      (finish-model (load-model-1 path threads))))
+  (let ((arch (meta (read-gguf path) "general.architecture")))
+    (cond ((equal arch "deepseek4") (load-ds4f-model path threads))
+          ((equal arch "deepseek41") (load-ds41f-model path threads))
+          (t (finish-model (load-model-1 path threads))))))
 
 (defun load-model-1 (path threads)
   (let* ((g (read-gguf path))

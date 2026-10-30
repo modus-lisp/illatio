@@ -229,8 +229,8 @@
 
 (defun render-chat (model messages &optional tools &key (thinking t))
   (let ((template (meta (model-gguf model) "tokenizer.chat_template" "")))
-    (cond ((equal (model-arch model) "deepseek4")
-           (render-ds4f-chat messages tools :thinking thinking))
+    (cond ((member (model-arch model) '("deepseek4" "deepseek41") :test #'equal)
+           (render-ds4f-chat messages tools :thinking thinking :v41 (equal (model-arch model) "deepseek41")))
           ((and (search "<|im_start|>" template) (search "<tool_call>" template)
                 (search "</think>" template))
            (render-qwen3-chat messages tools))
@@ -326,7 +326,7 @@
     (let* ((m (engine-model engine))
            (ctx (engine-context engine))
            (thinking (request-thinking req))
-           (ds4f (equal (model-arch m) "deepseek4"))
+           (ds4f (member (model-arch m) '("deepseek4" "deepseek41") :test #'equal))
            (prompt (render-chat m (jget req "messages") (jget req "tools") :thinking thinking))
            (ids (tokenize m prompt))
            (max (or (jget req "max_completion_tokens") (jget req "max_tokens") 2048))
@@ -420,7 +420,7 @@
                                                               (progn (setf sent-role t)
                                                                      (hobj "role" "assistant" "reasoning_content" text)))))))
          (resp (chat-completion engine req
-                                :on-text (cond ((equal (model-arch (engine-model engine)) "deepseek4")
+                                :on-text (cond ((member (model-arch (engine-model engine)) '("deepseek4" "deepseek41") :test #'equal)
                                                 (make-ds4f-stream-filter emit emit-reasoning (request-thinking req)))
                                                ((jget req "tools") (make-tool-call-filter emit))
                                                (t emit))))
@@ -557,7 +557,9 @@
                (format o "</｜DSML｜invoke>~%")))
     (write-string "</｜DSML｜tool_calls>" o)))
 
-(defun render-ds4f-chat (messages tools &key (thinking t))
+(defun render-ds4f-chat (messages tools &key (thinking t) v41)
+  "DeepSeek V4's prompt; V4.1's (V41) opens a system turn with <｜System｜>,
+   with thinking on by ds4's default reasoning effort (high, 75)."
   (let* ((msgs (coerce messages 'list))
          (tools (and tools (plusp (length tools)) (coerce tools 'list)))
          (tool-context (or tools
@@ -581,6 +583,10 @@
                                   (content-string (jget m "content"))))))
     (with-output-to-string (o)
       (write-string "<｜begin▁of▁sentence｜>" o)
+      (when (and v41 thinking)
+        (format o "<｜System｜>Reasoning Effort: 75 (range 1-100, the higher the value, the more thorough the reasoning)~%~%"))
+      (when (and v41 (not thinking) (plusp (length system)))
+        (write-string "<｜System｜>" o))
       (write-string system o)
       (loop for m in msgs for i from 0
             for role = (jget m "role")

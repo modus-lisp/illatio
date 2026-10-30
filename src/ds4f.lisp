@@ -49,6 +49,7 @@
   (n-vocab 0 :type fixnum)
   embd-off output output-norm out-hc-fn out-hc-scale out-hc-base
   (layers #() :type simple-vector)
+  (v41 nil)                             ; V4.1's own (a D41, ds41f.lisp), or NIL for V4
   (gpu-plist '()))                      ; the GPU's state, when it runs (metal-ds4f.lisp)
 
 (defvar *ds4f-gpu* #+(and sbcl darwin) '(:decode :prefill) #+(and sbcl linux) '(:decode) #-sbcl nil
@@ -75,7 +76,8 @@
   ffn-norm gate-inp probs-b tid2eid
   gate-exps up-exps down-exps                ; (offset row-bytes rows cols) in the file
   sh-gate sh-up sh-down
-  hc-attn-fn hc-attn-scale hc-attn-base hc-ffn-fn hc-ffn-scale hc-ffn-base)
+  hc-attn-fn hc-attn-scale hc-attn-base hc-ffn-fn hc-ffn-scale hc-ffn-base
+  ix-k ix-k-norm eg-kv eg-q-norm eg-k-norm)  ; V4.1's: the indexer key from the compressed row; Engram
 
 (defstruct (f32mat (:constructor %make-f32mat)) (rows 0 :type fixnum) (cols 0 :type fixnum) (data nil :type f32vec))
 
@@ -964,56 +966,62 @@
 
 (defun d4-ffn (m l li streams token)
   "One layer's FFN block: (values out post comb)."
-  (let* ((d (ds4f-d m)) (pool (ds4f-pool m)) (eps (ds4f-eps m)) (ff (ds4f-ff-exp m)) (nu (ds4f-n-used m))
-         (clamp (svref (ds4f-clamps m) li)) (wf (ds4f-file m))
+  (let* ((d (ds4f-d m)) (eps (ds4f-eps m)) (clamp (svref (ds4f-clamps m) li))
          (cur (f32vec d)) (norm (f32vec d)) (flat (f32vec (* (ds4f-n-hc m) d))))
     (multiple-value-bind (post comb)
         (hc-pre m (dl-hc-ffn-fn l) (dl-hc-ffn-scale l) (dl-hc-ffn-base l) streams cur flat)
       (d4-rms! cur norm d eps (dl-ffn-norm l))
       (multiple-value-bind (sel w) (d4-route m l li norm token)
         (prefetch-experts m l sel)
-        (let ((xq (make-q8kvec d)) (mid (f32vec (* nu ff))) (moe (f32vec d)) (shared (f32vec d)))
-          (declare (ignorable shared))
-          (quantize-q8k! norm xq)
-          ;; gate and up: silu(clamp(g)) * clamp(u) * weight, per expert
-          (destructuring-bind (goff grb grows gcols) (dl-gate-exps l)
-            (destructuring-bind (uoff urb urows ucols) (dl-up-exps l)
-              (declare (ignore ucols urows))
-              (let ((nb (floor gcols +qk-k+)))
-                (pool-run pool
-                          (lambda (ti tn)
-                            (let ((desc (make-row-desc)))
-                              (declare (dynamic-extent desc))
-                              (multiple-value-bind (s e) (share (* nu ff) ti tn)
-                                (loop for idx from s below e
-                                      do (multiple-value-bind (slot r) (floor idx ff)
-                                           (let* ((ex (aref sel slot))
-                                                  (g (iq2xxs-row-dot* desc wf (+ goff (* (+ (* ex grows) r) grb)) nb xq 0))
-                                                  (u (iq2xxs-row-dot* desc wf (+ uoff (* (+ (* ex grows) r) urb)) nb xq 0)))
-                                             (declare (type single-float g u))
-                                             (when (> clamp 1f-6)
-                                               (setf g (min g clamp) u (max (- clamp) (min u clamp))))
-                                             (setf (aref mid idx) (* (* (d4-silu g) u) (aref w slot))))))))))))
-          ;; down, summed over the experts in order
-          (let ((midq (make-q8kvec (* nu ff))))
-            (dotimes (i nu) (quantize-q8k! mid midq (* i ff) ff (* i ff)))
-            (destructuring-bind (doff drb drows dcols) (dl-down-exps l)
-              (let ((nb (floor dcols +qk-k+)))
-                (pool-run pool
-                          (lambda (ti tn)
-                            (let ((desc (make-row-desc)))
-                              (declare (dynamic-extent desc))
-                              (multiple-value-bind (s e) (share d ti tn)
-                                (loop for r from s below e
-                                      do (let ((acc 0f0))
-                                           (declare (type single-float acc))
-                                           (dotimes (i nu)
-                                             (incf acc (q2k-row-dot* desc wf (+ doff (* (+ (* (aref sel i) drows) r) drb))
-                                                                     nb midq (* i ff))))
-                                           (setf (aref moe r) acc)))))))))))
+        (let ((moe (d4-routed! m l norm sel w clamp (f32vec d))) (shared (f32vec d)))
           (d4-shared! m l norm clamp shared)
           (dotimes (i d) (setf (aref moe i) (+ (aref moe i) (aref shared i))))
           (values moe post comb))))))
+
+(defun d4-routed! (m l norm sel w clamp moe)
+  "The routed experts SEL (weights W) of NORM, summed into MOE: IQ2_XXS
+   gate/up, silu(clamp(g)) * clamp(u) * weight, then Q2_K down, the experts
+   summed in SEL's order."
+  (let* ((d (ds4f-d m)) (pool (ds4f-pool m)) (ff (ds4f-ff-exp m)) (nu (ds4f-n-used m)) (wf (ds4f-file m))
+         (xq (make-q8kvec d)) (mid (f32vec (* nu ff))))
+    (quantize-q8k! norm xq)
+    ;; gate and up: silu(clamp(g)) * clamp(u) * weight, per expert
+    (destructuring-bind (goff grb grows gcols) (dl-gate-exps l)
+      (destructuring-bind (uoff urb urows ucols) (dl-up-exps l)
+        (declare (ignore ucols urows))
+        (let ((nb (floor gcols +qk-k+)))
+          (pool-run pool
+                    (lambda (ti tn)
+                      (let ((desc (make-row-desc)))
+                        (declare (dynamic-extent desc))
+                        (multiple-value-bind (s e) (share (* nu ff) ti tn)
+                          (loop for idx from s below e
+                                do (multiple-value-bind (slot r) (floor idx ff)
+                                     (let* ((ex (aref sel slot))
+                                            (g (iq2xxs-row-dot* desc wf (+ goff (* (+ (* ex grows) r) grb)) nb xq 0))
+                                            (u (iq2xxs-row-dot* desc wf (+ uoff (* (+ (* ex grows) r) urb)) nb xq 0)))
+                                       (declare (type single-float g u))
+                                       (when (> clamp 1f-6)
+                                         (setf g (min g clamp) u (max (- clamp) (min u clamp))))
+                                       (setf (aref mid idx) (* (* (d4-silu g) u) (aref w slot))))))))))))
+    ;; down, summed over the experts in order
+    (let ((midq (make-q8kvec (* nu ff))))
+      (dotimes (i nu) (quantize-q8k! mid midq (* i ff) ff (* i ff)))
+      (destructuring-bind (doff drb drows dcols) (dl-down-exps l)
+        (let ((nb (floor dcols +qk-k+)))
+          (pool-run pool
+                    (lambda (ti tn)
+                      (let ((desc (make-row-desc)))
+                        (declare (dynamic-extent desc))
+                        (multiple-value-bind (s e) (share d ti tn)
+                          (loop for r from s below e
+                                do (let ((acc 0f0))
+                                     (declare (type single-float acc))
+                                     (dotimes (i nu)
+                                       (incf acc (q2k-row-dot* desc wf (+ doff (* (+ (* (aref sel i) drows) r) drb))
+                                                               nb midq (* i ff))))
+                                     (setf (aref moe r) acc)))))))))))
+    moe))
 
 (defun d4-shared! (m l norm clamp out)
   "layer_shared_ffn_one: the shared expert of NORM into OUT."
@@ -1037,6 +1045,8 @@
   #-sbcl (ds4f-forward-1 ctx token logits))
 
 (defun ds4f-forward-1 (ctx token logits)
+  (when (d41ctx-p ctx)
+    (return-from ds4f-forward-1 (ds41f-forward-1 ctx token logits)))
   #+(and sbcl linux)
   (when (ds4f-cuda-p)
     (return-from ds4f-forward-1 (ds4f-cuda-forward ctx token logits)))
@@ -1232,7 +1242,10 @@
 (defun ds4f-context (ctx)
   (or (getf (context-plist ctx) :ds4f)
       (setf (getf (context-plist ctx) :ds4f)
-            (let ((c (make-d4ctx (model-impl (context-model ctx)) :n-ctx (context-n-ctx ctx))))
+            (let* ((m (model-impl (context-model ctx)))
+                   (c (if (ds4f-v41 m)
+                          (make-d41ctx m :n-ctx (context-n-ctx ctx))
+                          (make-d4ctx m :n-ctx (context-n-ctx ctx)))))
               (setf (d4ctx-logits c) (context-logits ctx))
               c))))
 
@@ -1246,15 +1259,17 @@
 (defun ds4f-context-eval (ctx tokens)
   (let ((c (ds4f-context ctx)))
     (setf (d4ctx-pos c) (context-pos ctx))
-    (if (rest tokens)
-        (ds4f-eval-saving c (context-tokens ctx) tokens)
-        (when tokens (ds4f-forward c (first tokens))))
+    (cond ((and (rest tokens) (not (d41ctx-p c))) (ds4f-eval-saving c (context-tokens ctx) tokens))
+          ((rest tokens)                ; V4.1: a token at a time so far
+           (dolist (tk (butlast tokens)) (ds4f-forward c tk :logits nil))
+           (ds4f-forward c (car (last tokens))))
+          (tokens (ds4f-forward c (first tokens))))
     (setf (context-pos ctx) (d4ctx-pos c))
     (context-logits ctx)))
 
 (defun ds4f-context-reset (ctx)
   "Start CTX over: fresh caches and compressor windows."
-  (let ((c (getf (context-plist ctx) :ds4f))) (when c (free-d4ctx c)))
+  (let ((c (getf (context-plist ctx) :ds4f))) (when c (if (d41ctx-p c) (free-d41ctx c) (free-d4ctx c))))
   (remf (context-plist ctx) :ds4f)
   (setf (context-pos ctx) 0)
   ctx)

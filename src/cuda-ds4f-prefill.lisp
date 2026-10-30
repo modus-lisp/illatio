@@ -93,7 +93,8 @@
           (apply #'dk-mm st "d4_mm_q8_0" (cmat-qs w) (cmat-d w) 0 (cmat-rows w) (cmat-cols w) x y n keys)))))
 
 (defun dk-f16mm (st name x y n &rest keys &key y-stride &allow-other-keys)
-  (destructuring-bind (w rows cols) (or (gethash name (dk-f16 st)) (error "no F16 tensor ~A" name))
+  (destructuring-bind (w rows cols &optional type) (or (gethash name (dk-f16 st)) (error "no F16 tensor ~A" name))
+    (declare (ignore type))
     (if *dk-small*
         (launch (dk-dev st) "d4_mv_f16n" (ceiling rows 4) 256 (list cols rows n (or y-stride rows) w x y))
         (apply #'dk-mm st "d4_mm_f16" w nil (* 2 cols) rows cols x y n keys))))

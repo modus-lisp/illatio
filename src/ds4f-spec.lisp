@@ -95,7 +95,7 @@
   "For GENERATE: TOKEN at CTX's next position and the guesses its greedy
    choices confirm; those (:NO if there is nothing to guess with)."
   (let ((model (context-model ctx)))
-    (unless (and (typep (model-impl model) 'ds4f) (plusp *ds4f-spec-k*)
+    (unless (and (typep (model-impl model) 'ds4f) (not (ds4f-v41 (model-impl model))) (plusp *ds4f-spec-k*)
                  (or #+darwin (ds4f-gpu-p :prefill) #+linux (ds4f-cuda-p)))
       (return-from ds4f-speculate :no))
     (let* ((hist (coerce (append (context-tokens ctx) (list tok)) 'simple-vector))

@@ -65,7 +65,7 @@
   host-in in host-out                   ; pinned staging, and the device's copy of the inputs
   gu mid down (hits 0))
 
-(defconstant +dt-ptrs+ (* 4 4096) "Where the experts' pointers are in a tier's inputs (after X).")
+(defconstant +dt-ptrs+ (* 4 8192) "Where the experts' pointers are in a tier's inputs (after X, 8192 wide at most).")
 (defconstant +dt-w+ (+ +dt-ptrs+ (* 8 32)) "Where their weights are.")
 
 (defvar *cuda-device-count* nil)
@@ -144,6 +144,12 @@
     "indexer.attn_q_b.weight" "indexer.proj.weight" "indexer_compressor_kv.weight"
     "indexer_compressor_gate.weight" "ffn_gate_inp.weight"))
 
+(defparameter +ds41f-cuda-f16-tensors+
+  '("hc_attn_fn.weight" "hc_ffn_fn.weight" "attn_compressor_kv.weight" "attn_compressor_gate.weight"
+    "indexer.attn_q_b.weight" "indexer.proj.weight" "indexer.attn_k.weight" "engram_kv.weight"))
+
+(defparameter +ds41f-cuda-f32-tensors+ '("ffn_gate_inp.weight"))
+
 (defun d4-tensor-names (per-layer m &optional extra)
   (append extra
           (loop for li below (ds4f-n-layer m)
@@ -152,8 +158,13 @@
 (defun d4-upload-weights (m st)
   "The Q8_0 tensors repacked on the device, the F16 ones as they are."
   (let* ((g (ds4f-gguf m)) (dev (dk-dev st)) (raw nil) (fd (d4-open m))
+         (v41 (ds4f-v41 m))
+         (f16-names (if v41
+                        (d4-tensor-names +ds41f-cuda-f16-tensors+ m)
+                        (d4-tensor-names +ds4f-cuda-f16-tensors+ m '("output_hc_fn.weight"))))
+         (f32-names (and v41 (d4-tensor-names +ds41f-cuda-f32-tensors+ m)))
          (most (loop for name in (append (d4-tensor-names +ds4f-cuda-q8-tensors+ m '("output.weight"))
-                                         (d4-tensor-names +ds4f-cuda-f16-tensors+ m '("output_hc_fn.weight")))
+                                         f16-names f32-names)
                      for ti = (gguf-tensor g name nil) when ti maximize (tensor-bytes ti)))
          (stage (cuda-host-alloc most)))
     (flet ((stage (ti)
@@ -178,14 +189,16 @@
                  (launch dev "repack_q8" (ceiling nb 8) '(32 8) (list raw qs d (list :i64 nb)))
                  (setf (gethash name (dk-q8 st))
                        (%make-cmat :name name :type :q8_0 :rows rows :cols cols :qs qs :d d)))))
-           (dolist (name (d4-tensor-names +ds4f-cuda-f16-tensors+ m '("output_hc_fn.weight")))
+           ;; the F16 ones (and V4.1's F32 router) as they are: (dbuf rows cols type)
+           (dolist (name (append f16-names f32-names))
              (let ((ti (gguf-tensor g name nil)))
                (when ti
-                 (assert (eq (tensor-info-type ti) :f16))
+                 (assert (eq (tensor-info-type ti) (if (member name f32-names :test #'equal) :f32 :f16)))
                  (let* ((dims (tensor-info-dims ti)) (bytes (tensor-bytes ti))
                         (b (cuda-alloc dev bytes :zero nil)))
                    (cuda-upload b (stage ti) bytes)
-                   (setf (gethash name (dk-f16 st)) (list b (reduce #'* (rest dims)) (first dims))))))))
+                   (setf (gethash name (dk-f16 st))
+                         (list b (reduce #'* (rest dims)) (first dims) (tensor-info-type ti))))))))
       (cuda-free raw)
       (cuda-host-free stage)
       (sb-unix:unix-close fd)))))
@@ -267,6 +280,28 @@
 
 ;;; --- the expert pool --------------------------------------------------------------
 
+(defvar *ds4f-hotlist-file* nil
+  "A route trace (lines of *DS4F-ROUTE-TRACE*'s: a layer, its experts) to
+   seed the pools from, the most used experts first, in place of the
+   built-in hotlist (V4's; V4.1 has none): NIL, none.")
+
+(defun d4-hotlist (m)
+  "The experts the pools are seeded with, the most used first: (layer
+   expert) pairs, flat."
+  (or (getf (ds4f-gpu-plist m) :hotlist)
+      (setf (getf (ds4f-gpu-plist m) :hotlist)
+            (cond ((and *ds4f-hotlist-file* (probe-file *ds4f-hotlist-file*))
+                   (let ((counts (make-hash-table)) (ne (ds4f-n-expert m)))
+                     (with-open-file (s *ds4f-hotlist-file*)
+                       (loop for line = (read-line s nil) while line
+                             do (let ((xs (with-input-from-string (i line) (loop for x = (read i nil) while x collect x))))
+                                  (dolist (e (rest xs)) (incf (gethash (+ (* (first xs) ne) e) counts 0))))))
+                     (let ((keys (sort (loop for k being the hash-keys of counts collect k) #'>
+                                       :key (lambda (k) (gethash k counts)))))
+                       (coerce (loop for k in keys append (multiple-value-list (floor k ne))) 'simple-vector))))
+                  ((and (= (ds4f-n-layer m) 43) (= (ds4f-n-expert m) 256)) +ds4f-hotlist+)
+                  (t #())))))
+
 (defun d4-make-pool (m st)
   "The pool: as many slots as the device has room for, seeded."
   (let* ((dev (dk-dev st)) (sb (dk-slot-bytes st))
@@ -282,11 +317,11 @@
           (dk-used st) (make-array n :element-type 'fixnum :initial-element 0)
           (dk-pin st) (make-array n :element-type 'fixnum :initial-element 0))
     (format *error-output* "illatio: expert pool of ~D slots (~,1F GB) on ~A~%" n (/ (* n sb) 1d9) (cudev-name dev))
-    ;; ds4's most used experts first
-    (when (and (= (ds4f-n-layer m) 43) (= (ds4f-n-expert m) 256))
-      (let ((k (min n (floor (length +ds4f-hotlist+) 2))))
+    ;; the most used experts first (ds4's, for V4)
+    (let ((hot (d4-hotlist m)))
+      (let ((k (min n (floor (length hot) 2))))
         (dotimes (s k)
-          (let ((li (aref +ds4f-hotlist+ (* 2 s))) (e (aref +ds4f-hotlist+ (1+ (* 2 s)))))
+          (let ((li (aref hot (* 2 s))) (e (aref hot (1+ (* 2 s)))))
             (setf (aref (dk-owner st) s) (+ (* li (ds4f-n-expert m)) e)
                   (aref (dk-slot-of st) (+ (* li (ds4f-n-expert m)) e)) s)
             (d4-copy-expert m st li e s)))
@@ -303,7 +338,8 @@
          (scratch (+ (* 4 3 k ff) (* 4 k d) (* 2 +dt-w+)))
          (free (- (cuda-mem-info dev) scratch (* 0.6d9)))
          (first (dk-free st))
-         (n (max 0 (min (floor free sb) (- (floor (length +ds4f-hotlist+) 2) first))))
+         (hot (d4-hotlist m))
+         (n (max 0 (min (floor free sb) (- (floor (length hot) 2) first))))
          (keys (* (ds4f-n-layer m) (ds4f-n-expert m)))
          (tr (make-d4tier :dev dev :event (cuda-event-create dev) :n n
                           :slot-of (make-array keys :element-type 'fixnum :initial-element -1)
@@ -311,12 +347,12 @@
                           :host-out (cuda-host-alloc (* 4 k d))
                           :gu (cuda-alloc dev (* 4 2 k ff)) :mid (cuda-alloc dev (* 4 k ff))
                           :down (cuda-alloc dev (* 4 k d)))))
-    (assert (= d 4096) () "a tier's inputs are laid out for 4096 wide")
+    (assert (<= d 8192) () "a tier's inputs are laid out for 8192 wide at most")
     ;; the device's own stream is its compute stream; copies go on another
     (setf (dt-pool tr) (cuda-alloc dev (* (max n 1) sb) :zero nil))
     (when (plusp n)
       (dotimes (s n)
-        (let* ((h (+ first s)) (li (aref +ds4f-hotlist+ (* 2 h))) (e (aref +ds4f-hotlist+ (1+ (* 2 h))))
+        (let* ((h (+ first s)) (li (aref hot (* 2 h))) (e (aref hot (1+ (* 2 h))))
                (at (* s sb)))
           (setf (aref (dt-slot-of tr) (+ (* li (ds4f-n-expert m)) e)) s)
           (cuda-copy-in (dt-pool tr) at (d4-expert-sap m st li e) sb stream)))
@@ -617,8 +653,8 @@
   (launch dev "d4_rope" (ceiling (* nh (floor nrot 2)) 256) 256 (list nh hd nrot 1 x cs)))
 
 (defun dk-mv16 (st name x y)
-  (destructuring-bind (w rows cols) (or (gethash name (dk-f16 st)) (error "no F16 tensor ~A" name))
-    (launch (dk-dev st) "d4_mv_f16" (ceiling rows 4) 256 (list cols rows w x y))))
+  (destructuring-bind (w rows cols &optional (type :f16)) (or (gethash name (dk-f16 st)) (error "no F16 tensor ~A" name))
+    (launch (dk-dev st) (if (eq type :f32) "d41_mv_f32" "d4_mv_f16") (ceiling rows 4) 256 (list cols rows w x y))))
 
 (defun dk-q8mv (st name x y &key group-rows q)
   "Y = W X for Q8_0 tensor NAME, X quantized (ds4's Q8_0 activations):
@@ -750,11 +786,12 @@
             (list 1 ff (svref (ds4f-clamps m) li) sg su one smid (car qmid) (cdr qmid)))
     (dk-q8mv st (lname li "ffn_down_shexp.weight") smid sout :q qmid)))
 
-(defun dk-ffn-tail (m st l li plan w sb sa)
+(defun dk-ffn-tail (m st l li plan w sb sa &key round)
   "Layer LI's routed experts (PLAN's, weights W) on its FFN input, summed
    with the shared expert, and its FFN's HC post: streams SB into SA.  The
    first device's experts' down rows first, then the second's (copied in
-   when it is done), summed in the experts' order."
+   when it is done), summed in the experts' order.  ROUND: the sum and the
+   streams to BF16 (V4.1)."
   (let* ((dev (dk-dev st)) (d (ds4f-d m)) (ff (ds4f-ff-exp m))
          (slots (dp-a-slots plan)) (k1 (length slots)) (k2 (length (dp-b-slots plan)))
          (k3 (length (dp-c-experts plan))) (k (+ k1 k2 k3))
@@ -792,7 +829,10 @@
         (cuda-stream-wait (cudev-stream dev) (dt-event tr))
         (cuda-copy-in bd (* 4 k1 d) (dt-host-out tr) (* 4 k2 d))))
     (launch dev "d4_moe_sum" (ceiling d 256) 256 (list d k bd (dbuf-of st :sout (* 4 d)) moe perm))
-    (dk-hc-post m st moe sb (dbuf-of st :pcf (* 4 32)) sa)))
+    (when round (launch dev "d41_round" (ceiling d 256) 256 (list d moe nil nil)))
+    (dk-hc-post m st moe sb (dbuf-of st :pcf (* 4 32)) sa)
+    (when round
+      (let ((hcd (* (ds4f-n-hc m) d))) (launch dev "d41_round" (ceiling hcd 256) 256 (list hcd sa nil nil))))))
 
 (defun dk-head (m st streams)
   "output_logits_one from STREAMS: the logits into :OUT."
