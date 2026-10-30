@@ -64,21 +64,29 @@ extern "C" __global__ void embed_q8(const i8* __restrict__ qs, const u16* __rest
 
 // One block of 32 (a warp, lane J holding element J) quantized as
 // QUANTIZE-Q8! does.
-__device__ __forceinline__ void quant_block(float v, i8* q, float* s, int lane) {
+// The block's int8 sum goes to *YSUM when YSUM isn't null (the K-quants'
+// mins want it: kquant.cu).
+__device__ __forceinline__ int warp_sum_i(int v) {
+  for (int o = 16; o > 0; o >>= 1) v += __shfl_xor_sync(0xffffffff, v, o);
+  return v;
+}
+__device__ __forceinline__ void quant_block(float v, i8* q, float* s, int lane, int* ysum = nullptr) {
   float amax = warp_max(fabsf(v));
   float dd = amax / 127.0f;
   float id = dd == 0.0f ? 0.0f : 1.0f / dd;
-  q[lane] = (i8)__float2int_rn(v * id);
+  int qi = __float2int_rn(v * id);
+  q[lane] = (i8)qi;
   if (lane == 0) *s = h2f(f2h(dd));
+  if (ysum) { int t = warp_sum_i(qi); if (lane == 0) *ysum = t; }
 }
 
 // X (N rows of COLS floats) quantized to XQ / XS: a warp a block.
 extern "C" __global__ void quant_q8(const float* __restrict__ x, i8* __restrict__ xq,
-                                    float* __restrict__ xs, long long nblocks) {
+                                    float* __restrict__ xs, int* __restrict__ xsum, long long nblocks) {
   long long b = (long long)blockIdx.x * (blockDim.x >> 5) + (threadIdx.x >> 5);
   int lane = threadIdx.x & 31;
   if (b >= nblocks) return;
-  quant_block(x[b * 32 + lane], xq + b * 32, xs + b, lane);
+  quant_block(x[b * 32 + lane], xq + b * 32, xs + b, lane, xsum ? xsum + b : nullptr);
 }
 
 // RMSNORM! of each of the N rows of X (D wide), weighted by W, then quantized:
@@ -135,7 +143,7 @@ __device__ __forceinline__ float stage_row_scale(const float* __restrict__ xr, i
 // a single token's norm is not one block's serial work.
 extern "C" __global__ void rmsnorm_q8(const float* __restrict__ x, const float* __restrict__ w,
                                       float* __restrict__ h, i8* __restrict__ xq, float* __restrict__ xs,
-                                      int dim, float eps) {
+                                      int* __restrict__ xsum, int dim, float eps) {
   __shared__ double part[32];
   __shared__ float sc;
   __shared__ __align__(16) float sxr[RMS_MAXD];
@@ -147,7 +155,7 @@ extern "C" __global__ void rmsnorm_q8(const float* __restrict__ x, const float* 
     int i = b * 32 + lane;
     float v = (sxr[i] * s) * __ldg(w + i);
     if (h) h[base + i] = v;
-    quant_block(v, xq + base + b * 32, xs + (base >> 5) + b, lane);
+    quant_block(v, xq + base + b * 32, xs + (base >> 5) + b, lane, xsum ? xsum + (base >> 5) + b : nullptr);
   }
 }
 
@@ -472,7 +480,7 @@ attn_decode(const float* __restrict__ q, const float* __restrict__ kc,
 // The splits of each (token, head) merged into OUT: a block each, a thread
 // an element.
 extern "C" __global__ void attn_merge(const float* __restrict__ part, float* __restrict__ out,
-                                      i8* __restrict__ xq, float* __restrict__ xs,
+                                      i8* __restrict__ xq, float* __restrict__ xs, int* __restrict__ xsum,
                                       int nh, int hd, int pos0, int chunk, int nsplit) {
   int head = blockIdx.x, t = blockIdx.y, j = threadIdx.x;
   int n = pos0 + t + 1;
@@ -494,7 +502,7 @@ extern "C" __global__ void attn_merge(const float* __restrict__ part, float* __r
   // and quantized, when XQ isn't null: a head is HD/32 whole blocks, a warp each
   if (xq) {
     long long o = (long long)t * nh * hd + head * hd;
-    quant_block(v, xq + o + (j & ~31), xs + ((o + j) >> 5), j & 31);
+    quant_block(v, xq + o + (j & ~31), xs + ((o + j) >> 5), j & 31, xsum ? xsum + ((o + j) >> 5) : nullptr);
   }
 }
 

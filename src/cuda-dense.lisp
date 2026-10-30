@@ -12,7 +12,14 @@
 
 (defstruct (cmat (:constructor %make-cmat))
   name type (rows 0 :type fixnum) (cols 0 :type fixnum)
-  qs d)                                 ; DBUFs: the int8s, the f16 scales
+  qs d)                                 ; DBUFs.  Q8_0: the int8s, the f16 scales;
+                                        ; a K-quant: its blocks (kquant.cu), and NIL
+
+(defun kquant-code (type)
+  "A K-quant format as kquant.cu numbers it."
+  (ecase type (:q4_k 0) (:q5_k 1) (:q6_k 2)))
+
+(defun cmat-kquant-p (w) (not (eq (cmat-type w) :q8_0)))
 
 (defstruct (cmodel (:constructor %make-cmodel))
   dev
@@ -54,16 +61,35 @@
       m)))
 
 (defun upload-gmat (dev g file raw)
-  "GMAT G's blocks from the mapped FILE to DEV, through the staging buffer RAW."
-  (unless (eq (gmat-type g) :q8_0)
-    (error "the CUDA path multiplies Q8_0 so far; ~A is ~A" (gmat-name g) (gmat-type g)))
-  (let* ((rows (gmat-rows g)) (cols (gmat-cols g))
-         (n (* rows cols)) (nb (floor n 32))
-         (qs (cuda-alloc dev n :zero nil))
-         (d (cuda-alloc dev (* 2 nb) :zero nil)))
-    (cuda-upload raw (sb-sys:sap+ (sb-sys:vector-sap file) (gmat-offset g)) (* rows (gmat-row-bytes g)))
-    (launch dev "repack_q8" (ceiling nb 8) '(32 8) (list raw qs d (list :i64 nb)))
-    (%make-cmat :name (gmat-name g) :type :q8_0 :rows rows :cols cols :qs qs :d d)))
+  "GMAT G's blocks from the mapped FILE to DEV, through the staging buffer
+   RAW: Q8_0's split into int8s and scales, Q6_K's padded, Q4_K's and
+   Q5_K's as they are."
+  (let* ((type (gmat-type g)) (rows (gmat-rows g)) (cols (gmat-cols g))
+         (n (* rows cols)) (bytes (* rows (gmat-row-bytes g)))
+         (src (sb-sys:sap+ (sb-sys:vector-sap file) (gmat-offset g))))
+    (unless (member type '(:q8_0 :q4_k :q5_k :q6_k))
+      (error "the CUDA path multiplies Q8_0, Q4_K, Q5_K and Q6_K; ~A is ~A" (gmat-name g) type))
+    (unless (zerop (mod cols (if (eq type :q8_0) 32 256)))
+      (error "~A: ~D columns is not a whole number of blocks" (gmat-name g) cols))
+    (ecase type
+      (:q8_0
+       (let* ((nb (floor n 32)) (qs (cuda-alloc dev n :zero nil)) (d (cuda-alloc dev (* 2 nb) :zero nil)))
+         (cuda-upload raw src bytes)
+         (launch dev "repack_q8" (ceiling nb 8) '(32 8) (list raw qs d (list :i64 nb)))
+         (%make-cmat :name (gmat-name g) :type type :rows rows :cols cols :qs qs :d d)))
+      ((:q4_k :q5_k)
+       (let ((qs (cuda-alloc dev bytes :zero nil)))
+         (cuda-upload qs src bytes)
+         (%make-cmat :name (gmat-name g) :type type :rows rows :cols cols :qs qs)))
+      (:q6_k
+       (let* ((nb (floor n 256)) (qs (cuda-alloc dev (* 224 nb) :zero nil)))
+         (cuda-upload raw src bytes)
+         (launch dev "repack_q6k" (ceiling nb 8) '(32 8) (list raw qs (list :i64 nb)))
+         (%make-cmat :name (gmat-name g) :type type :rows rows :cols cols :qs qs))))))
+
+(defun model-kquant-p (m)
+  "Whether any of M's matrices on the device is a K-quant."
+  (loop for w being the hash-values of (cmodel-mats (model-cuda m)) thereis (cmat-kquant-p w)))
 
 (defun cmat-of (cm g) (or (gethash g (cmodel-mats cm)) (error "~A is not on the device" (gmat-name g))))
 (defun cvec-of (cm v) (and v (or (gethash v (cmodel-vecs cm)) (error "a vector is not on the device"))))
@@ -72,6 +98,7 @@
 
 (defstruct (cctx (:constructor %make-cctx))
   tokens x xq xs q k v att fa fb logits part rope kc vc
+  xsum                                  ; the activation blocks' int8 sums, for K-quants (or NIL)
   (max-split 0 :type fixnum))
 
 (defconstant +att-chunk+ 64 "Positions a block of ATTN_DECODE takes at most (AD_CHUNK).")
@@ -97,6 +124,7 @@
       (let ((st (%make-cctx
                  :tokens (fb n) :x (fb (* n d))
                  :xq (cuda-alloc dev (* n wide)) :xs (fb (ceiling (* n wide) 32))
+                 :xsum (and (model-kquant-p m) (fb (ceiling (* n wide) 32)))
                  :q (fb (* n qd)) :k (fb (* n kvd)) :v (fb (* n kvd)) :att (fb (* n qd))
                  :fa (fb (* n f)) :fb (fb (* n f)) :logits (fb (model-n-vocab m))
                  ;; a decode's splits, for ATTN_MERGE
@@ -122,7 +150,7 @@
 (defun free-cuda-state (ctx)
   (let ((st (getf (context-plist ctx) :cuda)))
     (when st
-      (dolist (s '(tokens x xq xs q k v att fa fb logits part rope))
+      (dolist (s '(tokens x xq xs xsum q k v att fa fb logits part rope))
         (cuda-free (slot-value st s)))
       (cuda-free (car (svref (cctx-kc st) 0)))
       (cuda-free (car (svref (cctx-vc st) 0)))
@@ -135,11 +163,18 @@
 
 (defun mm2-p (dev cols) (and (>= (cudev-arch dev) 80) (zerop (mod cols 128))))
 
-(defun cmat-mul (dev w xq xs y n &key bias acc)
+(defun cmat-mul (dev w xq xs y n &key bias acc xsum)
   "Y = W X for N tokens (token t's X at t*cols, its Y at t*rows), or Y += it
-   when ACC: a matrix-vector product for one, the tiled product for more."
+   when ACC: a matrix-vector product for one, the tiled product for more.
+   XSUM, the activations' block sums, for a K-quant W."
   (let ((rows (cmat-rows w)) (cols (cmat-cols w)))
-    (cond ((= n 1)
+    (cond ((cmat-kquant-p w)
+           (if (= n 1)
+               (launch dev "mv_k" (ceiling rows 4) 128
+                       (list (kquant-code (cmat-type w)) (cmat-qs w) xq xs xsum y bias rows cols (if acc 1 0)))
+               (launch dev "mm_k" (list (ceiling n 64) (ceiling rows 64)) 256
+                       (list (kquant-code (cmat-type w)) (cmat-qs w) xq xs xsum y bias rows cols n (if acc 1 0)))))
+          ((= n 1)
            (launch dev "mv_q8" (ceiling rows 4) 128
                    (list (cmat-qs w) (cmat-d w) xq xs y bias rows cols (if acc 1 0))))
           ((mm2-p dev cols) (cmat-mul-n dev (list (list w y bias)) xq xs n :acc acc))
@@ -160,10 +195,11 @@
             (append args (list xq xs (cmat-cols (first (first parts))) n (if acc 1 0)))
             :shared +mm2-shared+)))
 
-(defun rmsnorm-q8 (dev x w xq xs d eps n)
-  "RMSNORM! of N rows of X (D wide) by W, quantized into XQ / XS.  A single
-   row is spread over a block per 256 of its elements."
-  (launch dev "rmsnorm_q8" (list (if (= n 1) (ceiling d 256) 1) n) 256 (list x w nil xq xs d eps)))
+(defun rmsnorm-q8 (dev x w xq xs xsum d eps n)
+  "RMSNORM! of N rows of X (D wide) by W, quantized into XQ / XS (and the
+   block sums into XSUM, unless NIL).  A single row is spread over a block
+   per 256 of its elements."
+  (launch dev "rmsnorm_q8" (list (if (= n 1) (ceiling d 256) 1) n) 256 (list x w nil xq xs xsum d eps)))
 
 (defun attn-prefill-shape (dev hd)
   "(VALUES queries-per-warp shared-bytes) for ATTN_PREFILL: as many queries
@@ -184,6 +220,71 @@
                            (<= (length rest) *cuda-chunk*)))
   (context-logits ctx))
 
+(defun embed (dev emb tokens x n d)
+  "Rows TOKENS (a device vector of N ids) of the embedding EMB as floats in X."
+  (if (cmat-kquant-p emb)
+      (launch dev "embed_k" n 128 (list (kquant-code (cmat-type emb)) (cmat-qs emb) tokens x d))
+      (launch dev "embed_q8" n 256 (list (cmat-qs emb) (cmat-d emb) tokens x d))))
+
+(defun qkv-mul (dev st wq wk wv bq bk bv n d)
+  "Q, K and V's products into the state's Q, K, V: one launch when the
+   formats allow it."
+  (let ((xq (cctx-xq st)) (xs (cctx-xs st)) (xsum (cctx-xsum st))
+        (q8 (notany #'cmat-kquant-p (list wq wk wv))))
+    (cond ((and (= n 1) q8)
+           (launch dev "mv_q8_3" (ceiling (+ (cmat-rows wq) (cmat-rows wk) (cmat-rows wv)) 4) 128
+                   (list (cmat-qs wq) (cmat-d wq) (cmat-qs wk) (cmat-d wk) (cmat-qs wv) (cmat-d wv)
+                         xq xs (cctx-q st) (cctx-k st) (cctx-v st) bq bk bv
+                         (cmat-rows wq) (cmat-rows wk) (cmat-rows wv) d)))
+          ((and (> n 1) q8 (mm2-p dev d) (every (lambda (w) (zerop (mod (cmat-rows w) 128))) (list wq wk wv)))
+           (cmat-mul-n dev (list (list wq (cctx-q st) bq) (list wk (cctx-k st) bk) (list wv (cctx-v st) bv))
+                       xq xs n))
+          (t (cmat-mul dev wq xq xs (cctx-q st) n :bias bq :xsum xsum)
+             (cmat-mul dev wk xq xs (cctx-k st) n :bias bk :xsum xsum)
+             (cmat-mul dev wv xq xs (cctx-v st) n :bias bv :xsum xsum)))))
+
+(defun glu-mul (dev st g u n f d)
+  "silu(G x) * (U x) into the state's FA."
+  (let ((xq (cctx-xq st)) (xs (cctx-xs st)) (xsum (cctx-xsum st)))
+    (cond ((and (= n 1) (not (cmat-kquant-p g)) (not (cmat-kquant-p u)))
+           (launch dev "mv_q8_glu" (ceiling f 4) 128
+                   (list (cmat-qs g) (cmat-d g) (cmat-qs u) (cmat-d u) xq xs (cctx-fa st) f d)))
+          ((and (= n 1) (cmat-kquant-p g) (cmat-kquant-p u))
+           (launch dev "mv_k_glu" (ceiling f 4) 128
+                   (list (kquant-code (cmat-type g)) (cmat-qs g) (kquant-code (cmat-type u)) (cmat-qs u)
+                         xq xs xsum (cctx-fa st) f d)))
+          (t (cmat-mul dev g xq xs (cctx-fa st) n :xsum xsum)
+             (cmat-mul dev u xq xs (cctx-fb st) n :xsum xsum)
+             (launch dev "swiglu" (ceiling (* n f) 256) 256
+                     (list (cctx-fa st) (cctx-fb st) (list :i64 (* n f))))))))
+
+(defun attention (dev m st li n pos0 visible)
+  "Layer LI's attention of the N tokens at POS0, into the state's ATT,
+   quantized for the output projection."
+  (let* ((hd (model-head-dim m)) (nh (model-n-head m)) (nkv (model-n-kv-head m)) (qd (model-q-dim m))
+         (scale (/ 1f0 (sqrt (coerce hd 'single-float))))
+         (q (cctx-q st)) (kc (svref (cctx-kc st) li)) (vc (svref (cctx-vc st) li))
+         (xq (cctx-xq st)) (xs (cctx-xs st)) (xsum (cctx-xsum st)))
+    (if (= n 1)
+        (let* ((chunk (decode-chunk visible)) (nsplit (ceiling visible chunk)))
+          (launch dev "attn_decode" (list nkv nsplit) 128
+                  (list q kc vc (cctx-part st) nh nkv hd pos0 chunk nsplit scale)
+                  :shared (* 4 (max (* hd (1+ +att-chunk+)) (* 8 hd (floor nh nkv)))))
+          ;; merged and quantized at once
+          (launch dev "attn_merge" (list nh n) (max 32 hd)
+                  (list (cctx-part st) (cctx-att st) xq xs xsum nh hd pos0 chunk nsplit)))
+        (let ((bytes2 (* 4 (+ (* 64 (+ hd 4)) (* 32 (+ hd 4)) (* 32 hd) (* 32 68)))))
+          (if (and (zerop (mod hd 64)) (<= bytes2 (cudev-max-shared dev)))
+              (launch dev "attn_prefill2" (list nh (ceiling n 64)) 256
+                      (list q kc vc (cctx-att st) nh nkv hd pos0 n scale)
+                      :shared bytes2)
+              (multiple-value-bind (qpw bytes) (attn-prefill-shape dev hd)
+                (launch dev "attn_prefill" (list nh (ceiling n (* 4 qpw))) 128
+                        (list q kc vc (cctx-att st) nh nkv hd pos0 n scale qpw)
+                        :shared bytes)))
+          (launch dev "quant_q8" (ceiling (* n qd) 256) 256
+                  (list (cctx-att st) xq xs xsum (list :i64 (floor (* n qd) 32))))))))
+
 (defun cuda-forward-n (ctx tokens logits)
   "TOKENS (at most *CUDA-CHUNK*) at the next positions; the logits, if
    LOGITS, are the last token's."
@@ -191,82 +292,35 @@
          (st (cuda-state ctx)) (pos0 (context-pos ctx)) (n (length tokens))
          (eps (model-eps m)) (d (model-d m)) (f (model-ffn m))
          (hd (model-head-dim m)) (nh (model-n-head m)) (nkv (model-n-kv-head m))
-         (qd (model-q-dim m))
-         (x (cctx-x st)) (xq (cctx-xq st)) (xs (cctx-xs st))
-         (visible (+ pos0 n))
-         (chunk (decode-chunk visible))
-         (nsplit (ceiling visible chunk))
-         (scale (/ 1f0 (sqrt (coerce hd 'single-float)))))
+         (x (cctx-x st)) (xq (cctx-xq st)) (xs (cctx-xs st)) (xsum (cctx-xsum st))
+         (visible (+ pos0 n)))
     (assert (<= 1 n *cuda-chunk*))
     (when (> visible (context-n-ctx ctx))
       (error "context is full (~D tokens)" (context-n-ctx ctx)))
     (with-cuda
       (cuda-current dev)
       (cuda-upload-vector (cctx-tokens st) (coerce tokens '(simple-array (signed-byte 32) (*))))
-      (let ((emb (cmat-of cm (model-token-embd m))))
-        (launch dev "embed_q8" n 256 (list (cmat-qs emb) (cmat-d emb) (cctx-tokens st) x d)))
+      (embed dev (cmat-of cm (model-token-embd m)) (cctx-tokens st) x n d)
       (loop for li below (model-n-layer m)
             for l = (svref (model-layers m) li)
-            do (rmsnorm-q8 dev x (cvec-of cm (layer-attn-norm l)) xq xs d eps n)
-               (let ((wq (cmat-of cm (layer-wq l))) (wk (cmat-of cm (layer-wk l))) (wv (cmat-of cm (layer-wv l)))
-                     (bq (cvec-of cm (layer-bq l))) (bk (cvec-of cm (layer-bk l))) (bv (cvec-of cm (layer-bv l))))
-                 (if (= n 1)
-                     (launch dev "mv_q8_3" (ceiling (+ (cmat-rows wq) (cmat-rows wk) (cmat-rows wv)) 4) 128
-                             (list (cmat-qs wq) (cmat-d wq) (cmat-qs wk) (cmat-d wk) (cmat-qs wv) (cmat-d wv)
-                                   xq xs (cctx-q st) (cctx-k st) (cctx-v st) bq bk bv
-                                   (cmat-rows wq) (cmat-rows wk) (cmat-rows wv) d))
-                     (if (and (mm2-p dev d) (every (lambda (w) (zerop (mod (cmat-rows w) 128))) (list wq wk wv)))
-                         (cmat-mul-n dev (list (list wq (cctx-q st) bq) (list wk (cctx-k st) bk) (list wv (cctx-v st) bv))
-                                     xq xs n)
-                         (progn
-                           (cmat-mul dev wq xq xs (cctx-q st) n :bias bq)
-                           (cmat-mul dev wk xq xs (cctx-k st) n :bias bk)
-                           (cmat-mul dev wv xq xs (cctx-v st) n :bias bv)))))
+            do (rmsnorm-q8 dev x (cvec-of cm (layer-attn-norm l)) xq xs xsum d eps n)
+               (qkv-mul dev st (cmat-of cm (layer-wq l)) (cmat-of cm (layer-wk l)) (cmat-of cm (layer-wv l))
+                        (cvec-of cm (layer-bq l)) (cvec-of cm (layer-bk l)) (cvec-of cm (layer-bv l)) n d)
                (launch dev "qk_rope" (list (+ nh nkv) n) (max 32 (floor hd 2))
                        (list (cctx-q st) (cctx-k st) (cctx-v st)
                              (cvec-of cm (layer-q-norm l)) (cvec-of cm (layer-k-norm l))
                              (cctx-rope st) (svref (cctx-kc st) li) (svref (cctx-vc st) li)
                              nh nkv hd pos0 eps (if (model-rope-neox m) 1 0)))
-               (if (= n 1)
-                   (progn
-                     (launch dev "attn_decode" (list nkv nsplit) 128
-                             (list (cctx-q st) (svref (cctx-kc st) li) (svref (cctx-vc st) li) (cctx-part st)
-                                   nh nkv hd pos0 chunk nsplit scale)
-                             :shared (* 4 (max (* hd (1+ +att-chunk+)) (* 8 hd (floor nh nkv)))))
-                     ;; merged and quantized for the output projection
-                     (launch dev "attn_merge" (list nh n) (max 32 hd)
-                             (list (cctx-part st) (cctx-att st) xq xs nh hd pos0 chunk nsplit)))
-                   (progn
-                     (let ((bytes2 (* 4 (+ (* 64 (+ hd 4)) (* 32 (+ hd 4)) (* 32 hd) (* 32 68)))))
-                       (if (and (zerop (mod hd 64)) (<= bytes2 (cudev-max-shared dev)))
-                           (launch dev "attn_prefill2" (list nh (ceiling n 64)) 256
-                                   (list (cctx-q st) (svref (cctx-kc st) li) (svref (cctx-vc st) li) (cctx-att st)
-                                         nh nkv hd pos0 n scale)
-                                   :shared bytes2)
-                           (multiple-value-bind (qpw bytes) (attn-prefill-shape dev hd)
-                             (launch dev "attn_prefill" (list nh (ceiling n (* 4 qpw))) 128
-                                     (list (cctx-q st) (svref (cctx-kc st) li) (svref (cctx-vc st) li) (cctx-att st)
-                                           nh nkv hd pos0 n scale qpw)
-                                     :shared bytes))))
-                     (launch dev "quant_q8" (ceiling (* n qd) 256) 256
-                             (list (cctx-att st) xq xs (list :i64 (floor (* n qd) 32))))))
-               (cmat-mul dev (cmat-of cm (layer-wo l)) xq xs x n :acc t)
-               (rmsnorm-q8 dev x (cvec-of cm (layer-ffn-norm l)) xq xs d eps n)
-               (let ((g (cmat-of cm (layer-wgate l))) (u (cmat-of cm (layer-wup l))))
-                 (if (= n 1)
-                     (launch dev "mv_q8_glu" (ceiling f 4) 128
-                             (list (cmat-qs g) (cmat-d g) (cmat-qs u) (cmat-d u) xq xs (cctx-fa st) f d))
-                     (progn
-                       (cmat-mul dev g xq xs (cctx-fa st) n)
-                       (cmat-mul dev u xq xs (cctx-fb st) n)
-                       (launch dev "swiglu" (ceiling (* n f) 256) 256
-                               (list (cctx-fa st) (cctx-fb st) (list :i64 (* n f)))))))
+               (attention dev m st li n pos0 visible)
+               (cmat-mul dev (cmat-of cm (layer-wo l)) xq xs x n :acc t :xsum xsum)
+               (rmsnorm-q8 dev x (cvec-of cm (layer-ffn-norm l)) xq xs xsum d eps n)
+               (glu-mul dev st (cmat-of cm (layer-wgate l)) (cmat-of cm (layer-wup l)) n f d)
                (launch dev "quant_q8" (ceiling (* n f) 256) 256
-                       (list (cctx-fa st) xq xs (list :i64 (floor (* n f) 32))))
-               (cmat-mul dev (cmat-of cm (layer-wdown l)) xq xs x n :acc t))
+                       (list (cctx-fa st) xq xs xsum (list :i64 (floor (* n f) 32))))
+               (cmat-mul dev (cmat-of cm (layer-wdown l)) xq xs x n :acc t :xsum xsum))
       (when logits
-        (rmsnorm-q8 dev (cons x (* 4 (1- n) d)) (cvec-of cm (model-output-norm m)) xq xs d eps 1)
-        (cmat-mul dev (cmat-of cm (model-output m)) xq xs (cctx-logits st) 1)
+        (rmsnorm-q8 dev (cons x (* 4 (1- n) d)) (cvec-of cm (model-output-norm m)) xq xs xsum d eps 1)
+        (cmat-mul dev (cmat-of cm (model-output m)) xq xs (cctx-logits st) 1 :xsum xsum)
         (let ((out (context-logits ctx)))
           (sb-sys:with-pinned-objects (out)
             (cuda-download (cctx-logits st) (sb-sys:vector-sap out) (* 4 (length out)))))))
