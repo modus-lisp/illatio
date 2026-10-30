@@ -1106,8 +1106,14 @@
 (defun ds4f-prefill-1 (ctx tokens logits)
   #+(and sbcl linux)
   (when (ds4f-cuda-p)
-    ;; a token at a time: decode's caches are the device's
-    (loop for (tk . rest) on tokens do (ds4f-cuda-forward ctx tk (and logits (null rest))))
+    ;; decode's caches are the device's: a long chunk layer-major on it
+    ;; (cuda-ds4f-prefill.lisp), *DS4F-CUDA-CHUNK* at a time, else a token at a time
+    (if (>= (length tokens) (symbol-value '*ds4f-cuda-chunk-from*))
+        (loop for rest = tokens then (nthcdr (symbol-value '*ds4f-cuda-chunk*) rest)
+              while rest
+              do (let ((k (min (symbol-value '*ds4f-cuda-chunk*) (length rest))))
+                   (funcall 'ds4f-cuda-prefill-1 ctx (subseq rest 0 k) (and logits (= k (length rest))))))
+        (loop for (tk . rest) on tokens do (ds4f-cuda-forward ctx tk (and logits (null rest)))))
     (return-from ds4f-prefill-1 ctx))
   #+(and sbcl darwin)
   (when (ds4f-gpu-p :prefill)

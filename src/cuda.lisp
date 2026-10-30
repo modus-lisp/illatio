@@ -342,12 +342,13 @@
 (defun cuda-host-unregister (sap)
   (with-cuda (cu "cuMemHostUnregister" (sb-sys:system-area-pointer sap))))
 
-(defun cuda-host-alloc (bytes)
-  "BYTES of pinned host memory (portable): its SAP."
+(defun cuda-host-alloc (bytes &key mapped)
+  "BYTES of pinned host memory (portable): its SAP.  MAPPED: kernels may
+   read it where it lies, at the same address (unified addressing)."
   (with-cuda
     (with-out (p)
       (cu "cuMemHostAlloc" (sb-sys:system-area-pointer (out-ptr p)) (sb-alien:unsigned-long (max bytes 64))
-          (sb-alien:unsigned 1))           ; CU_MEMHOSTALLOC_PORTABLE
+          (sb-alien:unsigned (if mapped 3 1)))   ; CU_MEMHOSTALLOC_PORTABLE (| DEVICEMAP)
       (sb-sys:int-sap p))))
 
 (defun cuda-host-free (sap)
@@ -367,6 +368,9 @@
     (with-out (e)
       (cu "cuEventCreate" (sb-sys:system-area-pointer (out-ptr e)) (sb-alien:unsigned 2)) ; DISABLE_TIMING
       (sb-sys:int-sap e))))
+
+(defun cuda-event-destroy (event)
+  (with-cuda (cu "cuEventDestroy_v2" (sb-sys:system-area-pointer event))))
 
 (defun cuda-event-record (event stream)
   (with-cuda (cu "cuEventRecord" (sb-sys:system-area-pointer event) (sb-sys:system-area-pointer stream))))

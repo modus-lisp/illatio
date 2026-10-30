@@ -447,8 +447,10 @@ __device__ __forceinline__ unsigned warp_prefix_excl(unsigned v) {
 }
 
 // The indexer's pick: of N scores, the K highest, their rows in order into
-// IDX (the earlier of equal scores first, as TOP-K-ROWS).  1024 threads.
-extern "C" __global__ void d4_topk(int n, int k, const float* scores, unsigned* idx) {
+// IDX (the earlier of equal scores first, as TOP-K-ROWS).  1024 threads: the
+// body D4_TOPK (one token) and D4_TOPK_CHUNK (ds4f_chunk.cu, a block a token)
+// share.
+__device__ void d4_topk_row(int n, int k, const float* scores, unsigned* idx) {
   __shared__ unsigned cnt[32], pg[32], pe[32];
   int tid = threadIdx.x;
   if (n <= k) { for (int i = tid; i < n; i += 1024) idx[i] = i; return; }
@@ -480,6 +482,10 @@ extern "C" __global__ void d4_topk(int n, int k, const float* scores, unsigned* 
     if (kk > t) idx[at++] = i;
     else if (kk == t && et < ties) { idx[at++] = i; et++; }
   }
+}
+
+extern "C" __global__ void d4_topk(int n, int k, const float* scores, unsigned* idx) {
+  d4_topk_row(n, k, scores, idx);
 }
 
 // --- attention ------------------------------------------------------------------
