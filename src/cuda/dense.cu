@@ -311,18 +311,18 @@ extern "C" __global__ void swiglu(float* __restrict__ a, const float* __restrict
 
 // --- attention ----------------------------------------------------------------
 
-// Q/K head norms (qwen3; when QN isn't null), RoPE from the table, and K, V
-// into the caches: a block a head of a token, a thread a pair.  Q, K, V are
-// N tokens' projections; the token T is at position POS0+T.  ROPE holds
-// each position's cos (HD/2) then sin (HD/2).
+// Q/K head norms (qwen3; when QN isn't null), RoPE from the table on the
+// first RD dimensions, and K, V into the caches: a block a head of a token,
+// a thread a pair.  Q, K, V are N tokens' projections; the token T is at
+// position POS0+T.  ROPE holds each position's cos (RD/2) then sin (RD/2).
 extern "C" __global__ void qk_rope(float* __restrict__ q, float* __restrict__ k, const float* __restrict__ v,
                                    const float* __restrict__ qn, const float* __restrict__ kn,
                                    const float* __restrict__ rope,
                                    float* __restrict__ kc, float* __restrict__ vc,
-                                   int nh, int nkv, int hd, int pos0, float eps, int neox) {
+                                   int nh, int nkv, int hd, int rd, int pos0, float eps, int neox) {
   __shared__ double part[32];
   __shared__ float sc;
-  int head = blockIdx.x, t = blockIdx.y, i = threadIdx.x, half = hd >> 1;
+  int head = blockIdx.x, t = blockIdx.y, i = threadIdx.x, half = rd >> 1;
   int pos = pos0 + t;
   int qd = nh * hd, kvd = nkv * hd;
   bool isq = head < nh;
@@ -343,7 +343,7 @@ extern "C" __global__ void qk_rope(float* __restrict__ q, float* __restrict__ k,
     for (int j = i; j < hd; j += blockDim.x) x[j] = (x[j] * sc) * nw[j];
     __syncthreads();
   }
-  const float* cs = rope + (long long)pos * hd;
+  const float* cs = rope + (long long)pos * rd;
   for (int p = i; p < half; p += blockDim.x) {
     int a = neox ? p : 2 * p, b = neox ? p + half : 2 * p + 1;
     float x0 = x[a], x1 = x[b], c = cs[p], s = cs[half + p];

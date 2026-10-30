@@ -31,6 +31,7 @@
      (:file "metal-qwen35" :if-feature (:and :sbcl :darwin)) ; qwen35 on it (kernels: src/metal/)
      (:file "cuda" :if-feature (:and :sbcl :linux))       ; NVIDIA GPUs: the driver API and NVRTC
      (:file "cuda-dense" :if-feature (:and :sbcl :linux)) ; qwen2/qwen3/llama on them (kernels: src/cuda/)
+     (:file "cuda-qwen35" :if-feature (:and :sbcl :linux)) ; qwen35 on them
      (:file "generate")    ; sampling, prompt reuse, streaming text
      (:file "ds4f")        ; DeepSeek V4 Flash (deepseek4), ported from ds4.c
      (:file "ds4f-kv")      ; its state saved: a long prompt prefilled once

@@ -62,6 +62,9 @@
   "Zero every linear layer's state: the context starts over."
   (when (model-impl (context-model ctx))
     (return-from reset-recurrent! (ds4f-context-reset ctx)))
+  #+(and sbcl linux)
+  (when (model-cuda (context-model ctx))
+    (return-from reset-recurrent! (progn (reset-cuda-state ctx) ctx)))
   (let ((st (q35-state ctx)))
     (loop for v across (q35-conv st) do (fill v 0f0))
     (loop for v across (q35-ssm st) do (fill v 0f0)))
