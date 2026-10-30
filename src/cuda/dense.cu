@@ -845,17 +845,29 @@ __device__ __forceinline__ unsigned smem_addr(const void* p) {
   return (unsigned)__cvta_generic_to_shared(p);
 }
 __device__ __forceinline__ void cp_async16(void* dst, const void* src, bool ok) {
+#if __CUDA_ARCH__ >= 800
   asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;" :: "r"(smem_addr(dst)), "l"(src), "r"(ok ? 16 : 0));
+#endif
 }
 __device__ __forceinline__ void cp_async8(void* dst, const void* src, bool ok) {
+#if __CUDA_ARCH__ >= 800
   asm volatile("cp.async.ca.shared.global [%0], [%1], 8, %2;" :: "r"(smem_addr(dst)), "l"(src), "r"(ok ? 8 : 0));
+#endif
 }
+#if __CUDA_ARCH__ >= 800
 __device__ __forceinline__ void cp_commit() { asm volatile("cp.async.commit_group;"); }
 __device__ __forceinline__ void cp_wait1() { asm volatile("cp.async.wait_group 1;"); }
 __device__ __forceinline__ void cp_wait0() { asm volatile("cp.async.wait_group 0;"); }
+#else
+__device__ __forceinline__ void cp_commit() {}
+__device__ __forceinline__ void cp_wait1() {}
+__device__ __forceinline__ void cp_wait0() {}
+#endif
 __device__ __forceinline__ void ldsm_x4(int& r0, int& r1, int& r2, int& r3, const void* p) {
+#if __CUDA_ARCH__ >= 800
   asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];"
                : "=r"(r0), "=r"(r1), "=r"(r2), "=r"(r3) : "r"(smem_addr(p)));
+#endif
 }
 __device__ __forceinline__ float i2f_exact(int s) {
   return __int_as_float(s + 0x4B400000) - 12582912.0f;
@@ -866,6 +878,7 @@ mm_q8_mma2(const i8* __restrict__ w0, const u16* __restrict__ d0, float* __restr
            const i8* __restrict__ w1, const u16* __restrict__ d1, float* __restrict__ y1, const float* __restrict__ b1, int rows1,
            const i8* __restrict__ w2, const u16* __restrict__ d2, float* __restrict__ y2, const float* __restrict__ b2, int rows2,
            const i8* __restrict__ xq, const float* __restrict__ xs, int cols, int n, int acc) {
+#if __CUDA_ARCH__ >= 800
   extern __shared__ __align__(16) int m2s[];
   // which matrix this block's rows are
   int rt = blockIdx.y, t0 = blockIdx.x * MMA_T;
@@ -976,4 +989,5 @@ mm_q8_mma2(const i8* __restrict__ w0, const u16* __restrict__ d0, float* __restr
             }
         }
       }
+#endif
 }
