@@ -49,8 +49,9 @@
       (g2-1d gpu e "ng_axpby" n (list (- (* lr (sqrt (max 1f0 (/ r c))))) 1f0) (list x w)))))
 
 (defun ngpt-encode-update (m e step &key (muon-lr 0.04f0) (mu 0.95f0) (embed-lr 0.6f0) (head-lr 0.008f0)
-                                      (beta1 0.9f0) (beta2 0.95f0) (eps 1f-8))
-  "One optimizer step: Muon for the hidden matrices, Adam for the embedding and the head."
+                                      (scalar-lr 0.04f0) (beta1 0.9f0) (beta2 0.95f0) (eps 1f-8))
+  "One optimizer step: Muon for the hidden matrices, Adam for the embedding,
+   the head and the scalars."
   (with-ngpt (m)
     (let ((c (ngpt-c m)) (c1 (- 1f0 (expt beta1 step))) (c2 (- 1f0 (expt beta2 step))))
       (flet ((m1 (name &optional (li 0) (plus 0)) (cons (ngpt-m1buf m) (* 4 (+ plus (lof pl name li)))))
@@ -62,8 +63,9 @@
           (encode-muon-matrix m e c c (p :projw li) (g :projw li) (m1 :projw li) muon-lr mu)
           (encode-muon-matrix m e (* 4 c) c (p :fcw li) (g :fcw li) (m1 :fcw li) muon-lr mu)
           (encode-muon-matrix m e c (* 4 c) (p :fcprojw li) (g :fcprojw li) (m1 :fcprojw li) muon-lr mu))
-        (loop for (name lr) in (list (list :wte embed-lr) (list :head head-lr))
-              do (g2-1d gpu e "g2_adamw" (lsize pl name)
+        (loop for (name lr) in (list* (list :wte embed-lr) (list :head head-lr)
+                                      (mapcar (lambda (s) (list s scalar-lr)) *ngpt-scalars*))
+              do (g2-1d gpu e "g2_adamw" (lsize pl name (ngpt-l m))
                         (list lr beta1 beta2 eps 0f0 c1 c2)
                         (list (p name) (g name) (m1 name) (cons (ngpt-m2buf m) (* 4 (lof pl name)))
                               (ngpt-norm m))))))))
@@ -83,7 +85,7 @@
 
 (defun nanogpt-train (&key (data (merge-pathnames "workspace/modded-nanogpt/data/fineweb10B/" (user-homedir-pathname)))
                            (l 6) (c 384) (b 8) (tt 1024) (accum 8) (steps 1000) (warmup 0) (warmdown 0.3)
-                           (muon-lr 0.04f0) (embed-lr 0.6f0) (head-lr 0.008f0) (momentum-warmup 500)
+                           (muon-lr 0.04f0) (embed-lr 0.6f0) (head-lr 0.008f0) (scalar-lr 0.04f0) (momentum-warmup 500)
                            (cap 30f0) (val-every 50) (val-batches 16) (target nil) (seed 1337)
                            (model nil) (out *standard-output*))
   "Train the speedrun's model on FineWeb: STEPS steps of ACCUM micro-batches
@@ -117,7 +119,7 @@
               (incf loss (/ (ngpt-mean-loss m) accum)))
             (with-gpu-work (e (ngpt-gpu m))
               (ngpt-encode-update m e (1+ step) :muon-lr (* k muon-lr) :embed-lr (* k embed-lr)
-                                                :head-lr (* k head-lr)
+                                                :head-lr (* k head-lr) :scalar-lr (* k scalar-lr)
                                                 :mu (coerce (+ (* (- 1 frac) 0.85) (* frac 0.95)) 'single-float)))
             (let ((ms (/ (- (get-internal-real-time) t0) (/ internal-time-units-per-second 1000))))
               (incf train-ms ms)

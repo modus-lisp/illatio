@@ -4,7 +4,12 @@
 ;;; RMSNorm without weights before attention, the MLP and the head; merged
 ;;; QKV with no biases; QK-norm then rotary embeddings on each 64-wide head;
 ;;; ReLU^2; the output projections and an untied head initialized to zero;
-;;; the logits softcapped.  Muon for the hidden matrices is nanogpt-muon.lisp.
+;;; the logits softcapped.  And record 11's shortcuts, each a learned scalar:
+;;; the embedding RMS-normed into x0, which every block's input mixes back in
+;;; (l0 x + l1 x0); the value residual, each layer's V mixed with the first
+;;; layer's ((1 - l) v + l v1); U-net skips, the second half's layers each
+;;; adding w times the output of the first half's layer as far from the
+;;; middle.  Muon for the hidden matrices is nanogpt-train.lisp.
 ;;;
 ;;; The parameters, their gradients and the optimizer's two moments are four
 ;;; GPU buffers laid out by one table; the activations and their gradients
@@ -47,14 +52,18 @@
   inputs targets norm)
 
 (defun ngpt-param-specs (l c vp)
-  (declare (ignore l))
+  ;; the scalars last, each padded to 4 floats: the matrices stay aligned for float4s
   `((:wte ,(* vp c) nil)
     (:qkvw ,(* 3 c c) t) (:projw ,(* c c) t) (:fcw ,(* 4 c c) t) (:fcprojw ,(* 4 c c) t)
-    (:head ,(* vp c) nil)))
+    (:head ,(* vp c) nil)
+    (:lambdas 4 t) (:vlamb 4 t) (:skipw ,(* 4 (- l (floor l 2))) nil)))
+
+(defun ngpt-encoders (m) (floor (ngpt-l m) 2))
 
 (defun ngpt-act-specs (b tt c nh vp)
   (let ((n (* b tt)))
-    `((:x0 ,(* n c) nil)
+    `((:emb ,(* n c) nil) (:r0 ,n nil) (:x0 ,(* n c) nil) (:x0acc ,(* n c) nil) (:v1acc ,(* n c) nil)
+      (:xin ,(* n c) t) (:xm ,(* n c) t) (:vm ,(* n c) t) (:skip ,(* n c) t)
       (:ln1 ,(* n c) t) (:r1 ,n t) (:qkv ,(* n 3 c) t) (:qk ,(* n 2 c) t) (:qkr ,(* n 2 nh) t)
       (:pre ,(* b nh tt tt) t) (:att ,(* b nh tt tt) t) (:atty ,(* n c) t) (:proj ,(* n c) t)
       (:res2 ,(* n c) t) (:ln2 ,(* n c) t) (:r2 ,n t) (:fch ,(* n 4 c) t) (:fca ,(* n 4 c) t)
@@ -85,19 +94,24 @@
                         :m1buf (gpu-buffer gpu (* 4 np)) :m2buf (gpu-buffer gpu (* 4 np))
                         :abuf (gpu-buffer gpu (* 4 na)) :dabuf (gpu-buffer gpu (* 4 na))
                         :inputs (gpu-buffer gpu (* 4 b tt)) :targets (gpu-buffer gpu (* 4 b tt))
-                        :norm (gpu-buffer gpu (* 4 (+ 2 +g2-norm-groups+)))))
+                        :norm (gpu-buffer gpu (* 4 (+ 4 +g2-norm-groups+)))))
          (p (f32vec np)) (gauss (gaussian-filler seed)))
     (flet ((fill-normal (name std count)
              (let ((o (lof pl name)))
                (dotimes (k count) (setf (aref p (+ o k)) (* std (funcall gauss)))))))
       (fill-normal :wte 1f0 (* v c))
       (fill-normal :qkvw (/ 1f0 (sqrt (coerce c 'single-float))) (lsize pl :qkvw l))
-      (fill-normal :fcw (/ 1f0 (sqrt (coerce c 'single-float))) (lsize pl :fcw l)))
+      (fill-normal :fcw (/ 1f0 (sqrt (coerce c 'single-float))) (lsize pl :fcw l))
+      (dotimes (li l)
+        (setf (aref p (lof pl :lambdas li)) 1f0 (aref p (lof pl :vlamb li)) 0.5f0))
+      (dotimes (j (- l (floor l 2))) (setf (aref p (+ (lof pl :skipw) (* 4 j))) 1f0)))
     (copy-to-gbuf (ngpt-pbuf m) p)
     (setf (sb-sys:sap-ref-single (gbuf-sap (ngpt-norm m)) 0) 1f0)
     m))
 
 (defun ngpt-n-params (m) (layout-total (ngpt-params m)))
+
+(defparameter *ngpt-scalars* '(:lambdas :vlamb :skipw) "The learned scalars (Adam's, lr 0.04).")
 
 (defun ngpt-params-vector (m)
   (copy-from-gbuf (ngpt-pbuf m) (f32vec (ngpt-n-params m))))
@@ -109,8 +123,8 @@
    activation and activation-gradient buffers at tensor NAME (LAYER)."
   `(let* ((gpu (ngpt-gpu ,m)) (pl (ngpt-params ,m)) (al (ngpt-acts ,m)))
      (declare (ignorable gpu pl al))
-     (flet ((p (name &optional (li 0)) (cons (ngpt-pbuf ,m) (* 4 (lof pl name li))))
-            (g (name &optional (li 0)) (cons (ngpt-gbuf ,m) (* 4 (lof pl name li))))
+     (flet ((p (name &optional (li 0) (plus 0)) (cons (ngpt-pbuf ,m) (* 4 (+ plus (lof pl name li)))))
+            (g (name &optional (li 0) (plus 0)) (cons (ngpt-gbuf ,m) (* 4 (+ plus (lof pl name li)))))
             (a (name &optional (li 0) (plus 0)) (cons (ngpt-abuf ,m) (* 4 (+ plus (lof al name li)))))
             (da (name &optional (li 0) (plus 0)) (cons (ngpt-dabuf ,m) (* 4 (+ plus (lof al name li))))))
        (declare (ignorable #'p #'g #'a #'da))
@@ -126,23 +140,33 @@
       (flet ((rms (out r in) (dispatch gpu e "ng_rms_fwd" (list n c) (list in out r) n 32))
              (linear (out in w cin cout &optional (kind :linear))
                (g2-gemm gpu e nil t n cout cin in cin w cin out cout :kind kind)))
-        (dispatch gpu e "ng_embed_fwd" (list n c) (list (ngpt-inputs m) (p :wte) (a :x0))
+        (dispatch gpu e "ng_embed_fwd" (list n c) (list (ngpt-inputs m) (p :wte) (a :emb))
                   (ceiling (* n c) 256) 256)
+        (rms (a :x0) (a :r0) (a :emb))
         (dotimes (li l)
-          (let ((xin (if (zerop li) (a :x0) (a :res3 (1- li)))))
-            (rms (a :ln1 li) (a :r1 li) xin)
+          (let* ((enc (ngpt-encoders m)) (prev (if (zerop li) (a :x0) (a :res3 (1- li))))
+                 (xin (if (>= li enc)
+                          (let ((j (- li enc)))  ; a U-net skip from the encoder layer as far from the middle
+                            (g2-1d gpu e "ng_add_scaled" (* n c) '()
+                                   (list (a :xin li) prev (a :res3 (- enc 1 j)) (p :skipw 0 (* 4 j))))
+                            (a :xin li))
+                          prev)))
+            (g2-1d gpu e "ng_mix" (* n c) '() (list (a :xm li) xin (a :x0) (p :lambdas li)))
+            (rms (a :ln1 li) (a :r1 li) (a :xm li))
             (linear (a :qkv li) (a :ln1 li) (p :qkvw li) c (* 3 c))
             (dispatch gpu e "ng_qk_fwd" (list n tt c nh (ngpt-rope-base m))
                       (list (a :qkv li) (a :qk li) (a :qkr li)) (list n nh 2) 32)
+            (g2-1d gpu e "ng_vmix" (* n c) (list c (* 3 c))
+                   (list (a :vm li) (a :qkv li (* 2 c)) (a :qkv 0 (* 2 c)) (p :vlamb li)))
             (g2-gemm gpu e nil t tt tt hs (a :qk li) (* 2 c) (a :qk li c) (* 2 c) (a :pre li) tt
                      :alpha scale :kind :attention :batch (* b nh) :nb2 nh :causal 1
                      :sa (list (* tt 2 c) hs) :sb (list (* tt 2 c) hs) :sc (list (* nh tt tt) (* tt tt)))
             (dispatch gpu e "g2_attn_softmax" (list (* b nh tt) tt) (list (a :pre li) (a :att li)) (* b nh tt) 32)
-            (g2-gemm gpu e nil nil tt hs tt (a :att li) tt (a :qkv li (* 2 c)) (* 3 c) (a :atty li) c
+            (g2-gemm gpu e nil nil tt hs tt (a :att li) tt (a :vm li) c (a :atty li) c
                      :kind :attention :batch (* b nh) :nb2 nh :causal 2
-                     :sa (list (* nh tt tt) (* tt tt)) :sb (list (* tt 3 c) hs) :sc (list (* tt c) hs))
+                     :sa (list (* nh tt tt) (* tt tt)) :sb (list (* tt c) hs) :sc (list (* tt c) hs))
             (linear (a :proj li) (a :atty li) (p :projw li) c c)
-            (g2-1d gpu e "g2_add" (* n c) '() (list (a :res2 li) xin (a :proj li)))
+            (g2-1d gpu e "g2_add" (* n c) '() (list (a :res2 li) (a :xm li) (a :proj li)))
             (rms (a :ln2 li) (a :r2 li) (a :res2 li))
             (linear (a :fch li) (a :ln2 li) (p :fcw li) c (* 4 c))
             (g2-1d gpu e "ng_relu2_fwd" (* n 4 c) '() (list (a :fch li) (a :fca li)))
@@ -167,7 +191,12 @@
                (g2-gemm gpu e nil nil n cin cout dout cout w cin (car in) cin :kind kind)
                (g2-gemm gpu e t nil cout cin n dout cout (cdr in) cin dw cin :beta acc :kind kind))
              (rms-back (dx dy x r add)
-               (dispatch gpu e "ng_rms_bwd" (list n c (if add 1 0)) (list dx dy x r) n 32)))
+               (dispatch gpu e "ng_rms_bwd" (list n c (if add 1 0)) (list dx dy x r) n 32))
+             (scalar-grad (gr d x y ldx)
+               ;; GR (+)= sum D (X - Y), or sum D X with no Y; X and Y rows LDX apart
+               (let ((part (cons (ngpt-norm m) 16)))
+                 (dispatch gpu e "ng_dot_part" (list n c ldx 64 (if y 1 0)) (list d x (or y x) part) 64 1024 :shared 128)
+                 (dispatch gpu e "ng_dot_finish" (list 64 acc) (list part gr) 1 32))))
         (unless fused
           (dispatch gpu e "ng_softcap_ce_bwd" (list n (ngpt-v m) vp dloss (ngpt-cap m))
                     (list (da :logits) (a :probs) (ngpt-targets m) (a :logits))
@@ -176,22 +205,33 @@
         (linear-back (da :logits) (cons (da :lnf) (a :lnf)) (p :head) (g :head) c vp :head)
         (rms-back (da :res3 (1- l)) (da :lnf) (a :res3 (1- l)) (a :rf) nil)
         (loop for li from (1- l) downto 0
-              do (let ((xin (if (zerop li) (a :x0) (a :res3 (1- li))))
-                       (dxin (if (zerop li) (da :x0) (da :res3 (1- li)))))
+              do (let* ((enc (ngpt-encoders m)) (dec (>= li enc)) (j (- li enc))
+                        (xin (cond (dec (a :xin li)) ((zerop li) (a :x0)) (t (a :res3 (1- li)))))
+                        (last (= li (1- l))))
+                   ;; an encoder layer's output also feeds a decoder layer's skip: its gradient
+                   ;; (written when that layer's was, earlier in this pass) adds in
+                   (when (< li enc)
+                     (g2-1d gpu e "g2_add" (* n c) '() (list (da :res3 li) (da :res3 li) (da :skip li))))
                    (g2-1d gpu e "g2_copy2" (* n c) '() (list (da :res2 li) (da :fcproj li) (da :res3 li)))
                    (linear-back (da :fcproj li) (cons (da :fca li) (a :fca li)) (p :fcprojw li) (g :fcprojw li) (* 4 c) c)
                    (g2-1d gpu e "ng_relu2_bwd" (* n 4 c) '() (list (da :fch li) (a :fch li) (da :fca li)))
                    (linear-back (da :fch li) (cons (da :ln2 li) (a :ln2 li)) (p :fcw li) (g :fcw li) c (* 4 c))
                    (rms-back (da :res2 li) (da :ln2 li) (a :res2 li) (a :r2 li) t)
-                   (g2-1d gpu e "g2_copy2" (* n c) '() (list dxin (da :proj li) (da :res2 li)))
+                   (g2-1d gpu e "g2_copy2" (* n c) '() (list (da :xm li) (da :proj li) (da :res2 li)))
                    (linear-back (da :proj li) (cons (da :atty li) (a :atty li)) (p :projw li) (g :projw li) c c)
-                   ;; datt = dy V^T; dV = att^T dy; dpre; dQ' = s dpre K'; dK' = s dpre^T Q'
-                   (g2-gemm gpu e nil t tt tt hs (da :atty li) c (a :qkv li (* 2 c)) (* 3 c) (da :att li) tt
+                   ;; datt = dy VM^T; dVM = att^T dy; dpre; dQ' = s dpre K'; dK' = s dpre^T Q'
+                   (g2-gemm gpu e nil t tt tt hs (da :atty li) c (a :vm li) c (da :att li) tt
                             :kind :attention :batch (* b nh) :nb2 nh :causal 1
-                            :sa (list (* tt c) hs) :sb (list (* tt 3 c) hs) :sc (list (* nh tt tt) (* tt tt)))
-                   (g2-gemm gpu e t nil tt hs tt (a :att li) tt (da :atty li) c (da :qkv li (* 2 c)) (* 3 c)
+                            :sa (list (* tt c) hs) :sb (list (* tt c) hs) :sc (list (* nh tt tt) (* tt tt)))
+                   (g2-gemm gpu e t nil tt hs tt (a :att li) tt (da :atty li) c (da :vm li) c
                             :kind :attention :batch (* b nh) :nb2 nh :causal 3
-                            :sa (list (* nh tt tt) (* tt tt)) :sb (list (* tt c) hs) :sc (list (* tt 3 c) hs))
+                            :sa (list (* nh tt tt) (* tt tt)) :sb (list (* tt c) hs) :sc (list (* tt c) hs))
+                   ;; the value residual: dV = (1 - l) dVM, dV1 += l dVM, dl = sum dVM (v1 - v)
+                   (scalar-grad (g :vlamb li) (da :vm li) (a :qkv 0 (* 2 c)) (a :qkv li (* 2 c)) (* 3 c))
+                   (g2-1d gpu e "ng_vmix_bwd" (* n c) (list c (* 3 c) (if last 0 1))
+                          (list (da :qkv li (* 2 c)) (da :v1acc) (da :vm li) (p :vlamb li)))
+                   (when (zerop li)
+                     (g2-1d gpu e "ng_add_rows" (* n c) (list c (* 3 c)) (list (da :qkv 0 (* 2 c)) (da :v1acc))))
                    (dispatch gpu e "g2_attn_softmax_bwd" (list (* b nh tt) tt)
                              (list (da :pre li) (da :att li) (a :att li)) (* b nh tt) 32)
                    (g2-gemm gpu e nil nil tt hs tt (da :pre li) tt (a :qk li c) (* 2 c) (da :qk li) (* 2 c)
@@ -203,10 +243,24 @@
                    (dispatch gpu e "ng_qk_bwd" (list n tt c nh (ngpt-rope-base m))
                              (list (da :qkv li) (da :qk li) (a :qkv li) (a :qkr li)) (list n nh 2) 32)
                    (linear-back (da :qkv li) (cons (da :ln1 li) (a :ln1 li)) (p :qkvw li) (g :qkvw li) c (* 3 c))
-                   (rms-back dxin (da :ln1 li) xin (a :r1 li) t)))
+                   (rms-back (da :xm li) (da :ln1 li) (a :xm li) (a :r1 li) t)
+                   ;; the x0 mix: d xin = l0 dxm, dx0 += l1 dxm; dl0 = sum dxm xin, dl1 = sum dxm x0
+                   (scalar-grad (g :lambdas li) (da :xm li) xin nil c)
+                   (scalar-grad (g :lambdas li 1) (da :xm li) (a :x0) nil c)
+                   (let ((dprev (if (zerop li) (da :x0acc) (da :res3 (1- li)))))
+                     ;; layer 0's input is x0 itself: both its parts add into x0's
+                     (g2-1d gpu e "ng_mix_bwd" (* n c) (list (if (zerop li) 1 0) (if last 0 1))
+                            (list dprev (da :x0acc) (da :xm li) (p :lambdas li)))
+                     (when dec
+                       ;; xin = prev + w skip: prev's gradient is dxin, the skip's w dxin
+                       (let ((k (- enc 1 j)))
+                         (scalar-grad (g :skipw 0 (* 4 j)) dprev (a :res3 k) nil c)
+                         (g2-1d gpu e "ng_scaled" (* n c) '() (list (da :skip k) dprev (p :skipw 0 (* 4 j)))))))))
+        ;; x0 = rms(emb)
+        (rms-back (da :emb) (da :x0acc) (a :emb) (a :r0) nil)
         (unless accumulate
           (g2-1d gpu e "g2_zero" (lsize pl :wte) '() (list (g :wte))))
-        (dispatch gpu e "ng_embed_bwd" (list n c) (list (ngpt-inputs m) (g :wte) (da :x0))
+        (dispatch gpu e "ng_embed_bwd" (list n c) (list (ngpt-inputs m) (g :wte) (da :emb))
                   (ceiling c 256) 256)))))
 
 (defun ngpt-mean-loss (m)

@@ -2,9 +2,11 @@
 ;;;
 ;;;   sbcl --dynamic-space-size 4096 --non-interactive --load inspect/nanogpt-gradcheck.lisp
 ;;;
-;;; A tiny model (2 layers, 128 channels: 2 heads, a 256-token vocabulary)
-;;; with every weight random (the zero-initialized ones would hide most
-;;; gradients), in f32.  For each tensor, a random unit direction U in it:
+;;; A tiny model (2 layers, 128 channels: 2 heads, a 256-token vocabulary,
+;;; 160 positions: past one 64-row tile, not a multiple of it) with every
+;;; weight random (the zero-initialized ones would hide most gradients), in
+;;; f32.  The step is 4e-2 along a matrix's direction, 1e-2 along the scalars'
+;;; (their curvature is larger), the loss summed in double.  For each tensor, a random unit direction U in it:
 ;;; the gradient's component along U against (L(p + eU) - L(p - eU)) / 2e.
 
 (defvar cl-user::*system* "illatio/train")
@@ -12,12 +14,12 @@
 (in-package #:illatio)
 
 (let* ((*g2-precision* '((:head . "") (:attention . "") (:linear . "")))
-       (b 2) (tt 32) (v 256)
+       (b 2) (tt 160) (v 256)
        (m (make-nanogpt :l 2 :c 128 :v v :vp v :b b :tt tt :cap 30f0))
        (np (ngpt-n-params m)) (gauss (gaussian-filler 7))
        (p (f32vec np)) (x (make-array (* b tt) :element-type '(signed-byte 32)))
        (y (make-array (* b tt) :element-type '(signed-byte 32)))
-       (eps 4d-2) (allok t))
+       (allok t))
   (dotimes (i np) (setf (aref p i) (* 0.1f0 (funcall gauss))))
   (dotimes (i (* b tt)) (setf (aref x i) (random v) (aref y i) (random v)))
   (copy-to-gbuf (ngpt-pbuf m) p)
@@ -25,6 +27,7 @@
     (format t "loss ~,6F~%" loss)
     (dolist (name (layout-order (ngpt-params m)))
       (let* ((o (lof (ngpt-params m) name)) (n (lsize (ngpt-params m) name (ngpt-l m)))
+             (eps (if (member name *ngpt-scalars*) 1d-2 4d-2))
              (u (make-array n :element-type 'double-float)) (norm 0d0) (an 0d0))
         (dotimes (k n) (let ((r (coerce (funcall gauss) (quote double-float)))) (setf (aref u k) r) (incf norm (* r r))))
         (setf norm (sqrt norm))

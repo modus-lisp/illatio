@@ -238,3 +238,95 @@ kernel void ng_softcap_ce_fused(constant uint *a [[buffer(0)]], device const flo
     }
     if (tid == 0) losses[r] = -(ng_cap(x[y], cap) - gm - precise::log(S));
 }
+
+// --- record 11's shortcuts: learned scalars, read from the parameters -------
+
+// OUT = s[0] X + s[1] Y.  args: n
+kernel void ng_mix(constant uint *a [[buffer(0)]], device float *out [[buffer(1)]],
+                   device const float *x [[buffer(2)]], device const float *y [[buffer(3)]],
+                   device const float *s [[buffer(4)]], uint i [[thread_position_in_grid]]) {
+    if (i < a[0]) out[i] = s[0] * x[i] + s[1] * y[i];
+}
+
+// its gradient: DX (+)= s[0] D, DY (+)= s[1] D.  args: n, add-to-dx, add-to-dy
+kernel void ng_mix_bwd(constant uint *a [[buffer(0)]], device float *dx [[buffer(1)]],
+                       device float *dy [[buffer(2)]], device const float *d [[buffer(3)]],
+                       device const float *s [[buffer(4)]], uint i [[thread_position_in_grid]]) {
+    if (i >= a[0]) return;
+    const float g = d[i];
+    dx[i] = a[1] ? dx[i] + s[0] * g : s[0] * g;
+    dy[i] = a[2] ? dy[i] + s[1] * g : s[1] * g;
+}
+
+// OUT = X + s[0] Y (a U-net skip).  args: n
+kernel void ng_add_scaled(constant uint *a [[buffer(0)]], device float *out [[buffer(1)]],
+                          device const float *x [[buffer(2)]], device const float *y [[buffer(3)]],
+                          device const float *s [[buffer(4)]], uint i [[thread_position_in_grid]]) {
+    if (i < a[0]) out[i] = x[i] + s[0] * y[i];
+}
+
+// OUT = s[0] X.  args: n
+kernel void ng_scaled(constant uint *a [[buffer(0)]], device float *out [[buffer(1)]],
+                      device const float *x [[buffer(2)]], device const float *s [[buffer(3)]],
+                      uint i [[thread_position_in_grid]]) {
+    if (i < a[0]) out[i] = s[0] * x[i];
+}
+
+// The value residual: VM (n x C) = (1 - s) V + s V1, V and V1 rows LDV
+// apart (QKV's V).  args: n, C, ldv
+kernel void ng_vmix(constant uint *a [[buffer(0)]], device float *vm [[buffer(1)]],
+                    device const float *v [[buffer(2)]], device const float *v1 [[buffer(3)]],
+                    device const float *s [[buffer(4)]], uint i [[thread_position_in_grid]]) {
+    const uint C = a[1], ld = a[2];
+    if (i >= a[0] * C) return;
+    const uint k = (i / C) * ld + i % C;
+    vm[i] = (1.0f - s[0]) * v[k] + s[0] * v1[k];
+}
+
+// its gradient: DV (rows LDV apart) = (1 - s) D, DV1 (n x C) (+)= s D.  args: n, C, ldv, add
+kernel void ng_vmix_bwd(constant uint *a [[buffer(0)]], device float *dv [[buffer(1)]],
+                        device float *dv1 [[buffer(2)]], device const float *d [[buffer(3)]],
+                        device const float *s [[buffer(4)]], uint i [[thread_position_in_grid]]) {
+    const uint C = a[1], ld = a[2];
+    if (i >= a[0] * C) return;
+    const float g = d[i];
+    dv[(i / C) * ld + i % C] = (1.0f - s[0]) * g;
+    dv1[i] = a[3] ? dv1[i] + s[0] * g : s[0] * g;
+}
+
+// DST (rows LDD apart) += SRC (n x C).  args: n, C, ldd
+kernel void ng_add_rows(constant uint *a [[buffer(0)]], device float *dst [[buffer(1)]],
+                        device const float *src [[buffer(2)]], uint i [[thread_position_in_grid]]) {
+    const uint C = a[1];
+    if (i >= a[0] * C) return;
+    dst[(i / C) * a[2] + i % C] += src[i];
+}
+
+// A scalar's gradient, sum_i D[i] (X[i] - Y[i]) (no Y: X[i]), over n rows
+// of C, X and Y rows LDX apart: each threadgroup of 1024 a partial sum of
+// its stride, then NG_DOT_FINISH adds them in order into G[0] (or to it,
+// with ACC).  args: n, C, ldx, groups, has-y
+kernel void ng_dot_part(constant uint *a [[buffer(0)]], device const float *d [[buffer(1)]],
+                        device const float *x [[buffer(2)]], device const float *y [[buffer(3)]],
+                        device float *part [[buffer(4)]], threadgroup float *sh [[threadgroup(0)]],
+                        uint g [[threadgroup_position_in_grid]], ushort tid [[thread_index_in_threadgroup]],
+                        ushort sg [[simdgroup_index_in_threadgroup]], ushort l [[thread_index_in_simdgroup]]) {
+    const uint n = a[0] * a[1], C = a[1], ld = a[2], groups = a[3], hy = a[4];
+    float s = 0.0f;
+    for (uint i = g * 1024 + tid; i < n; i += groups * 1024) {
+        const uint k = (i / C) * ld + i % C;
+        s += d[i] * (hy ? x[k] - y[k] : x[k]);
+    }
+    s = simd_sum(s);
+    if (l == 0) sh[sg] = s;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (sg == 0) { s = simd_sum(sh[l]); if (l == 0) part[g] = s; }
+}
+
+kernel void ng_dot_finish(constant uint *a [[buffer(0)]], device const float *part [[buffer(1)]],
+                          device float *gr [[buffer(2)]], uint l [[thread_index_in_simdgroup]]) {
+    float s = 0.0f;
+    for (uint i = l; i < a[0]; i += 32) s += part[i];
+    s = simd_sum(s);
+    if (l == 0) gr[0] = a[1] ? gr[0] + s : s;
+}
