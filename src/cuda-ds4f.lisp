@@ -40,10 +40,12 @@
   (bufs '())                            ; scratch: key -> dbuf
   arena-host arena-dev (arena-at 0)     ; small per-layer inputs, staged in pinned memory
   rb                                    ; pinned memory the router's logits come back to
-  host (host-bytes 0)                   ; the file, in pinned host memory
+  host (host-bytes 0)                   ; the experts, in pinned host memory (D4-HOST-EXPERTS)
   pool (n-slots 0) (slot-bytes 0) (gate-bytes 0)
   slot-of owner used pin (tick 0) (free 0)
   tier                                  ; the second device's experts (D4TIER), or NIL
+  cpu                                   ; the CPUs' share (D4CPU), or NIL
+  fill-stream (fills '()) (events '())              ; copies into the pool not yet done: (slot key event), oldest first; spare events
   (hits 0) (misses 0) (prefetched 0) (copied 0))
 
 (defvar *ds4f-cuda-tier-device* 1
@@ -92,30 +94,44 @@
                                              sb-sys:system-area-pointer sb-alien:unsigned-long))
    dst src bytes))
 
-(defun d4-host-copy (m)
-  "(values sap bytes): the whole of DS4F M's file in host memory, read by
-   the model's threads in 64 MB pieces, then pinned."
-  (let* ((path (namestring (truename (gguf-path (ds4f-gguf m)))))
-         (bytes (with-open-file (s path :element-type '(unsigned-byte 8)) (file-length s)))
-         (span (* 2097152 (ceiling bytes 2097152)))
-         (base (%mmap-anon span)) (sap (sb-sys:int-sap base))
-         (fd (or (sb-unix:unix-open path sb-unix:o_rdonly 0) (error "cannot open ~A" path)))
-         (piece (* 64 1024 1024)) (t0 (get-internal-real-time)))
+(defun d4-open (m)
+  (let ((path (namestring (truename (gguf-path (ds4f-gguf m))))))
+    (or (sb-unix:unix-open path sb-unix:o_rdonly 0) (error "cannot open ~A" path))))
+
+(defun d4-host-experts (m slot-bytes gate-bytes)
+  "Every routed expert in host memory, pinned: expert E of layer LI in slot
+   LI*N-EXPERT+E (SLOT-BYTES each) as a device slot holds it -- gate, up,
+   then down -- so a copy into the pool is one DMA.  Read by the model's
+   threads, an expert's tensor a read."
+  (let* ((ne (ds4f-n-expert m)) (keys (* (ds4f-n-layer m) ne))
+         (span (* 2097152 (ceiling (* keys slot-bytes) 2097152)))
+         (base (%mmap-anon span)) (sap (sb-sys:int-sap base)) (fd (d4-open m))
+         (t0 (get-internal-real-time)))
     ;; huge pages: fewer for the kernel to walk, and for the driver to pin
     (sb-alien:alien-funcall (sb-alien:extern-alien "madvise" (function sb-alien:int sb-alien:unsigned-long
                                                                        sb-alien:unsigned-long sb-alien:int))
                             base span 14)  ; MADV_HUGEPAGE
     (unwind-protect
-         (parallel-for (k (ceiling bytes piece) (ds4f-pool m))
-           (let ((o (* k piece)))
-             (d4-pread fd (sb-sys:sap+ sap o) o (min piece (- bytes o)))))
+         (parallel-for (k (* 3 keys) (ds4f-pool m))
+           (multiple-value-bind (key part) (floor k 3)
+             (multiple-value-bind (li e) (floor key ne)
+               (destructuring-bind (off rb rows cols) (ecase part
+                                                        (0 (dl-gate-exps (svref (ds4f-layers m) li)))
+                                                        (1 (dl-up-exps (svref (ds4f-layers m) li)))
+                                                        (2 (dl-down-exps (svref (ds4f-layers m) li))))
+                 (declare (ignore cols))
+                 (d4-pread fd (sb-sys:sap+ sap (+ (* key slot-bytes) (* part gate-bytes)))
+                           (+ off (* e rows rb)) (* rows rb))))))
       (sb-unix:unix-close fd))
     (let ((t1 (get-internal-real-time)))
       (cuda-host-register sap span)
-      (format *error-output* "illatio: ~,1F GB read in ~,1Fs, pinned in ~,1Fs~%" (/ bytes 1d9)
+      (format *error-output* "illatio: the experts (~,1F GB) read in ~,1Fs, pinned in ~,1Fs~%" (/ span 1d9)
               (/ (- t1 t0) internal-time-units-per-second)
               (/ (- (get-internal-real-time) t1) internal-time-units-per-second)))
-    (values sap bytes)))
+    (values sap span)))
+
+(defun d4-expert-sap (m st li e)
+  (sb-sys:sap+ (dk-host st) (* (+ (* li (ds4f-n-expert m)) e) (dk-slot-bytes st))))
 
 ;;; --- the device's weights ------------------------------------------------------------
 
@@ -135,7 +151,18 @@
 
 (defun d4-upload-weights (m st)
   "The Q8_0 tensors repacked on the device, the F16 ones as they are."
-  (let* ((g (ds4f-gguf m)) (dev (dk-dev st)) (host (dk-host st)) (raw nil))
+  (let* ((g (ds4f-gguf m)) (dev (dk-dev st)) (raw nil) (fd (d4-open m))
+         (most (loop for name in (append (d4-tensor-names +ds4f-cuda-q8-tensors+ m '("output.weight"))
+                                         (d4-tensor-names +ds4f-cuda-f16-tensors+ m '("output_hc_fn.weight")))
+                     for ti = (gguf-tensor g name nil) when ti maximize (tensor-bytes ti)))
+         (stage (cuda-host-alloc most)))
+    (flet ((stage (ti)
+             ;; the tensor's bytes into the pinned staging buffer, in pieces across the threads
+             (let* ((bytes (tensor-bytes ti)) (off (+ (gguf-data-offset g) (tensor-info-offset ti)))
+                    (piece (* 16 1024 1024)))
+               (parallel-for (k (ceiling bytes piece) (ds4f-pool m))
+                 (let ((o (* k piece))) (d4-pread fd (sb-sys:sap+ stage o) (+ off o) (min piece (- bytes o)))))
+               stage)))
     (unwind-protect
          (progn
            (dolist (name (d4-tensor-names +ds4f-cuda-q8-tensors+ m '("output.weight")))
@@ -147,7 +174,7 @@
                  (cuda-free raw)
                  (setf raw (cuda-alloc dev bytes :zero nil)))
                (let ((qs (cuda-alloc dev (* rows cols) :zero nil)) (d (cuda-alloc dev (* 2 nb) :zero nil)))
-                 (cuda-upload raw (sb-sys:sap+ host (+ (gguf-data-offset g) (tensor-info-offset ti))) bytes)
+                 (cuda-upload raw (stage ti) bytes)
                  (launch dev "repack_q8" (ceiling nb 8) '(32 8) (list raw qs d (list :i64 nb)))
                  (setf (gethash name (dk-q8 st))
                        (%make-cmat :name name :type :q8_0 :rows rows :cols cols :qs qs :d d)))))
@@ -157,9 +184,11 @@
                  (assert (eq (tensor-info-type ti) :f16))
                  (let* ((dims (tensor-info-dims ti)) (bytes (tensor-bytes ti))
                         (b (cuda-alloc dev bytes :zero nil)))
-                   (cuda-upload b (sb-sys:sap+ host (+ (gguf-data-offset g) (tensor-info-offset ti))) bytes)
+                   (cuda-upload b (stage ti) bytes)
                    (setf (gethash name (dk-f16 st)) (list b (reduce #'* (rest dims)) (first dims))))))))
-      (cuda-free raw))))
+      (cuda-free raw)
+      (cuda-host-free stage)
+      (sb-unix:unix-close fd)))))
 
 (defun ds4f-cuda-state (m)
   "DS4F M's device state, made the first time: the file in pinned memory,
@@ -171,17 +200,21 @@
              (st (make-d4cuda :dev dev :slot-bytes (* 256 (ceiling (+ (* 2 gb) db) 256)) :gate-bytes gb)))
         (with-cuda
           (cuda-current dev)
-          (setf (dk-copy-stream st) (cuda-stream-create dev) (dk-event st) (cuda-event-create dev)
+          (setf (dk-copy-stream st) (cuda-stream-create dev) (dk-fill-stream st) (cuda-stream-create dev)
+                (dk-event st) (cuda-event-create dev)
                 (dk-arena-host st) (cuda-host-alloc (* 1024 1024)) (dk-arena-dev st) (cuda-alloc dev (* 1024 1024))
                 (dk-rb st) (cuda-host-alloc (* 64 1024)))
-          (multiple-value-bind (sap bytes) (d4-host-copy m)
+          (multiple-value-bind (sap bytes) (d4-host-experts m (dk-slot-bytes st) gb)
             (setf (dk-host st) sap (dk-host-bytes st) bytes))
           (d4-upload-weights m st)
           (d4-make-pool m st)
           (when (and *ds4f-cuda-tier-device* (> (cuda-device-count) *ds4f-cuda-tier-device*)
                      (/= *ds4f-cuda-tier-device* *ds4f-cuda-device*))
             (setf (dk-tier st) (d4-make-tier m st (open-cuda *ds4f-cuda-tier-device*)))
-            (cuda-current dev)))
+            (cuda-current dev))
+          #+x86-64
+          (when *ds4f-cpu-experts*
+            (setf (dk-cpu st) (d4-make-cpu m))))
         (setf (getf (ds4f-gpu-plist m) :cuda) st))))
 
 ;;; --- device copies of host vectors, scratch, the arena --------------------------------
@@ -284,35 +317,17 @@
     (when (plusp n)
       (dotimes (s n)
         (let* ((h (+ first s)) (li (aref +ds4f-hotlist+ (* 2 h))) (e (aref +ds4f-hotlist+ (1+ (* 2 h))))
-               (l (svref (ds4f-layers m) li)) (host (dk-host st)) (gb (dk-gate-bytes st)) (at (* s sb)))
+               (at (* s sb)))
           (setf (aref (dt-slot-of tr) (+ (* li (ds4f-n-expert m)) e)) s)
-          (destructuring-bind (goff grb grows gcols) (dl-gate-exps l)
-            (declare (ignore gcols))
-            (destructuring-bind (uoff urb urows ucols) (dl-up-exps l)
-              (declare (ignore urows ucols))
-              (destructuring-bind (doff drb drows dcols) (dl-down-exps l)
-                (declare (ignore dcols))
-                (cuda-copy-in (dt-pool tr) at (sb-sys:sap+ host (+ goff (* e grows grb))) gb stream)
-                (cuda-copy-in (dt-pool tr) (+ at gb) (sb-sys:sap+ host (+ uoff (* e grows urb))) gb stream)
-                (cuda-copy-in (dt-pool tr) (+ at (* 2 gb)) (sb-sys:sap+ host (+ doff (* e drows drb))) (* drows drb) stream))))))
+          (cuda-copy-in (dt-pool tr) at (d4-expert-sap m st li e) sb stream)))
       (cuda-stream-sync stream))
     (format *error-output* "illatio: and ~D more (~,1F GB) on ~A~%" n (/ (* n sb) 1d9) (cudev-name dev))
     tr))
 
-(defun d4-copy-expert (m st li e s)
+(defun d4-copy-expert (m st li e s &optional (stream (dk-copy-stream st)))
   "Queue layer LI's expert E's copy into slot S, on the copy stream."
-  (let* ((l (svref (ds4f-layers m) li)) (host (dk-host st)) (gb (dk-gate-bytes st))
-         (at (* s (dk-slot-bytes st))) (cs (dk-copy-stream st)))
-    (destructuring-bind (goff grb grows gcols) (dl-gate-exps l)
-      (declare (ignore gcols))
-      (destructuring-bind (uoff urb urows ucols) (dl-up-exps l)
-        (declare (ignore urows ucols))
-        (destructuring-bind (doff drb drows dcols) (dl-down-exps l)
-          (declare (ignore dcols))
-          (cuda-copy-in (dk-pool st) at (sb-sys:sap+ host (+ goff (* e grows grb))) gb cs)
-          (cuda-copy-in (dk-pool st) (+ at gb) (sb-sys:sap+ host (+ uoff (* e grows urb))) gb cs)
-          (cuda-copy-in (dk-pool st) (+ at (* 2 gb)) (sb-sys:sap+ host (+ doff (* e drows drb))) (* drows drb) cs)
-          (incf (dk-copied st)))))))
+  (cuda-copy-in (dk-pool st) (* s (dk-slot-bytes st)) (d4-expert-sap m st li e) (dk-slot-bytes st) stream)
+  (incf (dk-copied st)))
 
 (defun d4-victim (st)
   "A slot for a new expert: one never used, else the least recently used
@@ -337,9 +352,35 @@
     (d4-copy-expert m st li e s)
     s))
 
+(defun d4-fill (m st li e)
+  "Copy layer LI's expert E into a slot in the background: the slot is held
+   (pinned) and its expert unknown to lookups until the copy is done."
+  (let* ((key (+ (* li (ds4f-n-expert m)) e)) (s (d4-victim st))
+         (owner (dk-owner st)) (slot-of (dk-slot-of st))
+         (ev (or (pop (dk-events st)) (cuda-event-create (dk-dev st)))))
+    (declare (type (simple-array fixnum (*)) owner slot-of))
+    (when (>= (aref owner s) 0) (setf (aref slot-of (aref owner s)) -1))
+    (setf (aref owner s) -1 (aref (dk-used st) s) (dk-tick st))
+    (incf (aref (dk-pin st) s))
+    (d4-copy-expert m st li e s (dk-fill-stream st))
+    (cuda-event-record ev (dk-fill-stream st))
+    (setf (dk-fills st) (append (dk-fills st) (list (list s key ev))))))
+
+(defun d4-fills-done (st)
+  "The background copies that have finished: their slots known by their experts."
+  (loop while (and (dk-fills st) (cuda-event-done-p (third (first (dk-fills st)))))
+        do (destructuring-bind (s key ev) (pop (dk-fills st))
+             (setf (aref (dk-owner st) s) key (aref (dk-slot-of st) key) s)
+             (decf (aref (dk-pin st) s))
+             (push ev (dk-events st)))))
+
+(defun d4-filling-p (st key)
+  (find key (dk-fills st) :key #'second))
+
 (defstruct (d4plan (:conc-name dp-))
   a-slots a-idx                         ; the first device's experts: its slots, their places in SEL
-  b-slots b-idx)                        ; the second's
+  b-slots b-idx                         ; the second's
+  c-experts c-idx)                      ; the CPUs': the experts, their places
 
 (defun d4-plan (m st li sel prev)
   "Where layer LI's experts SEL are computed: the first device's slots
@@ -348,20 +389,32 @@
    the second's."
   (let* ((ne (ds4f-n-expert m)) (k (length sel)) (tr (dk-tier st))
          (slot-of (dk-slot-of st)) (used (dk-used st)) (pin (dk-pin st)) (tick (incf (dk-tick st)))
-         (as '()) (ai '()) (bs '()) (bi '()))
+         (as '()) (ai '()) (bs '()) (bi '()) (ce '()) (ci '()) (cpu (dk-cpu st)) (fills 0) (quota 0))
     (declare (type (simple-array fixnum (*)) slot-of used pin))
     (when prev (loop for s across (dp-a-slots prev) do (decf (aref pin s))))
+    (when cpu (d4-fills-done st))
+    (when cpu
+      ;; the CPUs' quota of this layer's misses
+      (let ((m (loop for i below k
+                     count (let ((key (+ (* li ne) (aref sel i))))
+                             (and (minusp (aref slot-of key)) (not (and tr (>= (aref (dt-slot-of tr) key) 0))))))))
+        (setf quota (if (eq *ds4f-cpu-max* :half) (floor m 2) (min *ds4f-cpu-max* m)))))
     (dotimes (i k)
       (let* ((key (+ (* li ne) (aref sel i))) (s (aref slot-of key))
              (s2 (if (and tr (minusp s)) (aref (dt-slot-of tr) key) -1)))
         (cond ((>= s 0) (setf (aref used s) tick) (incf (dk-hits st)) (push s as) (push i ai))
               ((>= s2 0) (incf (dt-hits tr)) (push s2 bs) (push i bi))
+              ((and cpu (< (length ce) quota))
+               (incf (dk-misses st)) (push (aref sel i) ce) (push i ci)
+               (when (and (< fills *ds4f-fill-max*) (not (d4-filling-p st key)))
+                 (incf fills) (d4-fill m st li (aref sel i))))
               (t (setf s (d4-claim m st li (aref sel i))) (incf (dk-misses st)) (push s as) (push i ai)))
         (when (>= s 0) (incf (aref pin s)))))
     (cuda-event-record (dk-event st) (dk-copy-stream st))
     (cuda-stream-wait (cudev-stream (dk-dev st)) (dk-event st))
     (flet ((v (l) (coerce (nreverse l) '(simple-array fixnum (*)))))
-      (make-d4plan :a-slots (v as) :a-idx (v ai) :b-slots (v bs) :b-idx (v bi)))))
+      (make-d4plan :a-slots (v as) :a-idx (v ai) :b-slots (v bs) :b-idx (v bi)
+                   :c-experts (v ce) :c-idx (v ci)))))
 
 (defun d4-tier-launch (m st l plan w)
   "The second device's share of a layer's experts, queued on it: the FFN
@@ -382,7 +435,7 @@
     (launch dev "d4_mv_iq2_xxs" (list (ceiling ff 8) 1 (* 2 k)) 64
             (list d ff (second (dl-gate-exps l)) (list :i64 0) 0 ff (cons in +dt-ptrs+) in (dt-gu tr)))
     (launch dev "d4_swiglu_w" (ceiling (* k ff) 256) 256
-            (list k ff (svref (ds4f-clamps m) li) (dt-gu tr) (cons (dt-gu tr) (* 4 k ff)) (cons in +dt-w+) (dt-mid tr)))
+            (list k ff (svref (ds4f-clamps m) li) (dt-gu tr) (cons (dt-gu tr) (* 4 k ff)) (cons in +dt-w+) (dt-mid tr) nil nil))
     (launch dev "d4_mv_q2_k" (list (ceiling d 8) 1 k) 64
             (list ff d (second (dl-down-exps l)) (list :i64 (* 2 gb)) ff d (cons in +dt-ptrs+) (dt-mid tr) (dt-down tr)))
     (cuda-copy-out (dt-host-out tr) (dt-down tr) 0 (* 4 k d))
@@ -422,10 +475,128 @@
                           (setf (aref logits best) most-negative-single-float)
                           best))))))
 
+;;; --- the CPUs' experts ----------------------------------------------------------------
+;;; What neither device holds is computed where it lies: host memory, by the
+;;; CPUs (avx2.lisp's row dots), while the devices compute theirs -- an
+;;; expert is 7 MB, about 350 us over the bus and 80 us across the cores.
+;;; A thread a physical core (the process's own: a container may have
+;;; fewer than the machine), each held to it.
+
+(defvar *ds4f-cpu-experts* nil
+  "Whether the experts neither device holds are computed by the CPUs (else
+   they are copied into the first device's pool, then computed there).")
+
+(defvar *ds4f-cpu-max* :half
+  "At most this many of a layer's missing experts are computed by the CPUs;
+   the rest are copied in and computed on the first device, the two at once.
+   Either way a missing expert is copied into the pool for next time, in the
+   background (*DS4F-FILL-MAX* a layer at most).")
+
+(defvar *ds4f-fill-max* 4 "Background copies into the pool queued a layer, at most.")
+
+(defvar *ds4f-cpu-threads* nil "The CPUs' threads for the experts; NIL: a physical core each.")
+
+(defstruct (d4cpu (:conc-name dc-))
+  pool x xq g u mid midq out)          ; OUT: pinned, the down rows for the device
+
+(defun allowed-cpus ()
+  "The logical CPUs this process may run on (sched_getaffinity)."
+  (let ((mask (make-array 128 :element-type '(unsigned-byte 8) :initial-element 0)))
+    (sb-sys:with-pinned-objects (mask)
+      (sb-alien:alien-funcall (sb-alien:extern-alien "sched_getaffinity" (function sb-alien:int sb-alien:int sb-alien:unsigned-long
+                                                                                   sb-sys:system-area-pointer))
+                              0 128 (sb-sys:vector-sap mask)))
+    (loop for c below 1024 when (logbitp (mod c 8) (aref mask (floor c 8))) collect c)))
+
+(defun physical-cpus ()
+  "One allowed logical CPU for each physical core with any allowed."
+  (let ((seen (make-hash-table :test 'equal)) (out '()))
+    (dolist (c (allowed-cpus) (nreverse out))
+      (let ((key (ignore-errors
+                  (flet ((rd (f) (with-open-file (s (format nil "/sys/devices/system/cpu/cpu~D/topology/~A" c f))
+                                   (parse-integer (read-line s)))))
+                    (cons (rd "physical_package_id") (rd "core_id"))))))
+        (unless (and key (gethash key seen))
+          (when key (setf (gethash key seen) t))
+          (push c out))))))
+
+(defun pin-thread-to (cpu)
+  (let ((mask (make-array 128 :element-type '(unsigned-byte 8) :initial-element 0)))
+    (setf (ldb (byte 1 (mod cpu 8)) (aref mask (floor cpu 8))) 1)
+    (sb-sys:with-pinned-objects (mask)
+      (sb-alien:alien-funcall (sb-alien:extern-alien "sched_setaffinity" (function sb-alien:int sb-alien:int sb-alien:unsigned-long
+                                                                                   sb-sys:system-area-pointer))
+                              0 128 (sb-sys:vector-sap mask)))))
+
+(defun d4-make-cpu (m)
+  (let* ((cpus (physical-cpus)) (n (or *ds4f-cpu-threads* (length cpus)))
+         (pool (make-pool n)) (k (ds4f-n-used m)) (d (ds4f-d m)) (ff (ds4f-ff-exp m)))
+    ;; each participant held to its own core (the caller, participant 0, to the first)
+    (pool-run pool (lambda (ti tn) (declare (ignore tn)) (pin-thread-to (nth (mod ti (length cpus)) cpus))))
+    (format *error-output* "illatio: and the rest on ~D CPU threads, a core each~%" n)
+    (make-d4cpu :pool pool :x (f32vec d) :xq (make-q8kvec d) :g (f32vec (* k ff)) :u (f32vec (* k ff))
+                :mid (f32vec (* k ff)) :midq (make-q8kvec (* k ff)) :out (cuda-host-alloc (* 4 k d)))))
+
+#+x86-64
+(defun d4-cpu-experts (m st l li plan w)
+  "PLAN's CPU experts of layer LI on its FFN input (come back in RB): their
+   down rows, weighted, into the pinned OUT, an expert after another."
+  (declare (ignore li))
+  (let* ((cpu (dk-cpu st)) (pool (dc-pool cpu)) (d (ds4f-d m)) (ff (ds4f-ff-exp m))
+         (experts (dp-c-experts plan)) (k (length experts)) (li (position l (ds4f-layers m)))
+         (clamp (svref (ds4f-clamps m) li)) (gb (dk-gate-bytes st))
+         (x (dc-x cpu)) (xq (dc-xq cpu)) (g (dc-g cpu)) (u (dc-u cpu)) (mid (dc-mid cpu)) (midq (dc-midq cpu))
+         (out (dc-out cpu)) (grb (second (dl-gate-exps l))) (drb (second (dl-down-exps l)))
+         (gnb (floor d 256)) (dnb (floor ff 256))
+         (saps (map 'vector (lambda (e) (d4-expert-sap m st li e)) experts)))
+    (declare (type f32vec x g u mid) (type fixnum d ff k gb grb drb gnb dnb))
+    (let ((rb (sb-sys:sap+ (dk-rb st) 4096)))
+      (dotimes (i d) (setf (aref x i) (sb-sys:sap-ref-single rb (* 4 i)))))
+    (quantize-q8k! x xq)
+    ;; gate and up: a row of one or the other a task
+    (let ((qs (q8kvec-qs xq)) (yd (q8kvec-d xq)))
+      (pool-run pool
+                (lambda (ti tn)
+                  (multiple-value-bind (s e) (share (* 2 k ff) ti tn)
+                    (loop for task from s below e
+                          do (multiple-value-bind (j rest) (floor task (* 2 ff))
+                               (multiple-value-bind (which r) (floor rest ff)
+                                 (let ((v (iq2xxs-dot-avx2 (sb-sys:sap+ (svref saps j) (+ (* which gb) (* r grb)))
+                                                           gnb qs 0 yd)))
+                                   (if (zerop which)
+                                       (setf (aref g (+ (* j ff) r)) v)
+                                       (setf (aref u (+ (* j ff) r)) v))))))))))
+    ;; silu(clamp(g)) * clamp(u) * weight, each expert's quantized
+    (dotimes (j k)
+      (let ((wt (aref w (aref (dp-c-idx plan) j))))
+        (dotimes (r ff)
+          (let ((gi (aref g (+ (* j ff) r))) (ui (aref u (+ (* j ff) r))))
+            (when (> clamp 1f-6) (setf gi (min gi clamp) ui (max (- clamp) (min ui clamp))))
+            (setf (aref mid (+ (* j ff) r)) (* (* (d4-silu gi) ui) wt)))))
+      (quantize-q8k! mid midq (* j ff) ff (* j ff)))
+    ;; down: a row of an expert a task, into OUT
+    (let ((qs (q8kvec-qs midq)) (yd (q8kvec-d midq)) (bs (q8kvec-bsums midq)))
+      (pool-run pool
+                (lambda (ti tn)
+                  (multiple-value-bind (s e) (share (* k d) ti tn)
+                    (loop for task from s below e
+                          do (multiple-value-bind (j r) (floor task d)
+                               (setf (sb-sys:sap-ref-single out (* 4 task))
+                                     (q2k-dot-avx2 (sb-sys:sap+ (svref saps j) (+ (* 2 gb) (* r drb)))
+                                                   dnb qs (* j ff) yd bs))))))))))
+
 ;;; --- the ops ------------------------------------------------------------------------
 
-(defun dk-rms (dev x w out n groups eps)
-  (launch dev "d4_rms" groups (min 1024 n) (list n eps (if w 1 0) x (or w x) out)))
+(defun dk-rms (dev x w out n groups eps &optional q)
+  "RMS norms of GROUPS rows of N at X into OUT (times W), quantized into Q
+   ((xq . xs), a single row) too when Q."
+  (assert (or (null q) (and (= groups 1) (zerop (mod n 32)))))
+  (launch dev "d4_rms" groups (min 1024 n) (list n eps (if w 1 0) x (or w x) out (car q) (cdr q))))
+
+(defun dk-qbuf (st key n)
+  "Quantized activations KEY for N values: (xq . xs)."
+  (cons (dbuf-of st (intern (format nil "~A-Q" key) :keyword) n)
+        (dbuf-of st (intern (format nil "~A-S" key) :keyword) (* 4 (ceiling n 32)))))
 
 (defun dk-rope (dev x cs nh hd nrot)
   (launch dev "d4_rope" (ceiling (* nh (floor nrot 2)) 256) 256 (list nh hd nrot 1 x cs)))
@@ -434,14 +605,15 @@
   (destructuring-bind (w rows cols) (or (gethash name (dk-f16 st)) (error "no F16 tensor ~A" name))
     (launch (dk-dev st) "d4_mv_f16" (ceiling rows 4) 256 (list cols rows w x y))))
 
-(defun dk-q8mv (st name x y &key group-rows)
-  "Y = W X for Q8_0 tensor NAME, X quantized first (ds4's Q8_0
-   activations); row r against X's group r/GROUP-ROWS when grouped."
+(defun dk-q8mv (st name x y &key group-rows q)
+  "Y = W X for Q8_0 tensor NAME, X quantized (ds4's Q8_0 activations):
+   first, unless Q has it already, (xq . xs); row r against X's group
+   r/GROUP-ROWS when grouped."
   (let* ((w (or (gethash name (dk-q8 st)) (error "no Q8_0 tensor ~A" name)))
          (dev (dk-dev st)) (rows (cmat-rows w)) (cols (cmat-cols w))
          (nx (if group-rows (* cols (floor rows group-rows)) cols))
-         (xq (dbuf-of st :xq nx)) (xs (dbuf-of st :xs (* 4 (floor nx 32)))))
-    (launch dev "d4_quant" (ceiling nx 256) 256 (list x xq xs (floor nx 32)))
+         (fresh (null q)) (q (or q (dk-qbuf st :x nx))) (xq (car q)) (xs (cdr q)))
+    (when fresh (launch dev "d4_quant" (ceiling nx 256) 256 (list x xq xs (floor nx 32))))
     (launch dev "d4_mvq8" (ceiling rows 4) 128 (list rows cols (or group-rows rows) (cmat-qs w) (cmat-d w) xq xs y))))
 
 (defun lname (li short) (format nil "blk.~D.~A" li short))
@@ -489,13 +661,14 @@
          (kv0 (dbuf-of st :kv0 (* 4 hd))) (heads (dbuf-of st :heads (* 4 nh hd)))
          (low (dbuf-of st :low (* 4 (ds4f-out-groups m) (ds4f-lora-o m))))
          (aout (dbuf-of st :aout (* 4 d)))
-         (cs (dk-cs m st pos li)) (ics (dk-cs m st pos li t)))
+         (cs (dk-cs m st pos li)) (ics (dk-cs m st pos li t))
+         (qnorm (dk-qbuf st :norm d)) (qqrn (dk-qbuf st :qrn lq)) (qheads (dk-qbuf st :heads (* nh hd))))
     (dk-hc-pre m st (lname li "hc_attn_fn.weight") (dl-hc-attn-scale l) (dl-hc-attn-base l) sa cur pca)
-    (dk-rms dev cur (dvec st (dl-attn-norm l)) norm d 1 eps)
-    (dk-q8mv st (lname li "attn_q_a.weight") norm qr)
-    (dk-q8mv st (lname li "attn_kv.weight") norm kv0)
-    (dk-rms dev qr (dvec st (dl-q-a-norm l)) qrn lq 1 eps)
-    (dk-q8mv st (lname li "attn_q_b.weight") qrn q)
+    (dk-rms dev cur (dvec st (dl-attn-norm l)) norm d 1 eps qnorm)
+    (dk-q8mv st (lname li "attn_q_a.weight") norm qr :q qnorm)
+    (dk-q8mv st (lname li "attn_kv.weight") norm kv0 :q qnorm)
+    (dk-rms dev qr (dvec st (dl-q-a-norm l)) qrn lq 1 eps qqrn)
+    (dk-q8mv st (lname li "attn_q_b.weight") qrn q :q qqrn)
     (dk-rms dev q nil q hd nh eps)
     (dk-rope dev q cs nh hd nrot)
     ;; the KV row into the ring (its counts kept on the CPU, as PUSH-RAW! keeps them)
@@ -533,8 +706,8 @@
                       (dc-n-raw c) ncomp (if indexed 0 1)
                       q (dvec st (dc-raw c)) kc idx (dvec st (dl-sinks l)) heads)
                 :shared (* 4 (+ (* 4 hd) (* 4 (+ (dc-n-raw c) ncomp)) 8)))))
-    (dk-rope dev heads ics nh hd nrot)
-    (dk-q8mv st (lname li "attn_output_a.weight") heads low :group-rows (ds4f-lora-o m))
+    (launch dev "d4_rope_q" nh hd (list hd nrot heads ics (car qheads) (cdr qheads)))
+    (dk-q8mv st (lname li "attn_output_a.weight") heads low :group-rows (ds4f-lora-o m) :q qheads)
     (dk-q8mv st (lname li "attn_output_b.weight") low aout)
     (dk-hc-post m st aout sa pca sb)))
 
@@ -547,17 +720,20 @@
          (pcf (dbuf-of st :pcf (* 4 32))) (logits (dbuf-of st :logits (* 4 2 ne)))
          (sg (dbuf-of st :sg (* 4 ff))) (su (dbuf-of st :su (* 4 ff)))
          (smid (dbuf-of st :smid (* 4 ff))) (sout (dbuf-of st :sout (* 4 d)))
-         (one (dk-put st (list 1f0) :type :f32)))
+         (one (dk-put st (list 1f0) :type :f32))
+         (qn2 (dk-qbuf st :norm2 d)) (qmid (dk-qbuf st :smid ff)))
+    (assert (zerop (mod ff 256)))
     (dk-hc-pre m st (lname li "hc_ffn_fn.weight") (dl-hc-ffn-scale l) (dl-hc-ffn-base l) sb cur pcf)
-    (dk-rms dev cur (dvec st (dl-ffn-norm l)) norm2 d 1 (ds4f-eps m))
+    (dk-rms dev cur (dvec st (dl-ffn-norm l)) norm2 d 1 (ds4f-eps m) qn2)
     (dk-mv16 st (lname li "ffn_gate_inp.weight") norm2 logits)
     (when (and (plusp *ds4f-prefetch-k*) (plusp *ds4f-prefetch-max*) (< (1+ li) (ds4f-n-layer m))
                (null (dl-tid2eid (svref (ds4f-layers m) (1+ li)))))
       (dk-mv16 st (lname (1+ li) "ffn_gate_inp.weight") norm2 (cons logits (* 4 ne))))
-    (dk-q8mv st (lname li "ffn_gate_shexp.weight") norm2 sg)
-    (dk-q8mv st (lname li "ffn_up_shexp.weight") norm2 su)
-    (launch dev "d4_swiglu_w" (ceiling ff 256) 256 (list 1 ff (svref (ds4f-clamps m) li) sg su one smid))
-    (dk-q8mv st (lname li "ffn_down_shexp.weight") smid sout)))
+    (dk-q8mv st (lname li "ffn_gate_shexp.weight") norm2 sg :q qn2)
+    (dk-q8mv st (lname li "ffn_up_shexp.weight") norm2 su :q qn2)
+    (launch dev "d4_swiglu_w" (ceiling ff 256) 256
+            (list 1 ff (svref (ds4f-clamps m) li) sg su one smid (car qmid) (cdr qmid)))
+    (dk-q8mv st (lname li "ffn_down_shexp.weight") smid sout :q qmid)))
 
 (defun dk-ffn-tail (m st l li plan w sb sa)
   "Layer LI's routed experts (PLAN's, weights W) on its FFN input, summed
@@ -565,7 +741,8 @@
    first device's experts' down rows first, then the second's (copied in
    when it is done), summed in the experts' order."
   (let* ((dev (dk-dev st)) (d (ds4f-d m)) (ff (ds4f-ff-exp m))
-         (slots (dp-a-slots plan)) (k1 (length slots)) (k2 (length (dp-b-slots plan))) (k (+ k1 k2))
+         (slots (dp-a-slots plan)) (k1 (length slots)) (k2 (length (dp-b-slots plan)))
+         (k3 (length (dp-c-experts plan))) (k (+ k1 k2 k3))
          (clamp (svref (ds4f-clamps m) li)) (sbytes (dk-slot-bytes st)) (gb (dk-gate-bytes st))
          (base (dbuf-ptr (dk-pool st)))
          (norm2 (dbuf-of st :norm2 (* 4 d)))
@@ -574,6 +751,7 @@
          (perm (let ((p (make-list k)))
                  (loop for i across (dp-a-idx plan) for j from 0 do (setf (nth i p) j))
                  (loop for i across (dp-b-idx plan) for j from k1 do (setf (nth i p) j))
+                 (loop for i across (dp-c-idx plan) for j from (+ k1 k2) do (setf (nth i p) j))
                  (dk-put st p :type :u32))))
     (when (plusp k1)
       (let ((ptrs (dk-put st (append (loop for s across slots collect (+ base (* s sbytes)))
@@ -582,9 +760,14 @@
             (bw (dk-put st (loop for i across (dp-a-idx plan) collect (aref w i)) :type :f32)))
         (launch dev "d4_mv_iq2_xxs" (list (ceiling ff 8) 1 (* 2 k1)) 64
                 (list d ff (second (dl-gate-exps l)) (list :i64 0) 0 ff ptrs norm2 bgu))
-        (launch dev "d4_swiglu_w" (ceiling (* k1 ff) 256) 256 (list k1 ff clamp bgu (cons bgu (* 4 k1 ff)) bw bm))
+        (launch dev "d4_swiglu_w" (ceiling (* k1 ff) 256) 256 (list k1 ff clamp bgu (cons bgu (* 4 k1 ff)) bw bm nil nil))
         (launch dev "d4_mv_q2_k" (list (ceiling d 8) 1 k1) 64
                 (list ff d (second (dl-down-exps l)) (list :i64 (* 2 gb)) ff d ptrs bm bd))))
+    (when (plusp k2) (d4-tier-launch m st l plan w))
+    ;; the CPUs' experts while the devices compute theirs
+    (when (plusp k3)
+      (d4-cpu-experts m st l li plan w)
+      (cuda-copy-in bd (* 4 (+ k1 k2) d) (dc-out (dk-cpu st)) (* 4 k3 d)))
     (when (plusp k2)
       (let ((tr (dk-tier st)))
         (cuda-stream-wait (cudev-stream dev) (dt-event tr))
@@ -602,8 +785,9 @@
     (dk-mv16 st "output_hc_fn.weight" flat pre)
     (launch dev "d4_head_mix" (ceiling d 256) 256
             (list d n (ds4f-hc-eps m) pre (dvec st (ds4f-out-hc-scale m)) (dvec st (ds4f-out-hc-base m)) streams embd))
-    (dk-rms dev embd (dvec st (ds4f-output-norm m)) norm d 1 eps)
-    (dk-q8mv st "output.weight" norm out)
+    (let ((q (dk-qbuf st :hnorm d)))
+      (dk-rms dev embd (dvec st (ds4f-output-norm m)) norm d 1 eps q)
+      (dk-q8mv st "output.weight" norm out :q q))
     out))
 
 ;;; --- a token ---------------------------------------------------------------------------
@@ -614,7 +798,7 @@
          (d (ds4f-d m)) (n (ds4f-n-hc m)) (hcd (* n d)) (pos (d4ctx-pos ctx)) (wf (ds4f-file m))
          (ne (ds4f-n-expert m)) (nl (ds4f-n-layer m)) (rb (dk-rb st))
          (sa (dbuf-of st :sa (* 4 hcd))) (sb (dbuf-of st :sb (* 4 hcd)))
-         (lg (f32vec ne)) (pl (f32vec ne)) (pending nil) (prev nil))
+         (lg (f32vec ne)) (pl (f32vec ne)) (prev nil))
     (declare (type u8vec wf))
     (with-cuda
       (cuda-current dev)
@@ -626,26 +810,24 @@
         (cuda-upload-vector sa e))
       (dotimes (li nl)
         (let ((l (svref (ds4f-layers m) li)) (c (svref (d4ctx-caches ctx) li)))
-          (dk-arena-reset st)
-          (when pending (apply #'dk-ffn-tail m st (append pending (list sb sa))))
           (dk-attention m st l li c pos sa sb)
           (dk-ffn-head m st l li sb)
           ;; the routing, on the CPU
           (cuda-copy-out rb (dbuf-of st :logits 0) 0 (* 4 2 ne))
-          (when (dk-tier st) (cuda-copy-out (sb-sys:sap+ rb 4096) (dbuf-of st :norm2 0) 0 (* 4 d)))
+          (when (or (dk-tier st) (dk-cpu st)) (cuda-copy-out (sb-sys:sap+ rb 4096) (dbuf-of st :norm2 0) 0 (* 4 d)))
           (cuda-sync dev)
+          ;; nothing queued is left to read the arena's staging
+          (dk-arena-reset st)
           (dotimes (i ne)
             (setf (aref lg i) (sb-sys:sap-ref-single rb (* 4 i))
                   (aref pl i) (sb-sys:sap-ref-single rb (* 4 (+ ne i)))))
           (multiple-value-bind (sel w) (d4-route m l li nil token lg)
             (when *ds4f-route-trace* (format *ds4f-route-trace* "~D~{ ~D~}~%" li (coerce sel 'list)))
             (let ((plan (d4-plan m st li sel prev)))
-              (when (plusp (length (dp-b-slots plan))) (d4-tier-launch m st l plan w))
+              (dk-ffn-tail m st l li plan w sb sa)
               (when (and (plusp *ds4f-prefetch-k*) (plusp *ds4f-prefetch-max*) (< (1+ li) nl))
                 (d4-prefetch m st (1+ li) (d4-predict m (1+ li) token *ds4f-prefetch-k* pl)))
-              (setf pending (list l li plan w) prev plan)))))
-      (dk-arena-reset st)
-      (apply #'dk-ffn-tail m st (append pending (list sb sa)))
+              (setf prev plan)))))
       (when logits
         (let ((out (dk-head m st sa)) (v (d4ctx-logits ctx)))
           (sb-sys:with-pinned-objects (v)

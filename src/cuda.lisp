@@ -390,3 +390,12 @@
   (with-cuda
     (cu "cuMemcpyDtoHAsync_v2" (sb-sys:system-area-pointer sap) (sb-alien:unsigned-long (+ (dbuf-ptr b) offset))
         (sb-alien:unsigned-long bytes) (sb-sys:system-area-pointer (cudev-stream (dbuf-dev b))))))
+
+(defun cuda-event-done-p (event)
+  "Whether the work before EVENT's last record has finished."
+  (let ((r (with-cuda (sb-alien:alien-funcall
+                       (sb-alien:extern-alien "cuEventQuery" (function sb-alien:int sb-sys:system-area-pointer))
+                       event))))
+    (cond ((zerop r) t)
+          ((= r 600) nil)                   ; CUDA_ERROR_NOT_READY
+          (t (error "CUDA: cuEventQuery: ~A" (cuda-error-string r))))))

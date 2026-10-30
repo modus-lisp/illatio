@@ -84,9 +84,22 @@ extern "C" __global__ void d4_mv_f16(int ncols, int nrows, const u16* __restrict
 
 // --- norms, hyper-connections, RoPE ------------------------------------------------
 
+__device__ void d4_rope_row(float* v, int hd, int nrot, const float* cs, int tid);
+
+// A warp's 32 consecutive values V as a Q8_0 block (D4_QUANT's rounding).
+__device__ __forceinline__ void d4_quant_block(float v, i8* q, float* s, int lane) {
+  float amax = warp_max(fabsf(v));
+  float dd = amax / 127.0f;
+  float id = dd == 0.0f ? 0.0f : 1.0f / dd;
+  q[lane] = (i8)__float2int_rn(v * id);
+  if (lane == 0) *s = dd;
+}
+
 // RMS norm of row blockIdx.x (N wide) of X into OUT (times W when HAS_W):
-// in place when OUT is X.
-extern "C" __global__ void d4_rms(int n, float eps, int has_w, const float* x, const float* w, float* out) {
+// in place when OUT is X.  XQ, when not null, gets the row quantized too
+// (a single row, N a multiple of 32, a block of a multiple of 32 threads).
+extern "C" __global__ void d4_rms(int n, float eps, int has_w, const float* x, const float* w, float* out,
+                                  i8* xq, float* xs) {
   __shared__ float red[32];
   const float* xr = x + (long long)blockIdx.x * n;
   float* orow = out + (long long)blockIdx.x * n;
@@ -94,7 +107,26 @@ extern "C" __global__ void d4_rms(int n, float eps, int has_w, const float* x, c
   for (int i = threadIdx.x; i < n; i += blockDim.x) { float v = xr[i]; ss += v * v; }
   ss = d4_block_sum(ss, red);
   float scale = 1.f / sqrtf(ss / (float)n + eps);
-  for (int i = threadIdx.x; i < n; i += blockDim.x) orow[i] = has_w ? (xr[i] * scale) * w[i] : xr[i] * scale;
+  for (int i = threadIdx.x; i < n; i += blockDim.x) {
+    float v = has_w ? (xr[i] * scale) * w[i] : xr[i] * scale;
+    orow[i] = v;
+    if (xq) d4_quant_block(v, xq + (i & ~31), xs + (i >> 5), threadIdx.x & 31);
+  }
+}
+
+// RoPE on the last NROT dims of each of NH heads of HD at X (CS as D4_ROPE's),
+// then every head quantized into XQ / XS: a block a head, HD threads.
+extern "C" __global__ void d4_rope_q(int hd, int nrot, float* x, const float* cs, i8* xq, float* xs) {
+  __shared__ float v[1024];
+  int h = blockIdx.x, tid = threadIdx.x;
+  float* xh = x + (long long)h * hd;
+  v[tid] = xh[tid];
+  __syncthreads();
+  d4_rope_row(v, hd, nrot, cs, tid);
+  float y = v[tid];
+  xh[tid] = y;
+  long long i = (long long)h * hd + tid;
+  d4_quant_block(y, xq + (i & ~31LL), xs + (i >> 5), tid & 31);
 }
 
 // hc_split_sinkhorn_one and the pre-weighted sum: MIX (the N*(N+2) mixes)
@@ -518,14 +550,18 @@ extern "C" __global__ void d4_attend1(int hd, float scale, int rcap, int r0, int
 
 // --- the routed experts ------------------------------------------------------------
 
-// MID[r][j] = silu(clamp(G)) * clamp(U) * W[r], each routed row r of FF values.
+// MID[r][j] = silu(clamp(G)) * clamp(U) * W[r], each routed row r of FF
+// values; quantized into XQ / XS too when XQ isn't null (N * FF a multiple
+// of the block, 256).
 extern "C" __global__ void d4_swiglu_w(int n, int ff, float clamp, const float* g, const float* u,
-                                       const float* w, float* mid) {
+                                       const float* w, float* mid, i8* xq, float* xs) {
   int i = blockIdx.x * blockDim.x + threadIdx.x;
   if (i >= n * ff) return;
   float gv = g[i], uv = u[i];
   if (clamp > 1e-6f) { gv = fminf(gv, clamp); uv = fminf(fmaxf(uv, -clamp), clamp); }
-  mid[i] = (gv * d4_sigmoid(gv)) * uv * w[i / ff];
+  float v = (gv * d4_sigmoid(gv)) * uv * w[i / ff];
+  mid[i] = v;
+  if (xq) d4_quant_block(v, xq + (i & ~31), xs + (i >> 5), threadIdx.x & 31);
 }
 
 __constant__ unsigned long long d4_iq2xxs_grid[256] = {
