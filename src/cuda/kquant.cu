@@ -310,8 +310,10 @@ __device__ __forceinline__ void mma_s8_k16(int* c, int a0, int a1, int b0) {
 #endif
 }
 
-extern "C" __global__ void __launch_bounds__(256)
-mm_k_mma(int type, const u8* __restrict__ w, const i8* __restrict__ xq, const float* __restrict__ xs,
+// The format is a template parameter, so each instance keeps only its own
+// format's registers and branches: MM_Q4K_MMA, MM_Q5K_MMA, MM_Q6K_MMA.
+template <int type>
+__device__ __forceinline__ void mm_k_mma_body(const u8* __restrict__ w, const i8* __restrict__ xq, const float* __restrict__ xs,
          const int* __restrict__ xsum, float* __restrict__ y, const float* __restrict__ bias,
          int rows, int cols, int n, int acc) {
 #if __CUDA_ARCH__ >= 800
@@ -452,3 +454,13 @@ mm_k_mma(int type, const u8* __restrict__ w, const i8* __restrict__ xq, const fl
       }
 #endif
 }
+
+extern "C" __global__ void __launch_bounds__(256)
+mm_q4k_mma(const u8* w, const i8* xq, const float* xs, const int* xsum, float* y, const float* bias,
+           int rows, int cols, int n, int acc) { mm_k_mma_body<0>(w, xq, xs, xsum, y, bias, rows, cols, n, acc); }
+extern "C" __global__ void __launch_bounds__(256)
+mm_q5k_mma(const u8* w, const i8* xq, const float* xs, const int* xsum, float* y, const float* bias,
+           int rows, int cols, int n, int acc) { mm_k_mma_body<1>(w, xq, xs, xsum, y, bias, rows, cols, n, acc); }
+extern "C" __global__ void __launch_bounds__(256)
+mm_q6k_mma(const u8* w, const i8* xq, const float* xs, const int* xsum, float* y, const float* bias,
+           int rows, int cols, int n, int acc) { mm_k_mma_body<2>(w, xq, xs, xsum, y, bias, rows, cols, n, acc); }

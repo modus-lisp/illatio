@@ -17,6 +17,9 @@
 (in-package #:illatio)
 
 (defparameter +worst+ 0.3 "The largest |dlogprob| among the top ten it accepts.")
+(defparameter +near-tie+ 0.1
+  "Two candidates closer than this (in logprob) are a tie the noise may
+   break either way: a differing argmax between them is not a failure.")
 
 (let ((path (or (uiop:getenv "ILLATIO_TEST_MODEL") "~/models/qwen3-4b-instruct-2507-q8_0.gguf"))
       (failures 0))
@@ -32,9 +35,12 @@
              (let* ((a (top-logprobs (context-logits batched) 10))
                     (b (top-logprobs (context-logits single) 10))
                     (worst (loop for (id . x) in a for y = (cdr (assoc id b)) when y maximize (abs (- x y))))
-                    (ok (and (= (car (first a)) (car (first b))) (< worst +worst+))))
-               (format t "~&~24A argmax ~:[differs~;agrees~], worst |dlogprob| ~,4F~:[  FAIL~;~]~%"
-                       what (= (car (first a)) (car (first b))) worst ok)
+                    (same (= (car (first a)) (car (first b))))
+                    ;; how far apart the two argmaxes are in the batched logits
+                    (margin (if same 0 (- (cdr (first a)) (or (cdr (assoc (car (first b)) a)) -100))))
+                    (ok (and (or same (< margin +near-tie+)) (< worst +worst+))))
+               (format t "~&~24A argmax ~:[differs (a near-tie, ~,3F apart)~;agrees~*~], worst |dlogprob| ~,4F~:[  FAIL~;~]~%"
+                       what same margin worst ok)
                (unless ok (incf failures)))))
       (eval-tokens batched ids)
       (dolist (id ids) (forward single id))

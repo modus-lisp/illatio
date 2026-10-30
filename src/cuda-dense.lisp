@@ -217,8 +217,9 @@
                (launch dev "mv_k" (ceiling rows 4) 128
                        (list (kquant-code (cmat-type w)) (cmat-qs w) xq xs xsum y bias rows cols (if acc 1 0)))
                (if (>= (cudev-arch dev) 80)
-                   (launch dev "mm_k_mma" (list (ceiling n 64) (ceiling rows 128)) 256
-                           (list (kquant-code (cmat-type w)) (cmat-qs w) xq xs xsum y bias rows cols n (if acc 1 0)))
+                   (launch dev (ecase (cmat-type w) (:q4_k "mm_q4k_mma") (:q5_k "mm_q5k_mma") (:q6_k "mm_q6k_mma"))
+                           (list (ceiling n 64) (ceiling rows 128)) 256
+                           (list (cmat-qs w) xq xs xsum y bias rows cols n (if acc 1 0)))
                    (launch dev "mm_k" (list (ceiling n 64) (ceiling rows 64)) 256
                            (list (kquant-code (cmat-type w)) (cmat-qs w) xq xs xsum y bias rows cols n (if acc 1 0))))))
           ((= n 1)
