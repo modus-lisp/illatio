@@ -8,8 +8,9 @@
   from ds4f -- 40 layers of 5120, 384 experts, engram (hashed n-gram)
   embeddings at layers 1 and 14, KV and indexer rows shared across layers
   (`kv_source_layer_ids`, `index_source_layer_ids`), candidate blocks.
-  `/mnt/ollama/DeepSeek-V4.1-Flash-Q2.gguf` (60 GB).  Needs a reference to
-  port from (ds4f had ds4).
+  `/mnt/ollama/DeepSeek-V4.1-Flash-Q2.gguf` (60 GB).  ds4 runs it -- the
+  reference to port from, as for ds4f (`ds4_deepseek41_*.h`, `ds4_engram.c`,
+  and a CUDA path, `ds4_deepseek41_cuda.cuh`).
 
 ## DS4F on CUDA
 

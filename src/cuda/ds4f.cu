@@ -644,11 +644,38 @@ __constant__ unsigned char d4_ksigns_iq2xs[128] = {
 #define D4_MV_NSG 2                     // warps a block
 #define D4_MV_NR0 4                     // rows a warp
 
+// A missed expert read through: when SRCS[z] (its rows where they lie in
+// pinned host memory, mapped) is set, the block's rows come over the bus
+// into the slot at PTRS[z] first -- 16 bytes a thread, four in flight --
+// and are computed from there.  A block's rows are its own (no other block
+// reads them in this launch), so its read-only loads after the fence see
+// them.  Uniform in the block.
+__device__ __forceinline__ void d4_read_through(const unsigned long long* srcs, const unsigned long long* ptrs,
+                                                int z, long long add, int nrows, int row_bytes) {
+  if (!srcs || !srcs[z]) return;
+  int r0 = blockIdx.x * D4_MV_NSG * D4_MV_NR0, nr = min(D4_MV_NSG * D4_MV_NR0, nrows - r0);
+  if (nr <= 0) return;
+  long long off = add + (long long)r0 * row_bytes;
+  const int4* src = (const int4*)(srcs[z] + off);
+  int4* dst = (int4*)(ptrs[z] + off);
+  int n = nr * row_bytes / 16, step = blockDim.x;
+  for (int i = threadIdx.x; i < n; i += 4 * step) {
+    int4 v[4];
+#pragma unroll
+    for (int j = 0; j < 4; ++j) if (i + j * step < n) v[j] = src[i + j * step];
+#pragma unroll
+    for (int j = 0; j < 4; ++j) if (i + j * step < n) dst[i + j * step] = v[j];
+  }
+  __threadfence_block();
+  __syncthreads();
+}
+
 // Y[z] = W[z] X[z] for each expert z (grid z): W[z]'s rows at PTRS[z] + ADD
-// (a device address: the expert's slot), X[z] at z*X_STRIDE, Y[z] at
+// (a device address: the expert's slot; read through from SRCS[z] first
+// when that is set), X[z] at z*X_STRIDE, Y[z] at
 // z*Y_STRIDE.  ggml's kernel_mul_mv_iq2_xxs_f32.  64 threads.
 extern "C" __global__ void d4_mv_iq2_xxs(int ncols, int nrows, int row_bytes, long long add, int x_stride, int y_stride,
-                                         const unsigned long long* __restrict__ ptrs,
+                                         const unsigned long long* __restrict__ ptrs, const unsigned long long* __restrict__ srcs,
                                          const float* __restrict__ src1, float* __restrict__ dst) {
   __shared__ unsigned long long svalues[256];
   __shared__ unsigned char ssigns[128];
@@ -656,6 +683,7 @@ extern "C" __global__ void d4_mv_iq2_xxs(int ncols, int nrows, int row_bytes, lo
   const int nb = ncols / D4_QK_K, nb32 = nb * (D4_QK_K / 32);
   const int first_row = (blockIdx.x * D4_MV_NSG + sgitg) * D4_MV_NR0;
   const int z = blockIdx.z;
+  d4_read_through(srcs, ptrs, z, add, nrows, row_bytes);
   const unsigned char* x = (const unsigned char*)(ptrs[z] + add) + (long long)first_row * row_bytes;
   const float* y = src1 + (long long)z * x_stride;
   {
@@ -710,12 +738,13 @@ extern "C" __global__ void d4_mv_iq2_xxs(int ncols, int nrows, int row_bytes, lo
 // The same for Q2_K: ggml's kernel_mul_mv_q2_K_f32.  A block: 16 scale
 // bytes, 64 of quants, then d and dmin (84 bytes).
 extern "C" __global__ void d4_mv_q2_k(int ncols, int nrows, int row_bytes, long long add, int x_stride, int y_stride,
-                                      const unsigned long long* __restrict__ ptrs,
+                                      const unsigned long long* __restrict__ ptrs, const unsigned long long* __restrict__ srcs,
                                       const float* __restrict__ src1, float* __restrict__ dst) {
   int tiisg = threadIdx.x & 31, sgitg = threadIdx.x >> 5;
   const int nb = ncols / D4_QK_K;
   const int first_row = (blockIdx.x * D4_MV_NSG + sgitg) * D4_MV_NR0;
   const int z = blockIdx.z;
+  d4_read_through(srcs, ptrs, z, add, nrows, row_bytes);
   const unsigned char* x = (const unsigned char*)(ptrs[z] + add) + (long long)first_row * row_bytes;
   const float* y = src1 + (long long)z * x_stride;
   float sumf[D4_MV_NR0] = {0.f, 0.f, 0.f, 0.f};

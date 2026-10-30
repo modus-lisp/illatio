@@ -332,10 +332,11 @@
 
 (defun cuda-host-register (sap bytes)
   "Pin BYTES at SAP (page-aligned host memory) for every context (PORTABLE),
-   so copies from it are DMA's, asynchronous."
+   so copies from it are DMA's, asynchronous, and map it (DEVICEMAP): a
+   kernel may read it where it lies, at the address SAP (unified addressing)."
   (with-cuda
     (cu "cuMemHostRegister_v2" (sb-sys:system-area-pointer sap) (sb-alien:unsigned-long bytes)
-        (sb-alien:unsigned 1)))            ; CU_MEMHOSTREGISTER_PORTABLE
+        (sb-alien:unsigned 3)))            ; CU_MEMHOSTREGISTER_PORTABLE | DEVICEMAP
   sap)
 
 (defun cuda-host-unregister (sap)
