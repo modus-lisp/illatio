@@ -82,32 +82,70 @@ extern "C" __global__ void quant_q8(const float* __restrict__ x, i8* __restrict_
 }
 
 // RMSNORM! of each of the N rows of X (D wide), weighted by W, then quantized:
-// a block a row.  The squares are summed in double; the scale is a float as
+// a block a row.  The CPU squares in float and sums in double; FP64 is slow
+// on these GPUs, so each thread keeps its sum as a float pair (TwoSum: the
+// rounding error carried in the second float, about 48 bits in all) and
+// only the threads' sums meet in double.  The scale is a float as
 // (/ 1 (sqrt (coerce (+ (/ sum n) eps) 'single-float))).  H gets the floats
 // when it isn't null.
-extern "C" __global__ void rmsnorm_q8(const float* __restrict__ x, const float* __restrict__ w,
-                                      float* __restrict__ h, i8* __restrict__ xq, float* __restrict__ xs,
-                                      int dim, float eps) {
-  __shared__ double part[32];
-  __shared__ float sc;
-  const float* xr = x + (long long)blockIdx.x * dim;
-  double acc = 0.0;
-  for (int i = threadIdx.x; i < dim; i += blockDim.x) { double v = xr[i]; acc += v * v; }
-  acc = warp_sum_d(acc);
+__device__ __forceinline__ void two_sum(float& hi, float& lo, float b) {
+  float s = hi + b, bb = s - hi;
+  lo += (hi - (s - bb)) + (b - bb);
+  hi = s;
+}
+
+// A row of X staged in shared memory (all of a thread's float4 loads in
+// flight at once: the norm is latency-bound, not bandwidth-bound), and its
+// scale.  DIM a multiple of 4, at most RMS_MAXD.
+#define RMS_MAXD 8192
+__device__ __forceinline__ float stage_row_scale(const float* __restrict__ xr, int dim, float eps,
+                                                 float* sxr, double* part, float* sc) {
+  float hi = 0.0f, lo = 0.0f;
+  int n4 = dim >> 2;
+  const float4* x4 = (const float4*)xr;
+  for (int i0 = threadIdx.x; i0 < n4; i0 += 4 * blockDim.x) {
+    float4 v[4];
+#pragma unroll
+    for (int u = 0; u < 4; u++) { int i = i0 + u * blockDim.x; v[u] = i < n4 ? x4[i] : make_float4(0, 0, 0, 0); }
+#pragma unroll
+    for (int u = 0; u < 4; u++) {
+      int i = i0 + u * blockDim.x;
+      if (i < n4) {
+        ((float4*)sxr)[i] = v[u];
+        two_sum(hi, lo, v[u].x * v[u].x); two_sum(hi, lo, v[u].y * v[u].y);
+        two_sum(hi, lo, v[u].z * v[u].z); two_sum(hi, lo, v[u].w * v[u].w);
+      }
+    }
+  }
+  double acc = warp_sum_d((double)hi + (double)lo);
   int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, nw = blockDim.x >> 5;
   if (lane == 0) part[warp] = acc;
   __syncthreads();
   if (warp == 0) {
     double v = lane < nw ? part[lane] : 0.0;
     v = warp_sum_d(v);
-    if (lane == 0) sc = 1.0f / sqrtf((float)(v / (double)dim + (double)eps));
+    if (lane == 0) *sc = 1.0f / sqrtf((float)(v / (double)dim + (double)eps));
   }
   __syncthreads();
-  float s = sc;
-  long long base = (long long)blockIdx.x * dim;
-  for (int b = warp; b < (dim >> 5); b += nw) {
+  return *sc;
+}
+
+// Grid (slices, rows): every block of a row works its scale out (a read of
+// the row from L2) and quantizes its slice of the row's 32-wide blocks, so
+// a single token's norm is not one block's serial work.
+extern "C" __global__ void rmsnorm_q8(const float* __restrict__ x, const float* __restrict__ w,
+                                      float* __restrict__ h, i8* __restrict__ xq, float* __restrict__ xs,
+                                      int dim, float eps) {
+  __shared__ double part[32];
+  __shared__ float sc;
+  __shared__ __align__(16) float sxr[RMS_MAXD];
+  const float* xr = x + (long long)blockIdx.y * dim;
+  float s = stage_row_scale(xr, dim, eps, sxr, part, &sc);
+  int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, nw = blockDim.x >> 5;
+  long long base = (long long)blockIdx.y * dim;
+  for (int b = blockIdx.x * nw + warp; b < (dim >> 5); b += gridDim.x * nw) {
     int i = b * 32 + lane;
-    float v = (xr[i] * s) * w[i];
+    float v = (sxr[i] * s) * __ldg(w + i);
     if (h) h[base + i] = v;
     quant_block(v, xq + base + b * 32, xs + (base >> 5) + b, lane);
   }
@@ -157,6 +195,27 @@ extern "C" __global__ void mv_q8(const i8* __restrict__ wq, const u16* __restric
     if (bias) v += bias[r];
     out[r] = acc ? out[r] + v : v;
   }
+}
+
+// Q, K and V's products in one launch: rows [0, R0) are W0's, the next R1
+// W1's, the rest W2's, each into its own output with its own bias.
+extern "C" __global__ void mv_q8_3(const i8* __restrict__ q0, const u16* __restrict__ d0,
+                                   const i8* __restrict__ q1, const u16* __restrict__ d1,
+                                   const i8* __restrict__ q2, const u16* __restrict__ d2,
+                                   const i8* __restrict__ xq, const float* __restrict__ xs,
+                                   float* __restrict__ o0, float* __restrict__ o1, float* __restrict__ o2,
+                                   const float* __restrict__ b0, const float* __restrict__ b1,
+                                   const float* __restrict__ b2,
+                                   int r0, int r1, int r2, int cols) {
+  long long r = (long long)blockIdx.x * (blockDim.x >> 5) + (threadIdx.x >> 5);
+  int lane = threadIdx.x & 31;
+  const i8* wq; const u16* wd; float* out; const float* bias;
+  if (r < r0) { wq = q0; wd = d0; out = o0; bias = b0; }
+  else if (r < r0 + r1) { r -= r0; wq = q1; wd = d1; out = o1; bias = b1; }
+  else if (r < r0 + r1 + r2) { r -= r0 + r1; wq = q2; wd = d2; out = o2; bias = b2; }
+  else return;
+  float v = row_dot_q8(wq, wd, r, cols, xq, xs, lane);
+  if (lane == 0) out[r] = v + (bias ? bias[r] : 0.0f);
 }
 
 // The FFN's two products and SWIGLU! at once: OUT[r] = silu(G[r]·x) * (U[r]·x).
@@ -413,6 +472,7 @@ attn_decode(const float* __restrict__ q, const float* __restrict__ kc,
 // The splits of each (token, head) merged into OUT: a block each, a thread
 // an element.
 extern "C" __global__ void attn_merge(const float* __restrict__ part, float* __restrict__ out,
+                                      i8* __restrict__ xq, float* __restrict__ xs,
                                       int nh, int hd, int pos0, int chunk, int nsplit) {
   int head = blockIdx.x, t = blockIdx.y, j = threadIdx.x;
   int n = pos0 + t + 1;
@@ -429,7 +489,13 @@ extern "C" __global__ void attn_merge(const float* __restrict__ part, float* __r
     l += p[1] * f;
     if (j < hd) acc += p[2 + j] * f;
   }
-  if (j < hd) out[(long long)t * nh * hd + head * hd + j] = acc / l;
+  float v = acc / l;
+  if (j < hd) out[(long long)t * nh * hd + head * hd + j] = v;
+  // and quantized, when XQ isn't null: a head is HD/32 whole blocks, a warp each
+  if (xq) {
+    long long o = (long long)t * nh * hd + head * hd;
+    quant_block(v, xq + o + (j & ~31), xs + ((o + j) >> 5), j & 31);
+  }
 }
 
 // --- prefill attention ----------------------------------------------------------

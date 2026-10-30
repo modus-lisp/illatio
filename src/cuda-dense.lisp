@@ -138,6 +138,11 @@
             (launch dev "mm_q8" (list (ceiling n 64) (ceiling rows 64)) 256
                     (list (cmat-qs w) (cmat-d w) xq xs y bias rows cols n (if acc 1 0)))))))
 
+(defun rmsnorm-q8 (dev x w xq xs d eps n)
+  "RMSNORM! of N rows of X (D wide) by W, quantized into XQ / XS.  A single
+   row is spread over a block per 256 of its elements."
+  (launch dev "rmsnorm_q8" (list (if (= n 1) (ceiling d 256) 1) n) 256 (list x w nil xq xs d eps)))
+
 (defun attn-prefill-shape (dev hd)
   "(VALUES queries-per-warp shared-bytes) for ATTN_PREFILL: as many queries
    a warp as the device's shared memory takes, up to 8."
@@ -180,10 +185,18 @@
         (launch dev "embed_q8" n 256 (list (cmat-qs emb) (cmat-d emb) (cctx-tokens st) x d)))
       (loop for li below (model-n-layer m)
             for l = (svref (model-layers m) li)
-            do (launch dev "rmsnorm_q8" n 256 (list x (cvec-of cm (layer-attn-norm l)) nil xq xs d eps))
-               (cmat-mul dev (cmat-of cm (layer-wq l)) xq xs (cctx-q st) n :bias (cvec-of cm (layer-bq l)))
-               (cmat-mul dev (cmat-of cm (layer-wk l)) xq xs (cctx-k st) n :bias (cvec-of cm (layer-bk l)))
-               (cmat-mul dev (cmat-of cm (layer-wv l)) xq xs (cctx-v st) n :bias (cvec-of cm (layer-bv l)))
+            do (rmsnorm-q8 dev x (cvec-of cm (layer-attn-norm l)) xq xs d eps n)
+               (let ((wq (cmat-of cm (layer-wq l))) (wk (cmat-of cm (layer-wk l))) (wv (cmat-of cm (layer-wv l)))
+                     (bq (cvec-of cm (layer-bq l))) (bk (cvec-of cm (layer-bk l))) (bv (cvec-of cm (layer-bv l))))
+                 (if (= n 1)
+                     (launch dev "mv_q8_3" (ceiling (+ (cmat-rows wq) (cmat-rows wk) (cmat-rows wv)) 4) 128
+                             (list (cmat-qs wq) (cmat-d wq) (cmat-qs wk) (cmat-d wk) (cmat-qs wv) (cmat-d wv)
+                                   xq xs (cctx-q st) (cctx-k st) (cctx-v st) bq bk bv
+                                   (cmat-rows wq) (cmat-rows wk) (cmat-rows wv) d))
+                     (progn
+                       (cmat-mul dev wq xq xs (cctx-q st) n :bias bq)
+                       (cmat-mul dev wk xq xs (cctx-k st) n :bias bk)
+                       (cmat-mul dev wv xq xs (cctx-v st) n :bias bv))))
                (launch dev "qk_rope" (list (+ nh nkv) n) (max 32 (floor hd 2))
                        (list (cctx-q st) (cctx-k st) (cctx-v st)
                              (cvec-of cm (layer-q-norm l)) (cvec-of cm (layer-k-norm l))
@@ -195,17 +208,18 @@
                              (list (cctx-q st) (svref (cctx-kc st) li) (svref (cctx-vc st) li) (cctx-part st)
                                    nh nkv hd pos0 chunk nsplit scale)
                              :shared (* 4 (max (* hd (1+ +att-chunk+)) (* 8 hd (floor nh nkv)))))
+                     ;; merged and quantized for the output projection
                      (launch dev "attn_merge" (list nh n) (max 32 hd)
-                             (list (cctx-part st) (cctx-att st) nh hd pos0 chunk nsplit)))
+                             (list (cctx-part st) (cctx-att st) xq xs nh hd pos0 chunk nsplit)))
                    (multiple-value-bind (qpw bytes) (attn-prefill-shape dev hd)
                      (launch dev "attn_prefill" (list nh (ceiling n (* 4 qpw))) 128
                              (list (cctx-q st) (svref (cctx-kc st) li) (svref (cctx-vc st) li) (cctx-att st)
                                    nh nkv hd pos0 n scale qpw)
-                             :shared bytes)))
-               (launch dev "quant_q8" (ceiling (* n qd) 256) 256
-                       (list (cctx-att st) xq xs (list :i64 (floor (* n qd) 32))))
+                             :shared bytes)
+                     (launch dev "quant_q8" (ceiling (* n qd) 256) 256
+                             (list (cctx-att st) xq xs (list :i64 (floor (* n qd) 32))))))
                (cmat-mul dev (cmat-of cm (layer-wo l)) xq xs x n :acc t)
-               (launch dev "rmsnorm_q8" n 256 (list x (cvec-of cm (layer-ffn-norm l)) nil xq xs d eps))
+               (rmsnorm-q8 dev x (cvec-of cm (layer-ffn-norm l)) xq xs d eps n)
                (let ((g (cmat-of cm (layer-wgate l))) (u (cmat-of cm (layer-wup l))))
                  (if (= n 1)
                      (launch dev "mv_q8_glu" (ceiling f 4) 128
@@ -219,8 +233,7 @@
                        (list (cctx-fa st) xq xs (list :i64 (floor (* n f) 32))))
                (cmat-mul dev (cmat-of cm (layer-wdown l)) xq xs x n :acc t))
       (when logits
-        (launch dev "rmsnorm_q8" 1 256
-                (list (cons x (* 4 (1- n) d)) (cvec-of cm (model-output-norm m)) nil xq xs d eps))
+        (rmsnorm-q8 dev (cons x (* 4 (1- n) d)) (cvec-of cm (model-output-norm m)) xq xs d eps 1)
         (cmat-mul dev (cmat-of cm (model-output m)) xq xs (cctx-logits st) 1)
         (let ((out (context-logits ctx)))
           (sb-sys:with-pinned-objects (out)
