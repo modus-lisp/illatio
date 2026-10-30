@@ -85,7 +85,7 @@
 
 (defun nanogpt-train (&key (data (merge-pathnames "workspace/modded-nanogpt/data/fineweb10B/" (user-homedir-pathname)))
                            (l 6) (c 384) (b 8) (tt 1024) (accum 8) (steps 1000) (warmup 0) (warmdown 0.3)
-                           (muon-lr 0.04f0) (embed-lr 0.6f0) (head-lr 0.008f0) (scalar-lr 0.04f0) (momentum-warmup 500)
+                           (muon-lr 0.04f0) (embed-lr 0.6f0) (head-lr 0.008f0) (scalar-lr 0.04f0) (adam-beta1 0.9f0) (momentum-warmup 500)
                            (cap 30f0) (val-every 50) (val-batches 16) (target nil) (stop-at-target t) (seed 1337)
                            (model nil) (out *standard-output*))
   "Train the speedrun's model on FineWeb: STEPS steps of ACCUM micro-batches
@@ -121,7 +121,7 @@
               (incf loss (/ (ngpt-mean-loss m) accum)))
             (with-gpu-work (e (ngpt-gpu m))
               (ngpt-encode-update m e (1+ step) :muon-lr (* k muon-lr) :embed-lr (* k embed-lr)
-                                                :head-lr (* k head-lr) :scalar-lr (* k scalar-lr)
+                                                :head-lr (* k head-lr) :scalar-lr (* k scalar-lr) :beta1 adam-beta1
                                                 :mu (coerce (+ (* (- 1 frac) 0.85) (* frac 0.95)) 'single-float)))
             (let ((ms (/ (- (get-internal-real-time) t0) (/ internal-time-units-per-second 1000))))
               (incf train-ms ms)
