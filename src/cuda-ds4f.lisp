@@ -4,10 +4,10 @@
 ;;; metal-ds4f-decode.lisp's layers with src/cuda/ds4f.cu's kernels.  The
 ;;; difference is where the weights live.  An M4's GPU shares the Mac's
 ;;; memory and reads the SSD; here the GPU has 24 GB of its own, behind PCIe,
-;;; and the host has a great deal more.  So the file is read once into host
-;;; memory, pinned (86.7 GB); the non-routed weights go to the device (the
+;;; and the host has a great deal more.  So the routed experts are read once into
+;;; host memory, pinned (78 GB); the non-routed weights go to the device (the
 ;;; Q8_0 ones repacked as dense.cu multiplies them, the F16 ones as they
-;;; are: 7.4 GB); the routed experts (78 GB) stay in host memory and are
+;;; are: 7.4 GB); the experts stay in host memory and are
 ;;; copied by DMA, on a stream of their own, into a pool of device slots as
 ;;; they are wanted -- the pool seeded with ds4's most used experts, kept by
 ;;; least recent use, the next layer's guessed experts copied ahead.
