@@ -116,7 +116,10 @@
        (declare (ignorable #'p #'g #'a #'da))
        ,@body)))
 
-(defun ngpt-encode-forward (m e &key (targets t))
+(defun ngpt-encode-forward (m e &key (targets t) dloss)
+  "The forward pass: with TARGETS, each position's loss; with DLOSS too (the
+   weight of each in what is differentiated), the logits' gradient as well,
+   by the fused kernel, and NGPT-ENCODE-BACKWARD must be told :FUSED."
   (with-ngpt (m)
     (let* ((b (ngpt-b m)) (tt (ngpt-tt m)) (c (ngpt-c m)) (nh (ngpt-nh m)) (l (ngpt-l m))
            (n (* b tt)) (hs 64) (scale (/ 1f0 (sqrt (coerce hs 'single-float)))))
@@ -132,11 +135,11 @@
             (dispatch gpu e "ng_qk_fwd" (list n tt c nh (ngpt-rope-base m))
                       (list (a :qkv li) (a :qk li) (a :qkr li)) (list n nh 2) 32)
             (g2-gemm gpu e nil t tt tt hs (a :qk li) (* 2 c) (a :qk li c) (* 2 c) (a :pre li) tt
-                     :alpha scale :kind :attention :batch (* b nh) :nb2 nh
+                     :alpha scale :kind :attention :batch (* b nh) :nb2 nh :causal 1
                      :sa (list (* tt 2 c) hs) :sb (list (* tt 2 c) hs) :sc (list (* nh tt tt) (* tt tt)))
             (dispatch gpu e "g2_attn_softmax" (list (* b nh tt) tt) (list (a :pre li) (a :att li)) (* b nh tt) 32)
             (g2-gemm gpu e nil nil tt hs tt (a :att li) tt (a :qkv li (* 2 c)) (* 3 c) (a :atty li) c
-                     :kind :attention :batch (* b nh) :nb2 nh
+                     :kind :attention :batch (* b nh) :nb2 nh :causal 2
                      :sa (list (* nh tt tt) (* tt tt)) :sb (list (* tt 3 c) hs) :sc (list (* tt c) hs))
             (linear (a :proj li) (a :atty li) (p :projw li) c c)
             (g2-1d gpu e "g2_add" (* n c) '() (list (a :res2 li) xin (a :proj li)))
@@ -147,11 +150,15 @@
             (g2-1d gpu e "g2_add" (* n c) '() (list (a :res3 li) (a :res2 li) (a :fcproj li)))))
         (rms (a :lnf) (a :rf) (a :res3 (1- l)))
         (linear (a :logits) (a :lnf) (p :head) c (ngpt-vp m) :head)
-        (dispatch gpu e "ng_softcap_ce" (list n (ngpt-v m) (ngpt-vp m) (if targets 1 0) (ngpt-cap m))
-                  (list (a :logits) (a :probs) (ngpt-targets m) (a :losses)) n 1024 :shared 128)))))
+        (if dloss
+            (dispatch gpu e "ng_softcap_ce_fused" (list n (ngpt-v m) (ngpt-vp m) dloss (ngpt-cap m))
+                      (list (a :logits) (da :logits) (ngpt-targets m) (a :losses)) n 1024 :shared 256)
+            (dispatch gpu e "ng_softcap_ce" (list n (ngpt-v m) (ngpt-vp m) (if targets 1 0) (ngpt-cap m))
+                      (list (a :logits) (a :probs) (ngpt-targets m) (a :losses)) n 1024 :shared 128))))))
 
-(defun ngpt-encode-backward (m e &key accumulate (dloss (/ 1f0 (* (ngpt-b m) (ngpt-tt m)))))
-  "The gradients, written (or with ACCUMULATE added to the parameters')."
+(defun ngpt-encode-backward (m e &key accumulate (dloss (/ 1f0 (* (ngpt-b m) (ngpt-tt m)))) fused)
+  "The gradients, written (or with ACCUMULATE added to the parameters').
+   FUSED: the forward pass wrote the logits' gradient already."
   (with-ngpt (m)
     (let* ((b (ngpt-b m)) (tt (ngpt-tt m)) (c (ngpt-c m)) (nh (ngpt-nh m)) (l (ngpt-l m))
            (vp (ngpt-vp m)) (n (* b tt)) (hs 64) (scale (/ 1f0 (sqrt (coerce hs 'single-float))))
@@ -161,9 +168,10 @@
                (g2-gemm gpu e t nil cout cin n dout cout (cdr in) cin dw cin :beta acc :kind kind))
              (rms-back (dx dy x r add)
                (dispatch gpu e "ng_rms_bwd" (list n c (if add 1 0)) (list dx dy x r) n 32)))
-        (dispatch gpu e "ng_softcap_ce_bwd" (list n (ngpt-v m) vp dloss (ngpt-cap m))
-                  (list (da :logits) (a :probs) (ngpt-targets m) (a :logits))
-                  (list (ceiling vp 256) n) (list 256 1))
+        (unless fused
+          (dispatch gpu e "ng_softcap_ce_bwd" (list n (ngpt-v m) vp dloss (ngpt-cap m))
+                    (list (da :logits) (a :probs) (ngpt-targets m) (a :logits))
+                    (list (ceiling vp 256) n) (list 256 1)))
         ;; IN for LINEAR-BACK: (where the input's gradient goes . the input)
         (linear-back (da :logits) (cons (da :lnf) (a :lnf)) (p :head) (g :head) c vp :head)
         (rms-back (da :res3 (1- l)) (da :lnf) (a :res3 (1- l)) (a :rf) nil)
@@ -179,18 +187,18 @@
                    (linear-back (da :proj li) (cons (da :atty li) (a :atty li)) (p :projw li) (g :projw li) c c)
                    ;; datt = dy V^T; dV = att^T dy; dpre; dQ' = s dpre K'; dK' = s dpre^T Q'
                    (g2-gemm gpu e nil t tt tt hs (da :atty li) c (a :qkv li (* 2 c)) (* 3 c) (da :att li) tt
-                            :kind :attention :batch (* b nh) :nb2 nh
+                            :kind :attention :batch (* b nh) :nb2 nh :causal 1
                             :sa (list (* tt c) hs) :sb (list (* tt 3 c) hs) :sc (list (* nh tt tt) (* tt tt)))
                    (g2-gemm gpu e t nil tt hs tt (a :att li) tt (da :atty li) c (da :qkv li (* 2 c)) (* 3 c)
-                            :kind :attention :batch (* b nh) :nb2 nh
+                            :kind :attention :batch (* b nh) :nb2 nh :causal 3
                             :sa (list (* nh tt tt) (* tt tt)) :sb (list (* tt c) hs) :sc (list (* tt 3 c) hs))
                    (dispatch gpu e "g2_attn_softmax_bwd" (list (* b nh tt) tt)
                              (list (da :pre li) (da :att li) (a :att li)) (* b nh tt) 32)
                    (g2-gemm gpu e nil nil tt hs tt (da :pre li) tt (a :qk li c) (* 2 c) (da :qk li) (* 2 c)
-                            :alpha scale :kind :attention :batch (* b nh) :nb2 nh
+                            :alpha scale :kind :attention :batch (* b nh) :nb2 nh :causal 2
                             :sa (list (* nh tt tt) (* tt tt)) :sb (list (* tt 2 c) hs) :sc (list (* tt 2 c) hs))
                    (g2-gemm gpu e t nil tt hs tt (da :pre li) tt (a :qk li) (* 2 c) (da :qk li c) (* 2 c)
-                            :alpha scale :kind :attention :batch (* b nh) :nb2 nh
+                            :alpha scale :kind :attention :batch (* b nh) :nb2 nh :causal 3
                             :sa (list (* nh tt tt) (* tt tt)) :sb (list (* tt 2 c) hs) :sc (list (* tt 2 c) hs))
                    (dispatch gpu e "ng_qk_bwd" (list n tt c nh (ngpt-rope-base m))
                              (list (da :qkv li) (da :qk li) (a :qkv li) (a :qkr li)) (list n nh 2) 32)
@@ -220,6 +228,6 @@
   "Forward and backward: the mean loss, the gradients in GBUF."
   (ngpt-set-batch m inputs targets)
   (with-gpu-work (e (ngpt-gpu m))
-    (ngpt-encode-forward m e)
-    (ngpt-encode-backward m e))
+    (ngpt-encode-forward m e :dloss (/ 1f0 (* (ngpt-b m) (ngpt-tt m))))
+    (ngpt-encode-backward m e :fused t))
   (ngpt-mean-loss m))

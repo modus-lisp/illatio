@@ -201,3 +201,40 @@ kernel void ng_axpby(constant uint *a [[buffer(0)]], device const float *x [[buf
     if (i >= a[0]) return;
     y[i] = as_type<float>(a[1]) * x[i] + as_type<float>(a[2]) * y[i];
 }
+
+// Training's softcapped cross-entropy, forward and backward at once: each
+// row's max and sum of exponentials found online in one pass over its
+// logits, then a second writing the loss and dz = (p - onehot) dl (1 -
+// (capped/cap)^2) -- no probabilities stored, no pass to read them back.
+// A threadgroup of 1024 a row.  args: n, V, Vp, dl, cap
+kernel void ng_softcap_ce_fused(constant uint *a [[buffer(0)]], device const float *logits [[buffer(1)]],
+                                device float *dlogits [[buffer(2)]], device const int *targets [[buffer(3)]],
+                                device float *losses [[buffer(4)]], threadgroup float *red [[threadgroup(0)]],
+                                uint r [[threadgroup_position_in_grid]], ushort tid [[thread_index_in_threadgroup]],
+                                ushort sg [[simdgroup_index_in_threadgroup]], ushort l [[thread_index_in_simdgroup]]) {
+    const uint V = a[1], Vp = a[2];
+    const float dl = as_type<float>(a[3]), cap = as_type<float>(a[4]);
+    device const float *x = logits + r * Vp;
+    device float *d = dlogits + r * Vp;
+    float m = -INFINITY, s = 0.0f;
+    for (uint i = tid; i < V; i += 1024) {
+        const float z = ng_cap(x[i], cap);
+        if (z > m) { s = s * precise::exp(m - z) + 1.0f; m = z; } else s += precise::exp(z - m);
+    }
+    float M = simd_max(m);
+    s = simd_sum(m == -INFINITY ? 0.0f : s * precise::exp(m - M));
+    if (l == 0) { red[sg] = M; red[32 + sg] = s; }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    const float gm = simd_max(red[l]);
+    const float S = simd_sum(red[32 + l] * precise::exp(red[l] - gm));
+    const uint y = (uint)targets[r];
+    for (uint i = tid; i < Vp; i += 1024) {
+        if (i >= V) { d[i] = 0.0f; continue; }
+        const float z = ng_cap(x[i], cap);
+        const float p = precise::exp(z - gm) / S;
+        float g = (p - (i == y ? 1.0f : 0.0f)) * dl;
+        if (cap > 0.0f) { const float t = z / cap; g *= 1.0f - t * t; }
+        d[i] = g;
+    }
+    if (tid == 0) losses[r] = -(ng_cap(x[y], cap) - gm - precise::log(S));
+}

@@ -15,6 +15,9 @@ struct g2_gemm_args {
     uint M, N, K, lda, ldb, ldc;
     float alpha; uint beta; uint bias;
     uint nb2; uint sa1, sa2, sb1, sb2, sc1, sc2;
+    uint causal;   // 0, or which causal triangle of a T x T product to skip:
+                   // 1 C's tiles above the diagonal; 2 K past the tile's last row;
+                   // 3 K before the tile's first row
 };
 
 // A 64x64 tile of C a threadgroup of four simdgroups, each 32x32 of it in
@@ -58,12 +61,15 @@ kernel void g2_gemm(constant g2_gemm_args &p [[buffer(0)]],
     const uint mb0 = (sg % 2) * 4, nb0 = (sg / 2) * 4;
     const bool vec = p.beta >> 1;           // bit 1: rows aligned for float4
     const bool mfull = m0 + BM <= p.M, nfull = n0 + BN <= p.N;
+    if (p.causal == 1 && n0 >= m0 + BM) return;   // all masked: never read
+    const uint kbeg = p.causal == 3 ? (m0 / BK) * BK : 0;
+    const uint kend = p.causal == 2 ? min(p.K, m0 + BM) : p.K;
 
     simdgroup_float8x8 acc[4][4];
     for (int i = 0; i < 4; i++)
         for (int j = 0; j < 4; j++) acc[i][j] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
 
-    for (uint k0 = 0; k0 < p.K; k0 += BK) {
+    for (uint k0 = kbeg; k0 < kend; k0 += BK) {
         const bool kfull = k0 + BK <= p.K;
         // A: sixteen elements a thread
         if (!TA) {   // k contiguous: row mm, k from kh

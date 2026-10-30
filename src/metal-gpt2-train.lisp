@@ -88,24 +88,29 @@
    loss by 0.04, where everything else in bf16 moves it 0.003.")
 
 (defun g2-gemm (gpu e ta tb mm nn kk a lda b ldb c ldc
-                &key (kind :linear) (alpha 1f0) (beta 0) bias (batch 1) (nb2 1) (sa '(0 0)) (sb '(0 0)) (sc '(0 0)))
+                &key (kind :linear) (alpha 1f0) (beta 0) bias (batch 1) (nb2 1) (sa '(0 0)) (sb '(0 0)) (sc '(0 0))
+                     (causal 0))
   "C = ALPHA op(A) op(B) (+ C if BETA) (+ BIAS), MMxNN by KK; BATCH of them,
    the z-th's offsets (z / NB2) and (z mod NB2) times SA's, SB's, SC's strides.
-   KIND picks the precision (*G2-PRECISION*)."
+   KIND picks the precision (*G2-PRECISION*).  CAUSAL (attention's T x T
+   products, where what is past the diagonal is masked or zero): 1 skips
+   C's tiles above it, 2 sums K only up to each tile's last row, 3 only from
+   its first."
   (flet ((off (b) (if (consp b) (cdr b) 0)))
     (let ((vec (and (every (lambda (x) (zerop (mod x 4))) (list* lda ldb ldc (append sa sb sc)))
                     (every (lambda (b) (zerop (mod (off b) 16))) (list a b c)))))
       (g2-dispatch-gemm gpu e ta tb (or (cdr (assoc kind *g2-precision*)) "")
                         mm nn kk a lda b ldb c ldc alpha
-                        (logior (if (eql beta 0) 0 1) (if vec 2 0)) bias batch nb2 sa sb sc))))
+                        (logior (if (eql beta 0) 0 1) (if vec 2 0)) bias batch nb2 sa sb sc causal))))
 
-(defun g2-dispatch-gemm (gpu e ta tb suffix mm nn kk a lda b ldb c ldc alpha beta bias batch nb2 sa sb sc)
+(defun g2-dispatch-gemm (gpu e ta tb suffix mm nn kk a lda b ldb c ldc alpha beta bias batch nb2 sa sb sc
+                         &optional (causal 0))
   (dispatch gpu e (concatenate 'string
                               (cond ((and ta tb) (error "no TT product"))
                                     (ta "g2_gemm_tn") (tb "g2_gemm_nt") (t "g2_gemm_nn"))
                               suffix)
             (list mm nn kk lda ldb ldc alpha beta (if bias 1 0) nb2
-                  (first sa) (second sa) (first sb) (second sb) (first sc) (second sc))
+                  (first sa) (second sa) (first sb) (second sb) (first sc) (second sc) causal)
             (list a b c (or bias c))
             (list (ceiling nn 64) (ceiling mm 64) batch) 128 :shared 16384))
 
