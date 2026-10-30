@@ -7,12 +7,20 @@ MacBook Pro (M4 Pro, 48 GB).  Validation is the first 16 batches of 8 x 1024
 tokens of the validation shard.
 
 The model is small, 6 layers x 384 channels, so a run is an hour, not a
-night.  The first target: the llm.c recipe's loss after an hour, 5.37.
+night.  Times are training time (validation excluded), as the speedrun counts them.
 
-| # | time to 5.37 | val loss at 1 h (70M tokens) | what | date |
-|---|---|---|---|---|
-| 0 | 61 min | 5.37 | llm.c's GPT-2 recipe: AdamW, lr 1e-3, warmup then cosine (`gpt2-pretrain`) | 2026-10-30 |
-| 1 | 12 min | 4.30 | modded-nanogpt's records 5-11: RMSNorm, QK-norm + RoPE, ReLU^2, zero-init projections, untied head, softcap 30; Muon (lr 0.04) for the hidden matrices, Adam for the embedding and the head (`nanogpt-train`) | 2026-10-30 |
+| # | time to 5.37 | time to 4.30 | val loss after 1070 steps of 64K tokens (70M) | what | date |
+|---|---|---|---|---|---|
+| 0 | 61 min | -- | 5.37 | llm.c's GPT-2 recipe: AdamW, lr 1e-3, warmup then cosine (`gpt2-pretrain`) | 2026-10-30 |
+| 1 | 12 min | 62 min | 4.297 | modded-nanogpt's records 5-11: RMSNorm, QK-norm + RoPE, ReLU^2, zero-init projections, untied head, softcap 30; Muon (lr 0.04) for the hidden matrices, Adam for the embedding and the head (`nanogpt-train`) | 2026-10-30 |
+| 2 | -- | **52.8 min** | 4.257 | record 11's shortcuts: embedding norm into x0, x0 mixing, value residual, U-net skips; causal attention tiles and a fused softcapped loss (3.17 s a step, from 3.53) | 2026-10-30 |
 
-Record 1 reaches record 0's final loss at step 200 of 1070 (13M tokens);
-both run at about 19K tokens/s.  The next target is record 1's 4.30.
+The target is now 4.30.
+
+Notes:
+- Short runs mislead on batch size.  At 20M tokens, 16K-token steps beat 64K
+  ones (4.83 vs 4.90 with the shortcuts), but over the full hour the 16K run
+  stalls in the constant-lr phase and ends at 4.346, behind record 1.
+  Sweep at the full horizon.
+- Doubling Muon's or Adam's learning rates is worse at 20M tokens; halving
+  them is no different.
