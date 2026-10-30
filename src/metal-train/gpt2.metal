@@ -222,16 +222,18 @@ kernel void g2_encoder_fwd(constant uint *a [[buffer(0)]], device const int *inp
     out[gid] = wte[inp[bt] * C + i] + wpe[(bt % T) * C + i];
 }
 
-// a thread a channel, over every row: the rows of a token add in order
+// a thread a channel, over every row: the rows of a token add in order.
+// dwte adds to the head's gradient, written first; dwpe is the first
+// writer of its own unless ACC (gradients accumulating over micro-batches)
 kernel void g2_encoder_bwd(constant uint *a [[buffer(0)]], device const int *inp [[buffer(1)]],
                            device float *dwte [[buffer(2)]], device float *dwpe [[buffer(3)]],
                            device const float *dout [[buffer(4)]], uint i [[thread_position_in_grid]]) {
-    const uint n = a[0], T = a[1], C = a[2];
+    const uint n = a[0], T = a[1], C = a[2], acc = a[3];
     if (i >= C) return;
     for (uint bt = 0; bt < n; bt++) {
         float d = dout[bt * C + i];
         dwte[inp[bt] * C + i] += d;
-        dwpe[(bt % T) * C + i] += d;
+        if (bt < T && !acc) dwpe[bt * C + i] = d; else dwpe[(bt % T) * C + i] += d;
     }
 }
 
@@ -255,7 +257,7 @@ kernel void g2_layernorm_fwd(constant uint *a [[buffer(0)]], device const float 
     if (l == 0) { mean[r] = m; rstd[r] = s; }
 }
 
-// the input's gradient, a simdgroup a row
+// the input's gradient, a simdgroup a row: added to DINP if ADD, else written
 kernel void g2_layernorm_bwd_x(constant uint *a [[buffer(0)]], device float *dinp [[buffer(1)]],
                                device const float *dout [[buffer(2)]], device const float *inp [[buffer(3)]],
                                device const float *w [[buffer(4)]], device const float *mean [[buffer(5)]],
@@ -274,34 +276,57 @@ kernel void g2_layernorm_bwd_x(constant uint *a [[buffer(0)]], device float *din
     dm = simd_sum(dm) / C; dnm = simd_sum(dnm) / C;
     for (uint i = l; i < C; i += 32) {
         float nrm = (x[i] - mu) * rs, dn = w[i] * d[i];
-        dinp[r * C + i] += ((dn - dm) - nrm * dnm) * rs;
+        float g = ((dn - dm) - nrm * dnm) * rs;
+        dinp[r * C + i] = a[2] ? dinp[r * C + i] + g : g;
     }
 }
 
-// the weight's and bias's, a thread a channel
+// Column sums over N rows: a threadgroup of 1024 for 32 columns, 32 lanes
+// of rows each (row r on lane r mod 32, so each 32 columns read in a row),
+// the lanes' partial sums added in order through threadgroup memory.
+
+// the layernorm weight's and bias's gradients.  args: n, C, acc
 kernel void g2_layernorm_bwd_w(constant uint *a [[buffer(0)]], device float *dw [[buffer(1)]],
                                device float *db [[buffer(2)]], device const float *dout [[buffer(3)]],
                                device const float *inp [[buffer(4)]], device const float *mean [[buffer(5)]],
-                               device const float *rstd [[buffer(6)]], uint i [[thread_position_in_grid]]) {
-    const uint n = a[0], C = a[1];
-    if (i >= C) return;
+                               device const float *rstd [[buffer(6)]], threadgroup float *sh [[threadgroup(0)]],
+                               uint g [[threadgroup_position_in_grid]], ushort tid [[thread_index_in_threadgroup]]) {
+    const uint n = a[0], C = a[1], acc = a[2];
+    const uint c = g * 32 + tid % 32, lane = tid / 32;
     float gw = 0.0f, gb = 0.0f;
-    for (uint r = 0; r < n; r++) {
-        float d = dout[r * C + i];
-        gb += d;
-        gw += ((inp[r * C + i] - mean[r]) * rstd[r]) * d;
+    if (c < C)
+        for (uint r = lane; r < n; r += 32) {
+            float d = dout[r * C + c];
+            gb += d;
+            gw += ((inp[r * C + c] - mean[r]) * rstd[r]) * d;
+        }
+    sh[lane * 33 + tid % 32] = gw;
+    sh[32 * 33 + lane * 33 + tid % 32] = gb;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (lane == 0 && c < C) {
+        float sw = 0.0f, sb = 0.0f;
+        for (uint k = 0; k < 32; k++) { sw += sh[k * 33 + tid]; sb += sh[32 * 33 + k * 33 + tid]; }
+        dw[c] = acc ? dw[c] + sw : sw;
+        db[c] = acc ? db[c] + sb : sb;
     }
-    db[i] += gb; dw[i] += gw;
 }
 
-// a bias's gradient: each column's sum.  args: n, OC
+// a bias's gradient: each column's sum.  args: n, OC, acc
 kernel void g2_colsum(constant uint *a [[buffer(0)]], device float *db [[buffer(1)]],
-                      device const float *dout [[buffer(2)]], uint o [[thread_position_in_grid]]) {
-    const uint n = a[0], OC = a[1];
-    if (o >= OC) return;
+                      device const float *dout [[buffer(2)]], threadgroup float *sh [[threadgroup(0)]],
+                      uint g [[threadgroup_position_in_grid]], ushort tid [[thread_index_in_threadgroup]]) {
+    const uint n = a[0], OC = a[1], acc = a[2];
+    const uint o = g * 32 + tid % 32, lane = tid / 32;
     float s = 0.0f;
-    for (uint r = 0; r < n; r++) s += dout[r * OC + o];
-    db[o] += s;
+    if (o < OC)
+        for (uint r = lane; r < n; r += 32) s += dout[r * OC + o];
+    sh[lane * 33 + tid % 32] = s;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (lane == 0 && o < OC) {
+        float t = 0.0f;
+        for (uint k = 0; k < 32; k++) t += sh[k * 33 + tid];
+        db[o] = acc ? db[o] + t : t;
+    }
 }
 
 // the causal softmax of each (b, h, t) row of scores, already scaled: a
@@ -341,11 +366,14 @@ kernel void g2_attn_softmax_bwd(constant uint *a [[buffer(0)]], device float *dp
 
 constant float GELU_K = 0.7978845608028654f;  // sqrt(2/pi)
 
+// tanh by one exp: 1 - 2/(e^2u + 1), exact at the limits (e^2u is 0 or inf)
+static inline float g2_tanh(float u) { return 1.0f - 2.0f / (fast::exp(2.0f * u) + 1.0f); }
+
 kernel void g2_gelu_fwd(constant uint *a [[buffer(0)]], device const float *inp [[buffer(1)]],
                         device float *out [[buffer(2)]], uint i [[thread_position_in_grid]]) {
     if (i >= a[0]) return;
     float x = inp[i], cube = 0.044715f * x * x * x;
-    out[i] = 0.5f * x * (1.0f + precise::tanh(GELU_K * (x + cube)));
+    out[i] = 0.5f * x * (1.0f + g2_tanh(GELU_K * (x + cube)));
 }
 
 kernel void g2_gelu_bwd(constant uint *a [[buffer(0)]], device float *dinp [[buffer(1)]],
@@ -353,9 +381,9 @@ kernel void g2_gelu_bwd(constant uint *a [[buffer(0)]], device float *dinp [[buf
                         uint i [[thread_position_in_grid]]) {
     if (i >= a[0]) return;
     float x = inp[i], cube = 0.044715f * x * x * x, arg = GELU_K * (x + cube);
-    float th = precise::tanh(arg), ch = precise::cosh(arg), sech = 1.0f / (ch * ch);
+    float th = g2_tanh(arg), sech = 1.0f - th * th;
     float g = 0.5f * (1.0f + th) + x * 0.5f * sech * GELU_K * (1.0f + 3.0f * 0.044715f * x * x);
-    dinp[i] += g * dout[i];
+    dinp[i] = g * dout[i];
 }
 
 kernel void g2_add(constant uint *a [[buffer(0)]], device float *out [[buffer(1)]],
@@ -365,11 +393,12 @@ kernel void g2_add(constant uint *a [[buffer(0)]], device float *out [[buffer(1)
     out[i] = x[i] + y[i];
 }
 
-kernel void g2_add_to2(constant uint *a [[buffer(0)]], device float *dx [[buffer(1)]],
-                       device float *dy [[buffer(2)]], device const float *d [[buffer(3)]],
-                       uint i [[thread_position_in_grid]]) {
+// a residual's gradient to both its inputs, their first writer
+kernel void g2_copy2(constant uint *a [[buffer(0)]], device float *dx [[buffer(1)]],
+                     device float *dy [[buffer(2)]], device const float *d [[buffer(3)]],
+                     uint i [[thread_position_in_grid]]) {
     if (i >= a[0]) return;
-    dx[i] += d[i]; dy[i] += d[i];
+    dx[i] = d[i]; dy[i] = d[i];
 }
 
 kernel void g2_zero(constant uint *a [[buffer(0)]], device float *x [[buffer(1)]],
@@ -413,8 +442,8 @@ kernel void g2_ce_bwd(constant uint *a [[buffer(0)]], device float *dlogits [[bu
     const uint V = a[1], Vp = a[2];
     const float dl = as_type<float>(a[3]);
     const uint i = g.x, r = g.y;
-    if (i >= V || r >= a[0]) return;
-    dlogits[r * Vp + i] += (probs[r * Vp + i] - (i == (uint)targets[r] ? 1.0f : 0.0f)) * dl;
+    if (i >= Vp || r >= a[0]) return;
+    dlogits[r * Vp + i] = i < V ? (probs[r * Vp + i] - (i == (uint)targets[r] ? 1.0f : 0.0f)) * dl : 0.0f;
 }
 
 // AdamW.  args: count, lr, beta1, beta2, eps, weight decay, 1-beta1^t, 1-beta2^t

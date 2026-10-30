@@ -153,34 +153,39 @@
                 (list (a (aoff m +logits+)) (a (aoff m +probs+)) (g2gpu-targets g) (a (aoff m +losses+)))
                 n 1024 :shared 128))))
 
-(defun g2-encode-backward (g e)
-  "The gradients, into the zeroed gradient buffers (G2-ENCODE-ZERO-GRAD first)."
+(defun g2-encode-backward (g e &key accumulate)
+  "The gradients: the parameters' written, or with ACCUMULATE added to what
+   they hold (micro-batches); the activations' written by their first
+   producer, so neither needs zeroing."
   (with-g2 (g)
     (let* ((b (g2gpu-b g)) (tt (g2gpu-tt g)) (c (gpt2-c m)) (nh (gpt2-nh m)) (l (gpt2-l m))
            (v (gpt2-v m)) (vp (gpt2-vp m)) (n (* b tt)) (hs (floor c nh))
-           (scale (/ 1f0 (sqrt (coerce hs 'single-float)))))
+           (scale (/ 1f0 (sqrt (coerce hs 'single-float))))
+           (acc (if accumulate 1 0)))
       (dispatch gpu e "g2_ce_bwd" (list n v vp (/ 1f0 n))
                 (list (da (aoff m +logits+)) (a (aoff m +probs+)) (g2gpu-targets g))
-                (list (ceiling v 256) n) (list 256 1))
+                (list (ceiling vp 256) n) (list 256 1))
       (flet ((linear-back (dout inp w dw dbias cin cout &optional (kind :linear))
-               ;; dinp += dout W;  dW += dout^T inp;  dbias += column sums
-               (g2-gemm gpu e nil nil n cin cout (da dout) cout (p w) cin (da inp) cin :beta 1 :kind kind)
-               (g2-gemm gpu e t nil cout cin n (da dout) cout (a inp) cin (g dw) cin :beta 1 :kind kind)
+               ;; dinp = dout W (its first writer);  dW (+)= dout^T inp;  dbias (+)= column sums
+               (g2-gemm gpu e nil nil n cin cout (da dout) cout (p w) cin (da inp) cin :kind kind)
+               (g2-gemm gpu e t nil cout cin n (da dout) cout (a inp) cin (g dw) cin :beta acc :kind kind)
                (when dbias
-                 (dispatch gpu e "g2_colsum" (list n cout) (list (g dbias) (da dout)) (ceiling cout 256) 256)))
-             (layernorm-back (dinp dout inp w dw dbias mean rstd)
-               (dispatch gpu e "g2_layernorm_bwd_x" (list n c)
+                 (dispatch gpu e "g2_colsum" (list n cout acc) (list (g dbias) (da dout))
+                           (ceiling cout 32) 1024 :shared (* 4 32 33))))
+             (layernorm-back (dinp dout inp w dw dbias mean rstd add)
+               (dispatch gpu e "g2_layernorm_bwd_x" (list n c (if add 1 0))
                          (list (da dinp) (da dout) (a inp) (p w) (a mean) (a rstd)) n 32)
-               (dispatch gpu e "g2_layernorm_bwd_w" (list n c)
-                         (list (g dw) (g dbias) (da dout) (a inp) (a mean) (a rstd)) (ceiling c 256) 256)))
+               (dispatch gpu e "g2_layernorm_bwd_w" (list n c acc)
+                         (list (g dw) (g dbias) (da dout) (a inp) (a mean) (a rstd))
+                         (ceiling c 32) 1024 :shared (* 4 2 32 33))))
         (linear-back (aoff m +logits+) (aoff m +lnf+) (poff m +wte+) (poff m +wte+) nil c vp :head)
         (layernorm-back (aoff m +residual3+ (1- l)) (aoff m +lnf+) (aoff m +residual3+ (1- l))
-                        (poff m +lnfw+) (poff m +lnfw+) (poff m +lnfb+) (aoff m +lnf-mean+) (aoff m +lnf-rstd+))
+                        (poff m +lnfw+) (poff m +lnfw+) (poff m +lnfb+) (aoff m +lnf-mean+) (aoff m +lnf-rstd+) nil)
         (loop for li from (1- l) downto 0
               do (let ((res (if (zerop li) (aoff m +encoded+) (aoff m +residual3+ (1- li))))
                        (qkv (aoff m +qkv+ li)) (att (aoff m +att+ li)) (pre (aoff m +preatt+ li))
                        (atty (aoff m +atty+ li)))
-                   (g2-1d gpu e "g2_add_to2" (* n c) '()
+                   (g2-1d gpu e "g2_copy2" (* n c) '()
                           (list (da (aoff m +residual2+ li)) (da (aoff m +fcproj+ li)) (da (aoff m +residual3+ li))))
                    (linear-back (aoff m +fcproj+ li) (aoff m +fch-gelu+ li) (poff m +fcprojw+ li)
                                 (poff m +fcprojw+ li) (poff m +fcprojb+ li) (* 4 c) c)
@@ -190,8 +195,8 @@
                                 (poff m +fcb+ li) c (* 4 c))
                    (layernorm-back (aoff m +residual2+ li) (aoff m +ln2+ li) (aoff m +residual2+ li)
                                    (poff m +ln2w+ li) (poff m +ln2w+ li) (poff m +ln2b+ li)
-                                   (aoff m +ln2-mean+ li) (aoff m +ln2-rstd+ li))
-                   (g2-1d gpu e "g2_add_to2" (* n c) '()
+                                   (aoff m +ln2-mean+ li) (aoff m +ln2-rstd+ li) t)
+                   (g2-1d gpu e "g2_copy2" (* n c) '()
                           (list (da res) (da (aoff m +attproj+ li)) (da (aoff m +residual2+ li))))
                    (linear-back (aoff m +attproj+ li) atty (poff m +attprojw+ li) (poff m +attprojw+ li)
                                 (poff m +attprojb+ li) c c)
@@ -200,27 +205,22 @@
                             :kind :attention :batch (* b nh) :nb2 nh
                             :sa (list (* tt c) hs) :sb (list (* tt 3 c) hs) :sc (list (* nh tt tt) (* tt tt)))
                    (g2-gemm gpu e t nil tt hs tt (a att) tt (da atty) c (da (+ qkv (* 2 c))) (* 3 c)
-                            :beta 1 :kind :attention :batch (* b nh) :nb2 nh
+                            :kind :attention :batch (* b nh) :nb2 nh
                             :sa (list (* nh tt tt) (* tt tt)) :sb (list (* tt c) hs) :sc (list (* tt 3 c) hs))
                    (dispatch gpu e "g2_attn_softmax_bwd" (list (* b nh tt) tt)
                              (list (da pre) (da att) (a att)) (* b nh tt) 32)
                    (g2-gemm gpu e nil nil tt hs tt (da pre) tt (a (+ qkv c)) (* 3 c) (da qkv) (* 3 c)
-                            :alpha scale :beta 1 :kind :attention :batch (* b nh) :nb2 nh
+                            :alpha scale :kind :attention :batch (* b nh) :nb2 nh
                             :sa (list (* nh tt tt) (* tt tt)) :sb (list (* tt 3 c) hs) :sc (list (* tt 3 c) hs))
                    (g2-gemm gpu e t nil tt hs tt (da pre) tt (a qkv) (* 3 c) (da (+ qkv c)) (* 3 c)
-                            :alpha scale :beta 1 :kind :attention :batch (* b nh) :nb2 nh
+                            :alpha scale :kind :attention :batch (* b nh) :nb2 nh
                             :sa (list (* nh tt tt) (* tt tt)) :sb (list (* tt 3 c) hs) :sc (list (* tt 3 c) hs))
                    (linear-back qkv (aoff m +ln1+ li) (poff m +qkvw+ li) (poff m +qkvw+ li) (poff m +qkvb+ li) c (* 3 c))
                    (layernorm-back res (aoff m +ln1+ li) res (poff m +ln1w+ li) (poff m +ln1w+ li) (poff m +ln1b+ li)
-                                   (aoff m +ln1-mean+ li) (aoff m +ln1-rstd+ li)))))
-      (dispatch gpu e "g2_encoder_bwd" (list n tt c)
+                                   (aoff m +ln1-mean+ li) (aoff m +ln1-rstd+ li) t))))
+      (dispatch gpu e "g2_encoder_bwd" (list n tt c acc)
                 (list (g2gpu-inputs g) (g (poff m +wte+)) (g (poff m +wpe+)) (da (aoff m +encoded+)))
                 (ceiling c 256) 256))))
-
-(defun g2-encode-zero-grad (g e)
-  (with-g2 (g)
-    (g2-1d gpu e "g2_zero" (gpt2-n-params m) '() (list (g2gpu-grads g)))
-    (g2-1d gpu e "g2_zero" (gpt2-n-acts m) '() (list (g2gpu-dacts g)))))
 
 (defun g2-encode-update (g e lr beta1 beta2 eps weight-decay step)
   (with-g2 (g)
@@ -233,16 +233,15 @@
          (losses (copy-from-gbuf (g2gpu-acts g) (f32vec n) (aoff m +losses+))))
     (/ (reduce #'+ losses) n)))
 
-(defun gpt2-gpu-step (g inputs targets &key update (lr 1f-4) (beta1 0.9f0) (beta2 0.999f0)
+(defun gpt2-gpu-step (g inputs targets &key accumulate update (lr 1f-4) (beta1 0.9f0) (beta2 0.999f0)
                                             (eps 1f-8) (weight-decay 0f0) (step 1))
   "One step on the GPU, one command buffer: forward over INPUTS (int32, B*T)
-   with TARGETS, zeroed gradients, backward, and with UPDATE AdamW's step
-   STEP.  The mean loss."
+   with TARGETS, backward (the gradients added to the last step's with
+   ACCUMULATE), and with UPDATE AdamW's step STEP.  The mean loss."
   (set-gbuf-ints (g2gpu-inputs g) inputs)
   (set-gbuf-ints (g2gpu-targets g) targets)
   (with-gpu-work (e (g2gpu-gpu g))
     (g2-encode-forward g e)
-    (g2-encode-zero-grad g e)
-    (g2-encode-backward g e)
+    (g2-encode-backward g e :accumulate accumulate)
     (when update (g2-encode-update g e lr beta1 beta2 eps weight-decay step)))
   (g2-mean-loss g))
