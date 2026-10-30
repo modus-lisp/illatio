@@ -86,10 +86,11 @@
 (defun nanogpt-train (&key (data (merge-pathnames "workspace/modded-nanogpt/data/fineweb10B/" (user-homedir-pathname)))
                            (l 6) (c 384) (b 8) (tt 1024) (accum 8) (steps 1000) (warmup 0) (warmdown 0.3)
                            (muon-lr 0.04f0) (embed-lr 0.6f0) (head-lr 0.008f0) (scalar-lr 0.04f0) (momentum-warmup 500)
-                           (cap 30f0) (val-every 50) (val-batches 16) (target nil) (seed 1337)
+                           (cap 30f0) (val-every 50) (val-batches 16) (target nil) (stop-at-target t) (seed 1337)
                            (model nil) (out *standard-output*))
   "Train the speedrun's model on FineWeb: STEPS steps of ACCUM micro-batches
-   of B x TT tokens.  Stops early at the validation loss TARGET.  The model."
+   of B x TT tokens.  Notes when the validation loss reaches TARGET, and
+   stops there if STOP-AT-TARGET.  The model."
   (let* ((*g2-precision* '((:head . "_b") (:attention . "_b") (:linear . "_b")))
          (m (or model (make-nanogpt :l l :c c :b b :tt tt :cap cap :seed seed)))
          (train (make-shard-loader (fineweb-shards data "train") b tt))
@@ -106,7 +107,8 @@
             (finish-output out)
             (when (and target (<= vl target))
               (format out "target ~,3F reached at step ~D, ~,1F s of training~%" target step (/ train-ms 1000.0))
-              (return-from run))))
+              (setf target nil)
+              (when stop-at-target (return-from run)))))
         (when (< step steps)
           (let ((t0 (get-internal-real-time)) (loss 0d0)
                 (k (coerce (trapezoid step steps warmup warmdown) 'single-float))
