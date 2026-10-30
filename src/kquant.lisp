@@ -530,7 +530,7 @@
     act))
 
 (defun matrix-act-kind (w)
-  (if (or (kmat-p w) (gmat-p w)) :q8k :q8))
+  (if (or (kmat-p w) (and (gmat-p w) (not (eq (gmat-type w) :q8_0)))) :q8k :q8))
 
 (defun matrix-rows (w) (if (kmat-p w) (kmat-rows w) (q8mat-rows w)))
 

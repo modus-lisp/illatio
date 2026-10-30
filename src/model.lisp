@@ -49,6 +49,7 @@
   (layers #() :type simple-vector)
   pool
   gpu                                   ; a GMODEL when the GPU runs it (metal-qwen35.lisp)
+  cuda                                  ; a CMODEL when an NVIDIA GPU runs it (cuda-dense.lisp)
   impl                                  ; a DS4F when the model is DeepSeek V4 Flash (ds4f.lisp)
   (notes '()))                          ; a plist: things said once (warnings)
 
@@ -387,6 +388,9 @@
   #+(and sbcl darwin)
   (when (model-gpu (context-model ctx))
     (return-from forward-1 (gpu-forward ctx token logits)))
+  #+(and sbcl linux)
+  (when (model-cuda (context-model ctx))
+    (return-from forward-1 (cuda-forward ctx token logits)))
   (when (model-recurrent-p (context-model ctx))
     (return-from forward-1 (forward-qwen35 ctx token :logits logits)))
   (let* ((m (context-model ctx))
@@ -461,6 +465,7 @@
    collected (and on modus, which has no finalizers, rather than never);
    CTX is unusable afterwards.  Harmless to call twice."
   (disown-static-vectors ctx)
+  #+(and sbcl linux) (free-cuda-state ctx)
   (map nil #'free-static-vector (context-static-vectors ctx))
   (setf (context-k-cache ctx) nil (context-v-cache ctx) nil)
   (remf (context-plist ctx) :q35)

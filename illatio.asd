@@ -29,6 +29,8 @@
      (:file "qwen35")      ; Qwen3.5's hybrid layers: gated delta net, gated attention
      (:file "metal" :if-feature (:and :sbcl :darwin))        ; the GPU, through the Objective-C runtime
      (:file "metal-qwen35" :if-feature (:and :sbcl :darwin)) ; qwen35 on it (kernels: src/metal/)
+     (:file "cuda" :if-feature (:and :sbcl :linux))       ; NVIDIA GPUs: the driver API and NVRTC
+     (:file "cuda-dense" :if-feature (:and :sbcl :linux)) ; qwen2/qwen3/llama on them (kernels: src/cuda/)
      (:file "generate")    ; sampling, prompt reuse, streaming text
      (:file "ds4f")        ; DeepSeek V4 Flash (deepseek4), ported from ds4.c
      (:file "ds4f-kv")      ; its state saved: a long prompt prefilled once

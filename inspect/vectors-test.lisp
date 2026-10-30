@@ -104,7 +104,7 @@
     (format t "no model at ~A; see README (Testing)~%" path)
     (uiop:quit 2))
   (let ((m (if (uiop:getenv "ILLATIO_TEST_GPU")
-               (funcall (intern "LOAD-MODEL-GPU" '#:illatio) path)
+               (funcall (intern #+darwin "LOAD-MODEL-GPU" #-darwin "LOAD-MODEL-CUDA" '#:illatio) path)
                (load-model path))))
     (dolist (c (read-vectors (or (uiop:getenv "ILLATIO_TEST_VECTORS")
                                  (merge-pathnames "vectors/qwen2.5-0.5b-q8_0.sexp"

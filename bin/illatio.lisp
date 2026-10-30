@@ -38,8 +38,10 @@ flags:
   --seed S            sampling seed
   -c, --ctx N         context size in tokens (default 8192)
   -t, --threads N     worker threads (default: the performance cores)
-  --gpu               run a qwen35 model on the GPU (Metal); DeepSeek V4
-                      Flash always uses it on a Mac
+  --gpu               run the model on the GPU: a qwen35 model on Metal (DeepSeek
+                      V4 Flash always uses it on a Mac); qwen2, qwen3 and llama
+                      on CUDA
+  --device N          the CUDA device to run on (implies --gpu; default 0)
   -s, --system TEXT   system prompt for --chat
   -h, --help          this
 ")
@@ -71,6 +73,7 @@ flags:
                    ((member a '("-s" "--system") :test #'string=) (setf (getf opts :system) (val)))
                    ((string= a "--chat") (setf (getf opts :mode) :chat))
                    ((string= a "--gpu") (setf (getf opts :gpu) t))
+                   ((string= a "--device") (setf (getf opts :gpu) t (getf opts :device) (int (val))))
                    ((string= a "--bench") (setf (getf opts :mode) :bench))
                    ((string= a "-p") (setf (getf opts :bench-p) (int-list (val))))
                    ((string= a "-d") (setf (getf opts :bench-d) (int-list (val))))
@@ -107,14 +110,17 @@ flags:
     (format *error-output* "~&illatio: loading ~A~%" (file-namestring path))
     (let ((m (if (getf opts :gpu)
                  #+(and sbcl darwin) (illatio::load-model-gpu path)
-                 #-(and sbcl darwin) (die "--gpu needs Metal (SBCL on macOS)")
+                 #+(and sbcl linux) (illatio::load-model-cuda path :device (or (getf opts :device) 0))
+                 #-(or (and sbcl darwin) (and sbcl linux)) (die "--gpu needs Metal (macOS) or CUDA (Linux)")
                  (load-model path :threads (or (getf opts :threads) (default-thread-count))))))
       (format *error-output* "illatio: ~A, ~D layers, ~:[~D threads~*~;~*~A~], ~,1Fs~%"
               (model-name m) (illatio::model-n-layer m)
               (getf opts :gpu) (illatio::pool-size (illatio::model-pool m))
               #+(and sbcl darwin) (and (getf opts :gpu)
                                        (illatio::gpu-name (illatio::gmodel-gpu (illatio::model-gpu m))))
-              #-(and sbcl darwin) nil
+              #+(and sbcl linux) (and (getf opts :gpu)
+                                      (illatio::cudev-name (illatio::cmodel-dev (illatio::model-cuda m))))
+              #-(or (and sbcl darwin) (and sbcl linux)) nil
               (/ (- (get-internal-real-time) t0) internal-time-units-per-second))
       m)))
 
@@ -207,7 +213,7 @@ flags:
               (format t "| ~A | ~,2F GiB | ~A | ~A | ~(~A~)~D~@[ @ d~D~] | ~,2F ± ~,2F |~%"
                       (illatio::model-name m)
                       (/ (with-open-file (s path :element-type '(unsigned-byte 8)) (file-length s)) (expt 2d0 30))
-                      (if (getf opts :gpu) "Metal" "CPU")
+                      (if (getf opts :gpu) #+darwin "Metal" #-darwin "CUDA" "CPU")
                       (if (getf opts :gpu) "-" (illatio::pool-size (illatio::model-pool m)))
                       kind k (and (plusp d) d) mean sd)
               (force-output))))))))
