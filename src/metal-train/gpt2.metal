@@ -446,17 +446,50 @@ kernel void g2_ce_bwd(constant uint *a [[buffer(0)]], device float *dlogits [[bu
     dlogits[r * Vp + i] = i < V ? (probs[r * Vp + i] - (i == (uint)targets[r] ? 1.0f : 0.0f)) * dl : 0.0f;
 }
 
-// AdamW.  args: count, lr, beta1, beta2, eps, weight decay, 1-beta1^t, 1-beta2^t
+// AdamW.  args: count, lr, beta1, beta2, eps, weight decay, 1-beta1^t,
+// 1-beta2^t; SCALE[0] multiplies each gradient (G2_CLIP_SCALE's clipping)
 kernel void g2_adamw(constant uint *a [[buffer(0)]], device float *p [[buffer(1)]],
                      device const float *g [[buffer(2)]], device float *m [[buffer(3)]],
-                     device float *v [[buffer(4)]], uint i [[thread_position_in_grid]]) {
+                     device float *v [[buffer(4)]], device const float *scale [[buffer(5)]],
+                     uint i [[thread_position_in_grid]]) {
     if (i >= a[0]) return;
     const float lr = as_type<float>(a[1]), b1 = as_type<float>(a[2]), b2 = as_type<float>(a[3]);
     const float eps = as_type<float>(a[4]), wd = as_type<float>(a[5]);
     const float c1 = as_type<float>(a[6]), c2 = as_type<float>(a[7]);
-    float w = p[i], gr = g[i];
+    float w = p[i], gr = g[i] * scale[0];
     float mi = b1 * m[i] + (1.0f - b1) * gr;
     float vi = b2 * v[i] + (1.0f - b2) * gr * gr;
     m[i] = mi; v[i] = vi;
     p[i] = w - lr * ((mi / c1) / (precise::sqrt(vi / c2) + eps) + wd * w);
+}
+
+// The gradients' squared norm, in two passes: each threadgroup of 1024 a
+// partial sum of its stride of X (args: count, groups), then one threadgroup
+// adds the partials in order and writes the clipping scale min(1, clip/norm)
+// and the norm (args: groups, clip).
+kernel void g2_sumsq(constant uint *a [[buffer(0)]], device const float *x [[buffer(1)]],
+                     device float *part [[buffer(2)]], threadgroup float *sh [[threadgroup(0)]],
+                     uint g [[threadgroup_position_in_grid]], ushort tid [[thread_index_in_threadgroup]],
+                     ushort sg [[simdgroup_index_in_threadgroup]], ushort l [[thread_index_in_simdgroup]]) {
+    const uint n = a[0], groups = a[1];
+    float s = 0.0f;
+    for (uint i = g * 1024 + tid; i < n; i += groups * 1024) { float v = x[i]; s += v * v; }
+    s = simd_sum(s);
+    if (l == 0) sh[sg] = s;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (sg == 0) { s = simd_sum(sh[l]); if (l == 0) part[g] = s; }
+}
+
+kernel void g2_clip_scale(constant uint *a [[buffer(0)]], device const float *part [[buffer(1)]],
+                          device float *out [[buffer(2)]], uint l [[thread_index_in_simdgroup]]) {
+    const uint groups = a[0];
+    const float clip = as_type<float>(a[1]);
+    float s = 0.0f;
+    for (uint i = l; i < groups; i += 32) s += part[i];
+    s = simd_sum(s);
+    if (l == 0) {
+        float norm = precise::sqrt(s);
+        out[0] = (clip > 0.0f && norm > clip) ? clip / norm : 1.0f;
+        out[1] = norm;
+    }
 }

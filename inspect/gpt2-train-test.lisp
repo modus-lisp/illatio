@@ -97,7 +97,7 @@
                                            allok))))
                (if gpu
                    (with-gpu-work (e (g2gpu-gpu gpu))
-                     (g2-encode-update gpu e 1f-4 0.9f0 0.999f0 1f-8 0.01f0 (1+ step)))
+                     (g2-encode-update gpu e 1f-4 0.9f0 0.999f0 1f-8 0.01f0 (1+ step) :decayed t))
                    (gpt2-update m 1f-4 0.9f0 0.999f0 1f-8 0.01f0 (1+ step)))
                (let ((ok (< (abs (- (gpt2-mean-loss m) want)) loss-tol)))
                  (setf allok (and allok ok))

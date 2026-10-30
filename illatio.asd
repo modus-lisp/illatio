@@ -44,7 +44,8 @@
   :depends-on ("illatio")
   :components ((:module "src" :serial t
                 :components ((:file "gpt2-train")
-                             (:file "metal-gpt2-train" :if-feature (:and :sbcl :darwin))))))
+                             (:file "metal-gpt2-train" :if-feature (:and :sbcl :darwin))
+                             (:file "gpt2-pretrain" :if-feature (:and :sbcl :darwin))))))
 
 (defsystem "illatio/openai"
   :description "OpenAI chat completions computed in this image: chat templates

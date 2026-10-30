@@ -14,10 +14,13 @@
 
 (in-package #:illatio)
 
+(defconstant +g2-norm-groups+ 256 "Threadgroups the gradients' squared norm is summed in.")
+
 (defstruct (g2gpu (:constructor %make-g2gpu))
   gpu model                             ; the GPU; the CPU model, for shapes and offsets
   params grads mom vel acts dacts       ; f32 buffers
   inputs targets                        ; int32 buffers of B*T
+  norm                                  ; the clipping scale and the gradients' norm, then partial sums
   (b 0 :type fixnum) (tt 0 :type fixnum))
 
 (defun gpt2-metal-source ()
@@ -56,8 +59,10 @@
                          :params (gpu-buffer gpu (* 4 np)) :grads (gpu-buffer gpu (* 4 np))
                          :mom (gpu-buffer gpu (* 4 np)) :vel (gpu-buffer gpu (* 4 np))
                          :acts (gpu-buffer gpu (* 4 na)) :dacts (gpu-buffer gpu (* 4 na))
-                         :inputs (gpu-buffer gpu (* 4 b tt)) :targets (gpu-buffer gpu (* 4 b tt)))))
+                         :inputs (gpu-buffer gpu (* 4 b tt)) :targets (gpu-buffer gpu (* 4 b tt))
+                         :norm (gpu-buffer gpu (* 4 (+ 2 +g2-norm-groups+))))))
     (copy-to-gbuf (g2gpu-params g) (gpt2-params m))
+    (setf (sb-sys:sap-ref-single (gbuf-sap (g2gpu-norm g)) 0) 1f0) ; no clipping until G2-ENCODE-CLIP
     g))
 
 (defun set-gbuf-ints (buf v)
@@ -153,16 +158,18 @@
                 (list (a (aoff m +logits+)) (a (aoff m +probs+)) (g2gpu-targets g) (a (aoff m +losses+)))
                 n 1024 :shared 128))))
 
-(defun g2-encode-backward (g e &key accumulate)
+(defun g2-encode-backward (g e &key accumulate (dloss (/ 1f0 (* (g2gpu-b g) (g2gpu-tt g)))))
   "The gradients: the parameters' written, or with ACCUMULATE added to what
    they hold (micro-batches); the activations' written by their first
-   producer, so neither needs zeroing."
+   producer, so neither needs zeroing.  DLOSS: each position's loss's weight
+   in what is differentiated (1/(B*T) for the batch's mean; divided again
+   by the micro-batches a step accumulates)."
   (with-g2 (g)
     (let* ((b (g2gpu-b g)) (tt (g2gpu-tt g)) (c (gpt2-c m)) (nh (gpt2-nh m)) (l (gpt2-l m))
            (v (gpt2-v m)) (vp (gpt2-vp m)) (n (* b tt)) (hs (floor c nh))
            (scale (/ 1f0 (sqrt (coerce hs 'single-float))))
            (acc (if accumulate 1 0)))
-      (dispatch gpu e "g2_ce_bwd" (list n v vp (/ 1f0 n))
+      (dispatch gpu e "g2_ce_bwd" (list n v vp dloss)
                 (list (da (aoff m +logits+)) (a (aoff m +probs+)) (g2gpu-targets g))
                 (list (ceiling vp 256) n) (list 256 1))
       (flet ((linear-back (dout inp w dw dbias cin cout &optional (kind :linear))
@@ -222,11 +229,29 @@
                 (list (g2gpu-inputs g) (g (poff m +wte+)) (g (poff m +wpe+)) (da (aoff m +encoded+)))
                 (ceiling c 256) 256))))
 
-(defun g2-encode-update (g e lr beta1 beta2 eps weight-decay step)
+(defun g2-encode-clip (g e clip)
+  "The gradients' norm, and the scale clipping it to CLIP (0: no clipping)."
   (with-g2 (g)
-    (g2-1d gpu e "g2_adamw" (gpt2-n-params m)
-           (list lr beta1 beta2 eps weight-decay (- 1f0 (expt beta1 step)) (- 1f0 (expt beta2 step)))
-           (list (g2gpu-params g) (g2gpu-grads g) (g2gpu-mom g) (g2gpu-vel g)))))
+    (let ((nb (g2gpu-norm g)))
+      (dispatch gpu e "g2_sumsq" (list (gpt2-n-params m) +g2-norm-groups+)
+                (list (g2gpu-grads g) (cons nb 8)) +g2-norm-groups+ 1024 :shared 128)
+      (dispatch gpu e "g2_clip_scale" (list +g2-norm-groups+ clip) (list (cons nb 8) nb) 1 32))))
+
+(defun g2-encode-update (g e lr beta1 beta2 eps weight-decay step &key decayed)
+  "AdamW's step STEP, each gradient times the clipping scale (1 unless
+   G2-ENCODE-CLIP ran before).  WEIGHT-DECAY on the tensors DECAYED lists
+   (indices; all of them if T), none on the rest."
+  (with-g2 (g)
+    (let ((c1 (- 1f0 (expt beta1 step))) (c2 (- 1f0 (expt beta2 step))))
+      (dotimes (i +gpt2-tensors+)
+        (let ((o (poff m i)) (n (svref (gpt2-param-sizes m) i)))
+          (g2-1d gpu e "g2_adamw" n
+                 (list lr beta1 beta2 eps (if (or (eq decayed t) (member i decayed)) weight-decay 0f0) c1 c2)
+                 (list (p o) (g o) (cons (g2gpu-mom g) (* 4 o)) (cons (g2gpu-vel g) (* 4 o)) (g2gpu-norm g))))))))
+
+(defun g2-grad-norm (g)
+  "The gradients' norm G2-ENCODE-CLIP last found."
+  (sb-sys:sap-ref-single (gbuf-sap (g2gpu-norm g)) 4))
 
 (defun g2-mean-loss (g)
   (let* ((m (g2gpu-model g)) (n (* (g2gpu-b g) (g2gpu-tt g)))
@@ -243,5 +268,5 @@
   (with-gpu-work (e (g2gpu-gpu g))
     (g2-encode-forward g e)
     (g2-encode-backward g e :accumulate accumulate)
-    (when update (g2-encode-update g e lr beta1 beta2 eps weight-decay step)))
+    (when update (g2-encode-update g e lr beta1 beta2 eps weight-decay step :decayed t)))
   (g2-mean-loss g))
