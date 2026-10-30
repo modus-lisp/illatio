@@ -204,7 +204,7 @@
 (defun ngpt-mean-loss (m)
   (let* ((n (* (ngpt-b m) (ngpt-tt m)))
          (v (copy-from-gbuf (ngpt-abuf m) (f32vec n) (lof (ngpt-acts m) :losses))))
-    (/ (reduce #'+ v) n)))
+    (/ (loop for x across v sum (coerce x 'double-float)) n)))
 
 (defun ngpt-set-batch (m inputs targets)
   (set-gbuf-ints (ngpt-inputs m) inputs)
