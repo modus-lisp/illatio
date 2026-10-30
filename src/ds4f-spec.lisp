@@ -16,12 +16,14 @@
 
 (in-package #:illatio)
 
-(defparameter *ds4f-spec-k* 0
-  "Guesses a step at most (0: none, the default).  Exact, but on this model
-   streamed from the SSD it doesn't pay yet: a token's experts must be read
-   whether it is guessed or not (about 70 ms of a 100 ms token), so a step
-   saves at most the dense weights' second reading (about 30 ms a token),
-   and a verifying pass costs more than that as things are.")
+(defparameter *ds4f-spec-k* #+linux 8 #-linux 0
+  "Guesses a step at most (0: none).  On Metal, streaming the experts from
+   the SSD, it doesn't pay yet: a token's experts must be read whether it is
+   guessed or not (about 70 ms of a 100 ms token), so a step saves at most
+   the dense weights' second reading (about 30 ms a token), and a verifying
+   pass costs more than that as things are.  On CUDA (cuda-ds4f-spec.lisp),
+   the experts mostly held by the devices, text that repeats goes 1.7x as
+   fast and other text about 5% slower (guesses that miss).")
 (defparameter *ds4f-spec-ngram* '(4 3 2) "The suffix lengths a guess is looked up by, longest first.")
 (defvar *ds4f-spec-always* nil "For tests: a step with no guess goes through the prefill too.")
 
@@ -52,6 +54,7 @@
                  (and (dc-ix-kv d) (copy-seq (dc-ix-kv d))) (and (dc-ix-score d) (copy-seq (dc-ix-score d)))))
          (d4ctx-caches c))))
 
+#+darwin
 (defun ds4f-undo-to (c undo pos0 keep n)
   "d4ctx C, a pass of N tokens from POS0 over it, as if only its first KEEP
    had gone through."
@@ -92,11 +95,20 @@
   "For GENERATE: TOKEN at CTX's next position and the guesses its greedy
    choices confirm; those (:NO if there is nothing to guess with)."
   (let ((model (context-model ctx)))
-    (unless (and (typep (model-impl model) 'ds4f) (ds4f-gpu-p :prefill) (plusp *ds4f-spec-k*))
+    (unless (and (typep (model-impl model) 'ds4f) (plusp *ds4f-spec-k*)
+                 (or #+darwin (ds4f-gpu-p :prefill) #+linux (ds4f-cuda-p)))
       (return-from ds4f-speculate :no))
     (let* ((hist (coerce (append (context-tokens ctx) (list tok)) 'simple-vector))
            (draft (ngram-draft hist (min *ds4f-spec-k* more))))
       (unless (or draft *ds4f-spec-always*) (return-from ds4f-speculate :no))
+      #+linux
+      (let* ((c (ds4f-context ctx)) (pos0 (context-pos ctx))
+             (a (progn (setf (d4ctx-pos c) pos0)
+                       (sb-int:with-float-traps-masked (:overflow :inexact :underflow)
+                         (ds4f-cuda-speculate c tok draft)))))
+        (setf (context-pos ctx) (+ pos0 a 1))
+        (return-from ds4f-speculate (subseq draft 0 a)))
+      #+darwin
       (let* ((c (ds4f-context ctx)) (m (d4ctx-model c)) (nv (ds4f-n-vocab m))
              (pos0 (context-pos ctx)) (batch (cons tok draft)) (n (length batch))
              (undo (progn (setf (d4ctx-pos c) pos0) (ds4f-undo-record c n)))

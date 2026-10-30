@@ -58,6 +58,89 @@ extern "C" __global__ void d4_mvq8(int rows, int cols, int group_rows,
   if (lane == 0) y[r] = v;
 }
 
+// D4_MVQ8 for NTOK tokens at once (at most D4_NT: a speculative step's), the
+// row's weights read once for them all, each token's sum as decode's.
+// Token t's quantized input at t*X_TSTRIDE (its group's from + g*COLS), its
+// output at t*Y_TSTRIDE.
+#define D4_NT 9
+extern "C" __global__ void d4_mvq8n(int rows, int cols, int group_rows, int ntok, int x_tstride, int y_tstride,
+                                    const i8* __restrict__ wq, const u16* __restrict__ wd,
+                                    const i8* __restrict__ xq, const float* __restrict__ xs,
+                                    float* __restrict__ y) {
+  long long r = (long long)blockIdx.x * (blockDim.x >> 5) + (threadIdx.x >> 5);
+  int lane = threadIdx.x & 31;
+  if (r >= rows) return;
+  const long long g = r / group_rows;
+  const int nb = cols >> 5, nh = nb * 2;
+  const int4* w4 = (const int4*)(wq + r * cols);
+  const u16* wdr = wd + r * nb;
+  float sum[D4_NT];
+#pragma unroll
+  for (int t = 0; t < D4_NT; ++t) sum[t] = 0.0f;
+  for (int base = 0; base < nh; base += 32) {
+    const int hb = base + lane;
+    int4 a = make_int4(0, 0, 0, 0);
+    float wsc = 0.0f;
+    if (hb < nh) { a = __ldg(w4 + hb); wsc = h2f(__ldg(wdr + (hb >> 1))); }
+#pragma unroll
+    for (int t = 0; t < D4_NT; ++t) {
+      if (t < ntok) {
+        const long long xo = (long long)t * x_tstride + g * cols;
+        int acc = 0;
+        if (hb < nh) {
+          int4 b = __ldg((const int4*)(xq + xo) + hb);
+          acc = __dp4a(a.x, b.x, acc); acc = __dp4a(a.y, b.y, acc);
+          acc = __dp4a(a.z, b.z, acc); acc = __dp4a(a.w, b.w, acc);
+        }
+        acc += __shfl_xor_sync(0xffffffff, acc, 1);
+        if (hb < nh && !(lane & 1)) sum[t] += (float)acc * (wsc * __ldg(xs + (xo >> 5) + (hb >> 1)));
+      }
+    }
+  }
+#pragma unroll
+  for (int t = 0; t < D4_NT; ++t)
+    if (t < ntok) {
+      const float v = warp_sum(sum[t]);
+      if (lane == 0) y[(long long)t * y_tstride + r] = v;
+    }
+}
+
+// D4_MV_F16 for NTOK tokens at once (X's rows NCOLS apart, Y's Y_TSTRIDE).
+extern "C" __global__ void d4_mv_f16n(int ncols, int nrows, int ntok, int y_tstride, const u16* __restrict__ w,
+                                      const float* __restrict__ x, float* __restrict__ y) {
+  __shared__ float red[32];
+  int r0 = blockIdx.x * 4, tid = threadIdx.x;
+  float s[4][D4_NT];
+#pragma unroll
+  for (int r = 0; r < 4; ++r)
+#pragma unroll
+    for (int t = 0; t < D4_NT; ++t) s[r][t] = 0.f;
+  const int n4 = ncols / 4;
+  for (int i = tid; i < n4; i += 256) {
+    float4 wf[4];
+#pragma unroll
+    for (int r = 0; r < 4; ++r) {
+      if (r0 + r < nrows) {
+        uint2 h = __ldg((const uint2*)(w + (long long)(r0 + r) * ncols) + i);
+        wf[r] = make_float4(h2f(h.x & 0xffff), h2f(h.x >> 16), h2f(h.y & 0xffff), h2f(h.y >> 16));
+      } else wf[r] = make_float4(0.f, 0.f, 0.f, 0.f);
+    }
+#pragma unroll
+    for (int t = 0; t < D4_NT; ++t)
+      if (t < ntok) {
+        const float4 xv = __ldg((const float4*)(x + (long long)t * ncols) + i);
+#pragma unroll
+        for (int r = 0; r < 4; ++r) s[r][t] += wf[r].x * xv.x + wf[r].y * xv.y + wf[r].z * xv.z + wf[r].w * xv.w;
+      }
+  }
+  for (int t = 0; t < ntok; ++t)
+#pragma unroll
+    for (int r = 0; r < 4; ++r) {
+      float v = d4_block_sum(s[r][t], red);
+      if (tid == 0 && r0 + r < nrows) y[(long long)t * y_tstride + r0 + r] = v;
+    }
+}
+
 // Y = W X, W's rows F16 (the file's): 4 rows a block, K across its 256 threads.
 extern "C" __global__ void d4_mv_f16(int ncols, int nrows, const u16* __restrict__ w,
                                      const float* __restrict__ x, float* __restrict__ y) {
@@ -679,10 +762,14 @@ __device__ __forceinline__ void d4_read_through(const unsigned long long* srcs, 
 // Y[z] = W[z] X[z] for each expert z (grid z): W[z]'s rows at PTRS[z] + ADD
 // (a device address: the expert's slot; read through from SRCS[z] first
 // when that is set), X[z] at z*X_STRIDE, Y[z] at
-// z*Y_STRIDE.  ggml's kernel_mul_mv_iq2_xxs_f32.  64 threads.
+// z*Y_STRIDE.  ggml's kernel_mul_mv_iq2_xxs_f32.  64 threads.  With COUNTS
+// (a few tokens' experts at once), expert z's tokens are rows BASES[z] ..
+// BASES[z]+COUNTS[z]-1 of X and Y, its weights read once for them all
+// (from the cache after the first).
 extern "C" __global__ void d4_mv_iq2_xxs(int ncols, int nrows, int row_bytes, long long add, int x_stride, int y_stride,
                                          const unsigned long long* __restrict__ ptrs, const unsigned long long* __restrict__ srcs,
-                                         const float* __restrict__ src1, float* __restrict__ dst) {
+                                         const float* __restrict__ src1, float* __restrict__ dst,
+                                         const unsigned* __restrict__ counts, const unsigned* __restrict__ bases) {
   __shared__ unsigned long long svalues[256];
   __shared__ unsigned char ssigns[128];
   int tiisg = threadIdx.x & 31, sgitg = threadIdx.x >> 5;
@@ -691,7 +778,6 @@ extern "C" __global__ void d4_mv_iq2_xxs(int ncols, int nrows, int row_bytes, lo
   const int z = blockIdx.z;
   d4_read_through(srcs, ptrs, z, add, nrows, row_bytes);
   const unsigned char* x = (const unsigned char*)(ptrs[z] + add) + (long long)first_row * row_bytes;
-  const float* y = src1 + (long long)z * x_stride;
   {
     int pos = (32 * sgitg + tiisg) * 4;
     for (int i = 0; i < 4; ++i) svalues[pos + i] = d4_iq2xxs_grid[pos + i];
@@ -699,6 +785,10 @@ extern "C" __global__ void d4_mv_iq2_xxs(int ncols, int nrows, int row_bytes, lo
     for (int i = 0; i < 2; ++i) ssigns[pos + i] = d4_ksigns_iq2xs[pos + i];
     __syncthreads();
   }
+  const int ntok = counts ? (int)counts[z] : 1;
+  const long long tok0 = counts ? (long long)bases[z] : z;
+  for (int tk = 0; tk < ntok; ++tk) {
+  const float* y = src1 + (tok0 + tk) * x_stride;
   float sumf[D4_MV_NR0] = {0.f, 0.f, 0.f, 0.f};
   if (first_row < nrows) {
     const float* y4 = y + 32 * tiisg;
@@ -733,11 +823,12 @@ extern "C" __global__ void d4_mv_iq2_xxs(int ncols, int nrows, int row_bytes, lo
       y4 += 32 * 32;
     }
   }
-  float* out = dst + (long long)z * y_stride;
+  float* out = dst + (tok0 + tk) * y_stride;
 #pragma unroll
   for (int row = 0; row < D4_MV_NR0; ++row) {
     const float s = warp_sum(sumf[row]);
     if (tiisg == 0 && first_row + row < nrows) out[first_row + row] = s * 0.25f;
+  }
   }
 }
 
@@ -745,14 +836,18 @@ extern "C" __global__ void d4_mv_iq2_xxs(int ncols, int nrows, int row_bytes, lo
 // bytes, 64 of quants, then d and dmin (84 bytes).
 extern "C" __global__ void d4_mv_q2_k(int ncols, int nrows, int row_bytes, long long add, int x_stride, int y_stride,
                                       const unsigned long long* __restrict__ ptrs, const unsigned long long* __restrict__ srcs,
-                                      const float* __restrict__ src1, float* __restrict__ dst) {
+                                      const float* __restrict__ src1, float* __restrict__ dst,
+                                         const unsigned* __restrict__ counts, const unsigned* __restrict__ bases) {
   int tiisg = threadIdx.x & 31, sgitg = threadIdx.x >> 5;
   const int nb = ncols / D4_QK_K;
   const int first_row = (blockIdx.x * D4_MV_NSG + sgitg) * D4_MV_NR0;
   const int z = blockIdx.z;
   d4_read_through(srcs, ptrs, z, add, nrows, row_bytes);
   const unsigned char* x = (const unsigned char*)(ptrs[z] + add) + (long long)first_row * row_bytes;
-  const float* y = src1 + (long long)z * x_stride;
+  const int ntok = counts ? (int)counts[z] : 1;
+  const long long tok0 = counts ? (long long)bases[z] : z;
+  for (int tk = 0; tk < ntok; ++tk) {
+  const float* y = src1 + (tok0 + tk) * x_stride;
   float sumf[D4_MV_NR0] = {0.f, 0.f, 0.f, 0.f};
   const int ix = tiisg / 8, it = tiisg % 8, iq = it / 4, ir = it % 4, is = (8 * ir) / 16;
   if (first_row < nrows) {
@@ -793,11 +888,12 @@ extern "C" __global__ void d4_mv_q2_k(int ncols, int nrows, int row_bytes, long 
       y4 += 4 * D4_QK_K;
     }
   }
-  float* out = dst + (long long)z * y_stride;
+  float* out = dst + (tok0 + tk) * y_stride;
 #pragma unroll
   for (int row = 0; row < D4_MV_NR0; ++row) {
     const float s = warp_sum(sumf[row]);
     if (tiisg == 0 && first_row + row < nrows) out[first_row + row] = s;
+  }
   }
 }
 

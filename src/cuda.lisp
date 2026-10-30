@@ -390,6 +390,14 @@
     (cu "cuMemcpyHtoDAsync_v2" (sb-alien:unsigned-long (+ (dbuf-ptr b) offset))
         (sb-sys:system-area-pointer sap) (sb-alien:unsigned-long bytes) (sb-sys:system-area-pointer stream))))
 
+(defun cuda-copy-dd (dst dst-offset src src-offset bytes)
+  "BYTES of device buffer SRC at SRC-OFFSET into DST at DST-OFFSET, queued
+   on DST's device's stream."
+  (with-cuda
+    (cu "cuMemcpyDtoDAsync_v2" (sb-alien:unsigned-long (+ (dbuf-ptr dst) dst-offset))
+        (sb-alien:unsigned-long (+ (dbuf-ptr src) src-offset)) (sb-alien:unsigned-long bytes)
+        (sb-sys:system-area-pointer (cudev-stream (dbuf-dev dst))))))
+
 (defun cuda-copy-out (sap b offset bytes)
   "BYTES of B at OFFSET to host SAP, queued on B's device's stream (no wait)."
   (with-cuda

@@ -448,11 +448,11 @@
           do (setf (sb-sys:sap-ref-single h (+ +dt-w+ (* 4 j))) (aref w i)))
     (cuda-copy-in in 0 h (+ +dt-w+ (* 4 k)) (cudev-stream dev))
     (launch dev "d4_mv_iq2_xxs" (list (ceiling ff 8) 1 (* 2 k)) 64
-            (list d ff (second (dl-gate-exps l)) (list :i64 0) 0 ff (cons in +dt-ptrs+) nil in (dt-gu tr)))
+            (list d ff (second (dl-gate-exps l)) (list :i64 0) 0 ff (cons in +dt-ptrs+) nil in (dt-gu tr) nil nil))
     (launch dev "d4_swiglu_w" (ceiling (* k ff) 256) 256
             (list k ff (svref (ds4f-clamps m) li) (dt-gu tr) (cons (dt-gu tr) (* 4 k ff)) (cons in +dt-w+) (dt-mid tr) nil nil))
     (launch dev "d4_mv_q2_k" (list (ceiling d 8) 1 k) 64
-            (list ff d (second (dl-down-exps l)) (list :i64 (* 2 gb)) ff d (cons in +dt-ptrs+) nil (dt-mid tr) (dt-down tr)))
+            (list ff d (second (dl-down-exps l)) (list :i64 (* 2 gb)) ff d (cons in +dt-ptrs+) nil (dt-mid tr) (dt-down tr) nil nil))
     (cuda-copy-out (dt-host-out tr) (dt-down tr) 0 (* 4 k d))
     (cuda-event-record (dt-event tr) (cudev-stream dev))
     (cuda-current (dk-dev st))))
@@ -778,10 +778,10 @@
                               :type :u64))))
             (bw (dk-put st (loop for i across (dp-a-idx plan) collect (aref w i)) :type :f32)))
         (launch dev "d4_mv_iq2_xxs" (list (ceiling ff 8) 1 (* 2 k1)) 64
-                (list d ff (second (dl-gate-exps l)) (list :i64 0) 0 ff ptrs srcs norm2 bgu))
+                (list d ff (second (dl-gate-exps l)) (list :i64 0) 0 ff ptrs srcs norm2 bgu nil nil))
         (launch dev "d4_swiglu_w" (ceiling (* k1 ff) 256) 256 (list k1 ff clamp bgu (cons bgu (* 4 k1 ff)) bw bm nil nil))
         (launch dev "d4_mv_q2_k" (list (ceiling d 8) 1 k1) 64
-                (list ff d (second (dl-down-exps l)) (list :i64 (* 2 gb)) ff d ptrs srcs bm bd))))
+                (list ff d (second (dl-down-exps l)) (list :i64 (* 2 gb)) ff d ptrs srcs bm bd nil nil))))
     (when (plusp k2) (d4-tier-launch m st l plan w))
     ;; the CPUs' experts while the devices compute theirs
     (when (plusp k3)

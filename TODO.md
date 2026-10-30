@@ -16,13 +16,14 @@
 
 - Routed experts the GPUs lack computed on the CPUs (AVX2), from pinned
   host memory, while the GPUs compute theirs.
-- Speculative decoding (ds4f-spec.lisp, Metal only, off there) on CUDA.
+- Speculative decoding (cuda-ds4f-spec.lisp): a verifying pass costs 38 ms
+  and 10 ms a token more (decode 31 ms); the extra tokens' cost is mostly
+  their experts -- cheaper passes would let more text gain.
 - Prefill (layer-major, cuda-ds4f-prefill.lisp, ~420 t/s on a 1904-token
   prompt): its copies (every layer's experts, ~60 GB a pass) and its
   kernels now overlap; next, the second device computing the experts it
   holds (a third fewer copies), the tensor cores in int8 for the experts,
-  d4_attend's register spills; short chunks (speculative steps) still go a
-  token at a time.
+  d4_attend's register spills.
 - The Q8_0 products (d4_mvq8, the largest kernel) and IQ2_XXS's closer to
   the memory's speed; fewer, larger launches.
 

@@ -67,13 +67,36 @@
   (launch (dk-dev st) kernel (list (ceiling n 64) (ceiling rows 64)) 128
           (list cols rows n rbytes x-stride y-stride w wd x y)))
 
-(defun dk-q8mm (st name x y n &rest keys)
-  (let ((w (or (gethash name (dk-q8 st)) (error "no Q8_0 tensor ~A" name))))
-    (apply #'dk-mm st "d4_mm_q8_0" (cmat-qs w) (cmat-d w) 0 (cmat-rows w) (cmat-cols w) x y n keys)))
+(defvar *dk-small* nil
+  "During a short pass (a speculative step's few tokens): the products as
+   decode's matvecs, each weight read once for all the tokens.")
 
-(defun dk-f16mm (st name x y n &rest keys)
+(defvar *dk-keep-proj* nil
+  "During a verifying pass: each layer's compressor projections kept in
+   buffers of its own, so its carried windows can be redone for fewer
+   tokens (DS4F-CUDA-UNDO).")
+
+(defun dk-q8mm (st name x y n &rest keys &key group-rows &allow-other-keys)
+  "Y = W X for Q8_0 tensor NAME over N tokens: the tensor cores' product,
+   or in a short pass decode's (X quantized as decode quantizes it; row r
+   against its token's group r/GROUP-ROWS when grouped)."
+  (let ((w (or (gethash name (dk-q8 st)) (error "no Q8_0 tensor ~A" name))))
+    (if *dk-small*
+        (let* ((dev (dk-dev st)) (rows (cmat-rows w)) (cols (cmat-cols w))
+               (xlen (if group-rows (* cols (floor rows group-rows)) cols))
+               (q (dk-qbuf st :v-x (* n xlen))))
+          (launch dev "d4_quant" (ceiling (* n xlen) 256) 256 (list x (car q) (cdr q) (floor (* n xlen) 32)))
+          (launch dev "d4_mvq8n" (ceiling rows 4) 128
+                  (list rows cols (or group-rows rows) n xlen rows (cmat-qs w) (cmat-d w) (car q) (cdr q) y)))
+        (progn
+          (assert (null group-rows))
+          (apply #'dk-mm st "d4_mm_q8_0" (cmat-qs w) (cmat-d w) 0 (cmat-rows w) (cmat-cols w) x y n keys)))))
+
+(defun dk-f16mm (st name x y n &rest keys &key y-stride &allow-other-keys)
   (destructuring-bind (w rows cols) (or (gethash name (dk-f16 st)) (error "no F16 tensor ~A" name))
-    (apply #'dk-mm st "d4_mm_f16" w nil (* 2 cols) rows cols x y n keys)))
+    (if *dk-small*
+        (launch (dk-dev st) "d4_mv_f16n" (ceiling rows 4) 256 (list cols rows n (or y-stride rows) w x y))
+        (apply #'dk-mm st "d4_mm_f16" w nil (* 2 cols) rows cols x y n keys))))
 
 (defun dk-cs-rows (m st key pos-list il &optional inverse)
   "D4-ROPE-CS!'s table for each position of POS-LIST, a row each: in scratch
@@ -146,6 +169,11 @@
             (list ratio width pos0 n wstart (f32mat-cols ape) prev-from (if set-prev 1 0)
                   pkv psc (dvec st (f32mat-data ape)) (dvec st st-kv) (dvec st st-sc)))))
 
+(defun dk-proj-key (kind which li)
+  "The scratch key of compressor KIND's projection WHICH (0 kv, 1 score) for layer LI."
+  (let ((base (svref #("P-CKV" "P-CSC" "P-IKV" "P-ISC") (+ (* 2 kind) which))))
+    (intern (if *dk-keep-proj* (format nil "~A-~D" base li) base) :keyword)))
+
 (defun dk-compressor-chunk (m st l li c norm pos0 n kind)
   "A compressor (KIND 0 the attention's, 1 the indexer's) over the chunk:
    its projections, every window ending in it pooled, the carried window
@@ -157,8 +185,8 @@
          (rows (if (= kind 0) (dc-comp c) (dc-ix-comp c))) (dst0 (if (= kind 0) (dc-n-comp c) (dc-n-ix c)))
          (wstart (* ratio (floor pos0 ratio))) (e-pos (+ pos0 n -1))
          (p0 (+ wstart ratio -1)) (nb (if (> p0 e-pos) 0 (1+ (floor (- e-pos p0) ratio))))
-         (pkv (pb st (if (= kind 0) :p-ckv :p-ikv) (* n width)))
-         (psc (pb st (if (= kind 0) :p-csc :p-isc) (* n width))))
+         (pkv (pb st (dk-proj-key kind 0 li) (* n width)))
+         (psc (pb st (dk-proj-key kind 1 li) (* n width))))
     (dk-f16mm st (lname li (if (= kind 0) "attn_compressor_kv.weight" "indexer_compressor_kv.weight")) norm pkv n)
     (dk-f16mm st (lname li (if (= kind 0) "attn_compressor_gate.weight" "indexer_compressor_gate.weight")) norm psc n)
     (when (plusp nb)
@@ -231,11 +259,13 @@
                   (list nh hd (/ 1f0 (sqrt (float hd 1f0))) top-k 0 (if indexed 0 1)
                         q kr kc (dk-u32s st raws) (dk-u32s st nraw) (dk-u32s st ncomp) idx (dvec st (dl-sinks l)) heads)))))
     (dk-rope-chunk st heads ics nh hd nrot n)
-    (let ((w (gethash (lname li "attn_output_a.weight") (dk-q8 st))))
+    (if *dk-small*
+        (dk-q8mm st (lname li "attn_output_a.weight") heads low n :group-rows rank)
+     (let ((w (gethash (lname li "attn_output_a.weight") (dk-q8 st))))
       (dotimes (g groups)
         (dk-mm st "d4_mm_q8_0" (cons (cmat-qs w) (* g rank gdim)) (cons (cmat-d w) (* 2 g rank (floor gdim 32)))
                0 rank gdim (cons heads (* 4 g gdim)) (cons low (* 4 g rank)) n
-               :x-stride (* nh hd) :y-stride (* groups rank))))
+               :x-stride (* nh hd) :y-stride (* groups rank)))))
     (dk-q8mm st (lname li "attn_output_b.weight") low aout n)
     (dk-hc-post-chunk m st aout sa pc sb n)))
 
@@ -301,26 +331,67 @@
     (launch dev "d4_moe_sum_rows" (ceiling (* n d) 256) 256 (list d nu n down smap (pb st :p-sout (* n d)) moe))
     (dk-hc-post-chunk m st moe sb (pb st :p-pcf (* n 32)) sa n)))
 
+(defvar *dk-stage* nil
+  "During a pass: the staging slots free to take ((slot ...)), the only slots
+   its copies go into -- the pool's least recently used, so the experts decode
+   keeps there are left where they are.")
+
+(defun d4-stage-slots (st k exclude)
+  "The K least recently used slots of the pool not in run EXCLUDE (first . count), emptied for staging."
+  (let* ((n (dk-n-slots st)) (used (dk-used st)) (pin (dk-pin st))
+         (cands (loop for s below n
+                      unless (or (and (>= s (car exclude)) (< s (+ (car exclude) (cdr exclude)))) (plusp (aref pin s)))
+                        collect s)))
+    ;; emptied: what they held would otherwise be taken as held by a layer
+    (let ((stage (subseq (sort cands #'< :key (lambda (s) (aref used s))) 0 k)) (owner (dk-owner st)))
+      (dolist (s stage stage)
+        (when (>= (aref owner s) 0)
+          (setf (aref (dk-slot-of st) (aref owner s)) -1 (aref owner s) -1))))))
+
 (defun d4-take-layer (m st li)
   "Slots for all of layer LI's experts, held (pinned) until let go: those
-   the pool lacks claimed and their copies queued on the copy stream (the
-   held ones first, so no claim displaces one of them).  (values slots event)."
+   the pool holds where they are, the others copied into staging slots, the
+   copies queued on the copy stream.  (values slots event staged)."
   (let* ((ne (ds4f-n-expert m)) (slot-of (dk-slot-of st)) (pin (dk-pin st)) (used (dk-used st))
-         (tick (incf (dk-tick st))) (slots (make-array ne :initial-element -1)))
-    (declare (type (simple-array fixnum (*)) slot-of pin used))
+         (owner (dk-owner st)) (tick (incf (dk-tick st))) (slots (make-array ne :initial-element -1)) (staged '()))
+    (declare (type (simple-array fixnum (*)) slot-of pin used owner))
     (dotimes (e ne)
-      (let ((s (aref slot-of (+ (* li ne) e))))
-        (when (>= s 0) (incf (aref pin s)) (setf (aref used s) tick (aref slots e) s) (incf (dk-hits st)))))
-    (dotimes (e ne)
-      (when (minusp (aref slots e))
-        (let ((s (d4-claim m st li e)))
-          (incf (aref pin s)) (incf (dk-misses st)) (setf (aref slots e) s))))
+      (let ((key (+ (* li ne) e)))
+        (let ((s (aref slot-of key)))
+          (if (>= s 0)
+              (progn (incf (aref pin s)) (setf (aref used s) tick) (incf (dk-hits st)))
+              (progn
+                (setf s (or (pop (car *dk-stage*)) (error "a pass is out of staging slots")))
+                (when (>= (aref owner s) 0) (setf (aref slot-of (aref owner s)) -1))
+                ;; low priority once let go: decode's misses take these first
+                (setf (aref owner s) key (aref slot-of key) s (aref used s) 0)
+                (incf (aref pin s)) (incf (dk-misses st)) (push s staged)
+                (d4-copy-expert m st li e s)))
+          (setf (aref slots e) s))))
     (let ((ev (cuda-event-create (dk-dev st))))
       (cuda-event-record ev (dk-copy-stream st))
-      (values slots ev))))
+      (values slots ev staged))))
 
-(defun d4-let-go (st slots)
-  (loop for s across slots do (decf (aref (dk-pin st) s))))
+(defun d4-let-go (st slots staged)
+  (loop for s across slots do (decf (aref (dk-pin st) s)))
+  (setf (car *dk-stage*) (append staged (car *dk-stage*))))
+
+(defun dk-ready (m st ctx)
+  "What is copied in once (the hash tables, the layers' vectors, a fresh
+   context's caches), before a pass queues anything: behind its copies a
+   copy on the compute stream holds up its layer."
+  (loop for l across (ds4f-layers m) for li from 0 when (dl-tid2eid l) do (dk-tid2eid st li l))
+  (loop for l across (ds4f-layers m)
+        do (dolist (v (list (dl-attn-norm l) (dl-q-a-norm l) (dl-kv-norm l) (dl-ffn-norm l) (dl-sinks l)
+                            (dl-hc-attn-scale l) (dl-hc-attn-base l) (dl-hc-ffn-scale l) (dl-hc-ffn-base l)
+                            (dl-comp-norm l) (dl-ixc-norm l) (dl-probs-b l)
+                            (and (dl-comp-ape l) (f32mat-data (dl-comp-ape l)))
+                            (and (dl-ixc-ape l) (f32mat-data (dl-ixc-ape l)))))
+             (when v (dvec st v))))
+  (loop for c across (d4ctx-caches ctx)
+        do (dolist (v (list (dc-raw c) (dc-comp c) (dc-st-kv c) (dc-st-score c)
+                            (dc-ix-comp c) (dc-ix-kv c) (dc-ix-score c)))
+             (when v (dvec st v)))))
 
 (defun ds4f-cuda-prefill-1 (ctx tokens logits)
   "DS4F-PREFILL-1 on the device: the chunk TOKENS at the next positions,
@@ -335,6 +406,7 @@
       (let* ((run (d4-borrow-slots st (+ (* n *ds4f-cuda-chunk-bytes*) (* 64 1024 1024))))
              (base (+ (dbuf-ptr (dk-pool st)) (* (car run) (dk-slot-bytes st))))
              (*dk-scratch* (list base (+ base (* (cdr run) (dk-slot-bytes st))) (make-hash-table)))
+             (*dk-stage* (list (d4-stage-slots st (* 2 (ds4f-n-expert m)) run)))
              (*dk-mapped* (cons (or (getf (dk-bufs st) :p-mapped-sap)
                                     (setf (getf (dk-bufs st) :p-mapped-sap) (cuda-host-alloc +dk-mapped-bytes+ :mapped t)))
                                 0))
@@ -357,26 +429,14 @@
                (tables (loop for li in (list li-plain li-comp) for k from 0
                              collect (and li (cons (dk-cs-rows m st (if (zerop k) :p-cs0 :p-cs1) positions li)
                                                    (dk-cs-rows m st (if (zerop k) :p-ics0 :p-ics1) positions li t))))))
-          ;; what is copied in once (the hash tables, a fresh context's caches) before the
-          ;; copies are queued: behind them a copy on the compute stream holds up its layer
-          (loop for l across (ds4f-layers m) for li from 0 when (dl-tid2eid l) do (dk-tid2eid st li l))
-          (loop for l across (ds4f-layers m)
-                do (dolist (v (list (dl-attn-norm l) (dl-q-a-norm l) (dl-kv-norm l) (dl-ffn-norm l) (dl-sinks l)
-                                    (dl-hc-attn-scale l) (dl-hc-attn-base l) (dl-hc-ffn-scale l) (dl-hc-ffn-base l)
-                                    (dl-comp-norm l) (dl-ixc-norm l) (dl-probs-b l)
-                                    (and (dl-comp-ape l) (f32mat-data (dl-comp-ape l)))
-                                    (and (dl-ixc-ape l) (f32mat-data (dl-ixc-ape l)))))
-                     (when v (dvec st v))))
-          (loop for c across (d4ctx-caches ctx)
-                do (dolist (v (list (dc-raw c) (dc-comp c) (dc-st-kv c) (dc-st-score c)
-                                    (dc-ix-comp c) (dc-ix-kv c) (dc-ix-score c)))
-                     (when v (dvec st v))))
-          (multiple-value-bind (slots ev) (d4-take-layer m st 0)
+          (dk-ready m st ctx)
+          (multiple-value-bind (slots ev staged) (d4-take-layer m st 0)
             (dotimes (li nl)
               (let* ((l (svref (ds4f-layers m) li)) (c (svref (d4ctx-caches ctx) li))
                      (tab (if (plusp (dl-ratio l)) (second tables) (first tables))))
                 ;; the next layer's experts come in while this one computes
-                (multiple-value-bind (nslots nev) (if (< (1+ li) nl) (d4-take-layer m st (1+ li)) (values nil nil))
+                (multiple-value-bind (nslots nev nstaged)
+                    (if (< (1+ li) nl) (d4-take-layer m st (1+ li)) (values nil nil nil))
                   (dk-attention-chunk m st l li c pos0 n sa sb (car tab) (cdr tab))
                   (dk-ffn-head-chunk m st l li n sb)
                   (cuda-stream-wait (cudev-stream dev) ev)
@@ -385,8 +445,8 @@
                   (dk-arena-reset st)
                   (setf (cdr *dk-mapped*) 0)
                   (cuda-event-destroy ev)
-                  (d4-let-go st slots)
-                  (setf slots nslots ev nev)))))
+                  (d4-let-go st slots staged)
+                  (setf slots nslots ev nev staged nstaged)))))
           (incf (d4ctx-pos ctx) n)
           (when logits
             (let ((out (dk-head m st (cons sa (* 4 (1- n) hcd)))) (v (d4ctx-logits ctx)))

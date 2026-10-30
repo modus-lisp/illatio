@@ -39,10 +39,11 @@
      (:file "avx2" :if-feature (:and :sbcl :x86-64)) ; its experts' row dots as AVX2
      (:file "cuda-ds4f" :if-feature (:and :sbcl :linux)) ; its decode on an NVIDIA GPU, experts in host memory
      (:file "cuda-ds4f-prefill" :if-feature (:and :sbcl :linux)) ; its prefill there, layer-major
+     (:file "cuda-ds4f-spec" :if-feature (:and :sbcl :linux)) ; its speculative steps there
      (:file "metal-ds4f" :if-feature (:and :sbcl :darwin)) ; it on the GPU: prefill, decode's experts
      (:file "metal-ds4f-decode" :if-feature (:and :sbcl :darwin)) ; a token's every layer on it
      (:file "metal-ds4f-prefill" :if-feature (:and :sbcl :darwin)) ; a prefill chunk's
-     (:file "ds4f-spec" :if-feature (:and :sbcl :darwin)))))) ; a few tokens a step, guessed from the context
+     (:file "ds4f-spec" :if-feature (:and :sbcl (:or :darwin :linux))))))) ; a few tokens a step, guessed from the context
 
 (defsystem "illatio/openai"
   :description "OpenAI chat completions computed in this image: chat templates
