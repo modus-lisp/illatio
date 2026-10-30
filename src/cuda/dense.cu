@@ -527,11 +527,27 @@ attn_prefill(const float* __restrict__ q, const float* __restrict__ kc, const fl
   int last = pos0 + min(n, t0 + nq) - 1;      // the furthest position a query here sees
   for (int p0 = 0; p0 <= last; p0 += FA_K) {
     __syncthreads();
-    for (int e = threadIdx.x; e < FA_K * hd; e += blockDim.x) {
-      int kk = e / hd, j = e % hd, p = p0 + kk;
-      bool ok = p <= last;
-      sk[j * (FA_K + 1) + kk] = ok ? kc[(long long)p * kvd + kvh * hd + j] : 0.0f;
-      sv[kk * hd + j] = ok ? vc[(long long)p * kvd + kvh * hd + j] : 0.0f;
+    {
+      // the tile as float4s, all of a thread's loads in flight at once
+      int h4 = hd >> 2, nl = FA_K * h4;       // 2048 float4 at most: 16 a thread
+      float4 rk[16], rv[16];
+#pragma unroll
+      for (int u = 0; u < 16; u++) {
+        int e = threadIdx.x + u * 128, kk = e / h4, c = e % h4, p = p0 + kk;
+        bool ok = e < nl && p <= last;
+        long long o = (long long)p * kvd + kvh * hd;
+        rk[u] = ok ? __ldg((const float4*)(kc + o) + c) : make_float4(0, 0, 0, 0);
+        rv[u] = ok ? __ldg((const float4*)(vc + o) + c) : make_float4(0, 0, 0, 0);
+      }
+#pragma unroll
+      for (int u = 0; u < 16; u++) {
+        int e = threadIdx.x + u * 128, kk = e / h4, c = e % h4;
+        if (e < nl) {
+          sk[(4 * c + 0) * (FA_K + 1) + kk] = rk[u].x; sk[(4 * c + 1) * (FA_K + 1) + kk] = rk[u].y;
+          sk[(4 * c + 2) * (FA_K + 1) + kk] = rk[u].z; sk[(4 * c + 3) * (FA_K + 1) + kk] = rk[u].w;
+          *(float4*)(sv + kk * hd + 4 * c) = rv[u];
+        }
+      }
     }
     __syncthreads();
     int p = p0 + lane;
@@ -686,6 +702,129 @@ mm_q8_mma(const i8* __restrict__ wq, const u16* __restrict__ wd,
       float v = c[i][j][k] + (bias ? bias[r] : 0.0f);
       long long o = (long long)t * rows + r;
       y[o] = acc ? y[o] + v : v;
+    }
+  }
+}
+
+// --- prefill attention, GEMM-style -------------------------------------------------
+// A block takes one query head and 64 tokens and walks the keys 32 at a time.
+// Both products are register-tiled: for the scores a thread holds 4 queries
+// x 2 keys (keys TX and TX+16, so a quarter-warp's float4 reads of K's padded
+// rows hit distinct banks), for the output 4 queries x HD/16 elements.  The
+// softmax of a query runs across the 16 threads that hold it, with
+// shuffles.  Needs 4*(64*(HD+4) + 32*(HD+4) + 32*HD + 32*68) bytes of shared
+// memory: 76 KB for HD 128.  HD a multiple of 64, up to 256.
+#define F2_Q 64
+#define F2_K 32
+extern "C" __global__ void __launch_bounds__(256)
+attn_prefill2(const float* __restrict__ q, const float* __restrict__ kc, const float* __restrict__ vc,
+              float* __restrict__ out, int nh, int nkv, int hd, int pos0, int n, float scale) {
+  extern __shared__ __align__(16) float fsm[];
+  int hp = hd + 4;
+  float* sq = fsm;                            // [64][hd+4]
+  float* sk = sq + F2_Q * hp;                 // [32][hd+4]
+  float* sv = sk + F2_K * hp;                 // [32][hd]
+  float* sp = sv + F2_K * hd;                 // [32][68]: P, a key's row of 64 queries
+  int head = blockIdx.x, t0 = blockIdx.y * F2_Q;
+  int tid = threadIdx.x, tx = tid & 15, ty = tid >> 4;
+  int kvh = head / (nh / nkv), kvd = nkv * hd, qd = nh * hd;
+  int h4 = hd >> 2, nw = hd >> 6;             // float4s a row; float4s a thread's output row
+  for (int e = tid; e < F2_Q * h4; e += 256) {
+    int tq = e / h4, c = e % h4, t = t0 + tq;
+    float4 v = t < n ? __ldg((const float4*)(q + (long long)t * qd + head * hd) + c) : make_float4(0, 0, 0, 0);
+    v.x *= scale; v.y *= scale; v.z *= scale; v.w *= scale;
+    *(float4*)(sq + tq * hp + 4 * c) = v;
+  }
+  float o[4][16], m[4], l[4];
+#pragma unroll
+  for (int i = 0; i < 4; i++) { m[i] = -INFINITY; l[i] = 0.0f;
+#pragma unroll
+    for (int e = 0; e < 16; e++) o[i][e] = 0.0f; }
+  int last = pos0 + min(n, t0 + F2_Q) - 1;
+  for (int p0 = 0; p0 <= last; p0 += F2_K) {
+    __syncthreads();
+    {
+      float4 rk[8], rv[8];                    // 32 rows x 64 float4 at most / 256 threads
+#pragma unroll
+      for (int u = 0; u < 8; u++) {
+        int e = tid + u * 256, kk = e / h4, c = e % h4, p = p0 + kk;
+        bool ok = kk < F2_K && p <= last;
+        long long off = (long long)p * kvd + kvh * hd;
+        rk[u] = ok ? __ldg((const float4*)(kc + off) + c) : make_float4(0, 0, 0, 0);
+        rv[u] = ok ? __ldg((const float4*)(vc + off) + c) : make_float4(0, 0, 0, 0);
+      }
+#pragma unroll
+      for (int u = 0; u < 8; u++) {
+        int e = tid + u * 256, kk = e / h4, c = e % h4;
+        if (kk < F2_K) { *(float4*)(sk + kk * hp + 4 * c) = rk[u]; *(float4*)(sv + kk * hd + 4 * c) = rv[u]; }
+      }
+    }
+    __syncthreads();
+    // scores: queries 4ty..4ty+3, keys tx and tx+16
+    float s[4][2];
+#pragma unroll
+    for (int i = 0; i < 4; i++) { s[i][0] = 0.0f; s[i][1] = 0.0f; }
+    for (int j = 0; j < hd; j += 4) {
+      float4 k0 = *(const float4*)(sk + tx * hp + j), k1 = *(const float4*)(sk + (tx + 16) * hp + j);
+#pragma unroll
+      for (int i = 0; i < 4; i++) {
+        float4 qv = *(const float4*)(sq + (4 * ty + i) * hp + j);
+        s[i][0] += qv.x * k0.x + qv.y * k0.y + qv.z * k0.z + qv.w * k0.w;
+        s[i][1] += qv.x * k1.x + qv.y * k1.y + qv.z * k1.z + qv.w * k1.w;
+      }
+    }
+    float pw[4][2], f[4];
+#pragma unroll
+    for (int i = 0; i < 4; i++) {
+      int qpos = pos0 + t0 + 4 * ty + i;
+      bool live = t0 + 4 * ty + i < n;
+      float a = (live && p0 + tx <= qpos) ? s[i][0] : -INFINITY;
+      float b = (live && p0 + tx + 16 <= qpos) ? s[i][1] : -INFINITY;
+      float mx = fmaxf(a, b);
+      for (int x = 8; x > 0; x >>= 1) mx = fmaxf(mx, __shfl_xor_sync(0xffffffff, mx, x));
+      float mn = fmaxf(m[i], mx);
+      float ea = mn == -INFINITY ? 0.0f : expf(a - mn), eb = mn == -INFINITY ? 0.0f : expf(b - mn);
+      float ls = ea + eb;
+      for (int x = 8; x > 0; x >>= 1) ls += __shfl_xor_sync(0xffffffff, ls, x);
+      f[i] = mn == -INFINITY ? 1.0f : expf(m[i] - mn);
+      l[i] = l[i] * f[i] + ls;
+      m[i] = mn;
+      pw[i][0] = ea; pw[i][1] = eb;
+    }
+    *(float4*)(sp + tx * 68 + 4 * ty) = make_float4(pw[0][0], pw[1][0], pw[2][0], pw[3][0]);
+    *(float4*)(sp + (tx + 16) * 68 + 4 * ty) = make_float4(pw[0][1], pw[1][1], pw[2][1], pw[3][1]);
+#pragma unroll
+    for (int i = 0; i < 4; i++)
+#pragma unroll
+      for (int e = 0; e < 16; e++) o[i][e] *= f[i];
+    __syncthreads();
+    // output: queries 4ty..4ty+3, elements 4tx + 64w + c
+    for (int kk = 0; kk < F2_K; kk++) {
+      float4 pv = *(const float4*)(sp + kk * 68 + 4 * ty);
+      float pa[4] = {pv.x, pv.y, pv.z, pv.w};
+#pragma unroll
+      for (int w = 0; w < 4; w++) {
+        if (w < nw) {
+          float4 v = *(const float4*)(sv + kk * hd + 4 * tx + 64 * w);
+#pragma unroll
+          for (int i = 0; i < 4; i++) {
+            o[i][4 * w + 0] += pa[i] * v.x; o[i][4 * w + 1] += pa[i] * v.y;
+            o[i][4 * w + 2] += pa[i] * v.z; o[i][4 * w + 3] += pa[i] * v.w;
+          }
+        }
+      }
+    }
+  }
+#pragma unroll
+  for (int i = 0; i < 4; i++) {
+    int t = t0 + 4 * ty + i;
+    if (t < n) {
+      float inv = 1.0f / l[i];
+#pragma unroll
+      for (int w = 0; w < 4; w++)
+        if (w < nw)
+          *(float4*)(out + (long long)t * qd + head * hd + 4 * tx + 64 * w) =
+            make_float4(o[i][4 * w] * inv, o[i][4 * w + 1] * inv, o[i][4 * w + 2] * inv, o[i][4 * w + 3] * inv);
     }
   }
 }

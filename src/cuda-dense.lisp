@@ -211,11 +211,18 @@
                      ;; merged and quantized for the output projection
                      (launch dev "attn_merge" (list nh n) (max 32 hd)
                              (list (cctx-part st) (cctx-att st) xq xs nh hd pos0 chunk nsplit)))
-                   (multiple-value-bind (qpw bytes) (attn-prefill-shape dev hd)
-                     (launch dev "attn_prefill" (list nh (ceiling n (* 4 qpw))) 128
-                             (list (cctx-q st) (svref (cctx-kc st) li) (svref (cctx-vc st) li) (cctx-att st)
-                                   nh nkv hd pos0 n scale qpw)
-                             :shared bytes)
+                   (progn
+                     (let ((bytes2 (* 4 (+ (* 64 (+ hd 4)) (* 32 (+ hd 4)) (* 32 hd) (* 32 68)))))
+                       (if (and (zerop (mod hd 64)) (<= bytes2 (cudev-max-shared dev)))
+                           (launch dev "attn_prefill2" (list nh (ceiling n 64)) 256
+                                   (list (cctx-q st) (svref (cctx-kc st) li) (svref (cctx-vc st) li) (cctx-att st)
+                                         nh nkv hd pos0 n scale)
+                                   :shared bytes2)
+                           (multiple-value-bind (qpw bytes) (attn-prefill-shape dev hd)
+                             (launch dev "attn_prefill" (list nh (ceiling n (* 4 qpw))) 128
+                                     (list (cctx-q st) (svref (cctx-kc st) li) (svref (cctx-vc st) li) (cctx-att st)
+                                           nh nkv hd pos0 n scale qpw)
+                                     :shared bytes))))
                      (launch dev "quant_q8" (ceiling (* n qd) 256) 256
                              (list (cctx-att st) xq xs (list :i64 (floor (* n qd) 32))))))
                (cmat-mul dev (cmat-of cm (layer-wo l)) xq xs x n :acc t)
