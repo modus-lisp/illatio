@@ -294,13 +294,14 @@
 
 (defstruct (engine (:constructor %make-engine))
   model context
+  (max-tokens 2048)                     ; a request's max_tokens when it gives none
   (lock (sb-thread:make-mutex :name "illatio engine")))
 
-(defun make-engine (model &key (n-ctx (min 32768 (model-context-length model))))
+(defun make-engine (model &key (n-ctx (min 32768 (model-context-length model))) (max-tokens 2048))
   "A model and the one live context requests share.  One request runs at a
    time; consecutive requests that share a prefix (an agent's growing
    conversation) reuse its KV cache."
-  (%make-engine :model model :context (make-context model :n-ctx n-ctx)))
+  (%make-engine :model model :context (make-context model :n-ctx n-ctx) :max-tokens max-tokens))
 
 (defun hobj (&rest kv)
   (let ((h (make-hash-table :test 'equal)))
@@ -329,7 +330,7 @@
            (ds4f (member (model-arch m) '("deepseek4" "deepseek41") :test #'equal))
            (prompt (render-chat m (jget req "messages") (jget req "tools") :thinking thinking))
            (ids (tokenize m prompt))
-           (max (or (jget req "max_completion_tokens") (jget req "max_tokens") 2048))
+           (max (or (jget req "max_completion_tokens") (jget req "max_tokens") (engine-max-tokens engine)))
            (t0 (get-internal-real-time))
            (t1 nil))
       (multiple-value-bind (text out reason reused)

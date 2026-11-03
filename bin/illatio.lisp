@@ -5,6 +5,10 @@
 ;;;   illatio [FLAGS] --serve [[HOST]:PORT]
 ;;;                              OpenAI-compatible API (default 127.0.0.1:9931)
 ;;;
+;;;   illatio-server [FLAGS] [--host HOST] [--port PORT]
+;;;                              the server as a command of its own (llama-server's
+;;;                              way): bin/illatio-server, the same core
+;;;
 ;;; Modes are flags; a bare word is always text.  bin/illatio is the
 ;;; launcher (it keeps a core image so startup is instant).
 
@@ -23,7 +27,8 @@ usage:
   illatio [flags] \"text\"          continue the text, streamed (raw, no template)
   illatio [flags] --chat [\"text\"] chat; each line you type is a user turn
   illatio [flags] --serve [ADDR]  OpenAI-compatible server; ADDR is [HOST]:PORT
-                                  (default 127.0.0.1:9931)
+                                  (default 127.0.0.1:9931; or --host, --port); as a
+                                  command of its own: bin/illatio-server
   illatio [flags] --bench         llama-bench's tests, in its table: -p prompt
                                   tokens, -n generated, -d context depth (each a
                                   comma list), -r repetitions; e.g.
@@ -46,6 +51,30 @@ flags:
   -h, --help          this
 ")
 
+(defparameter +server-usage+
+  "illatio-server — illatio's OpenAI-compatible HTTP server
+
+usage:
+  illatio-server [flags]
+
+  POST /v1/chat/completions   (\"stream\": true for server-sent events)
+  GET  /v1/models
+  GET  /health
+
+flags:
+  -m, --model PATH    GGUF file (default $ILLATIO_MODEL)
+  --host HOST         address to listen on (default 127.0.0.1: there is no
+                      authentication; listen wider only behind something that has it)
+  --port PORT         port (default 9931)
+  -c, --ctx N         context size in tokens (default 8192)
+  -n, --predict N     max_tokens for a request that gives none (default 2048)
+  -t, --threads N     worker threads (default: the performance cores)
+  --gpu               run the model on the GPU (DeepSeek V4/V4.1 Flash use CUDA
+                      or Metal by themselves)
+  --device N          the CUDA device to run on (implies --gpu; default 0)
+  -h, --help          this
+")
+
 (defun die (fmt &rest args)
   (format *error-output* "illatio: ~?~%" fmt args)
   (uiop:quit 2))
@@ -64,7 +93,8 @@ flags:
                    ((member a '("-m" "--model") :test #'string=) (setf (getf opts :model) (val)))
                    ((member a '("-n" "--predict") :test #'string=)
                     (let ((v (val)))           ; --bench takes a list, as llama-bench does
-                      (setf (getf opts :predict) (int v) (getf opts :bench-n) (int-list v))))
+                      (setf (getf opts :predict) (int v) (getf opts :predict-given) t
+                            (getf opts :bench-n) (int-list v))))
                    ((string= a "--temp") (setf (getf opts :temp) (let ((*read-default-float-format* 'single-float))
                                                                     (coerce (read-from-string (val)) 'single-float))))
                    ((string= a "--seed") (setf (getf opts :seed) (int (val))))
@@ -78,6 +108,8 @@ flags:
                    ((string= a "-p") (setf (getf opts :bench-p) (int-list (val))))
                    ((string= a "-d") (setf (getf opts :bench-d) (int-list (val))))
                    ((string= a "-r") (setf (getf opts :bench-r) (int (val))))
+                   ((string= a "--host") (setf (getf opts :host) (val)))
+                   ((string= a "--port") (setf (getf opts :port) (int (val))))
                    ((string= a "--serve")
                     (setf (getf opts :mode) :serve)
                     (when (and args (find #\: (first args)) (not (eql 0 (search "-" (first args)))))
@@ -95,13 +127,14 @@ flags:
       (die "no model at ~A~%  pass -m PATH, or set ILLATIO_MODEL; the README says where to get one" p))
     p))
 
-(defun parse-addr (addr)
-  "[HOST]:PORT -> (values host port)."
+(defun parse-addr (addr &optional host port)
+  "[HOST]:PORT -> (values host port); HOST and PORT (--host, --port) over it."
   (if (null addr)
-      (values "127.0.0.1" 9931)
+      (values (or host "127.0.0.1") (or port 9931))
       (let ((c (position #\: addr :from-end t)))
-        (values (if (and c (plusp c)) (subseq addr 0 c) "127.0.0.1")
-                (or (parse-integer addr :start (if c (1+ c) 0) :junk-allowed t)
+        (values (or host (if (and c (plusp c)) (subseq addr 0 c) "127.0.0.1"))
+                (or port
+                    (parse-integer addr :start (if c (1+ c) 0) :junk-allowed t)
                     (die "bad address ~A: want [HOST]:PORT" addr))))))
 
 (defun load-it (opts)
@@ -167,9 +200,10 @@ flags:
             (setf messages (append messages (list msg)))))))))
 
 (defun run-serve (opts)
-  (multiple-value-bind (host port) (parse-addr (getf opts :addr))
+  (multiple-value-bind (host port) (parse-addr (getf opts :addr) (getf opts :host) (getf opts :port))
     (let* ((m (load-it opts))
-           (engine (make-engine m :n-ctx (getf opts :ctx))))
+           (engine (apply #'make-engine m :n-ctx (getf opts :ctx)
+                          (and (getf opts :predict-given) (list :max-tokens (getf opts :predict))))))
       (serve engine :host host :port port)
       (format *error-output* "illatio: serving http://~A:~D/v1 (context ~D)~%" host port (getf opts :ctx))
       (loop (sleep 3600)))))
@@ -219,6 +253,13 @@ flags:
               (force-output))))))))
 
 (defun main (args)
+  ;; bin/illatio-server: the server, its flags, its usage
+  (when (equal (first args) "--server-command")
+    (multiple-value-bind (opts text) (parse-args (rest args))
+      (cond ((getf opts :help) (write-string +server-usage+))
+            ((plusp (length text)) (die "illatio-server takes no text (~A); see --help" text))
+            (t (run-serve opts))))
+    (return-from main))
   (multiple-value-bind (opts text) (parse-args args)
     (cond ((getf opts :help) (write-string +usage+))
           ((eq (getf opts :mode) :serve) (run-serve opts))

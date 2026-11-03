@@ -14,7 +14,7 @@ laptop**, at the speed of the C engine it was ported from.
 ```
 bin/illatio "The capital of France is"
 bin/illatio --chat
-bin/illatio --serve :9931             # then: operandi --local :9931
+bin/illatio-server --port 9931        # then: operandi --local :9931
 operandi --illatio "task"             # or no server at all: the model in operandi's image
 ```
 
@@ -165,6 +165,18 @@ bin/illatio --chat [-s "system prompt"]                     # one line = one use
 bin/illatio --serve [[HOST]:PORT]                           # default 127.0.0.1:9931
 bin/illatio --bench [-p 512] [-n 128] [-d 0,4096] [-r 3]     # llama-bench's tests and table
 ```
+
+The server is also a command of its own, as llama-server is to llama-cli
+(the same core and flags, plus `--host` and `--port`; `-n` is the
+`max_tokens` of a request that gives none, 2048 by default):
+
+```
+bin/illatio-server -m PATH [--host 127.0.0.1] [--port 9931] [-c 8192] [-n 2048]
+```
+
+It answers `POST /v1/chat/completions` (streamed with `"stream": true`),
+`GET /v1/models` and `GET /health`, on loopback unless told otherwise: there
+is no authentication in front of it.
 
 `--gpu` runs a `qwen35` model on the GPU; DeepSeek V4 Flash always uses it
 on a Mac.  Raw text ends with llama-simple's speed line, so a quick
