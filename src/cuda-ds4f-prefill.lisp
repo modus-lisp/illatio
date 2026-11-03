@@ -304,7 +304,8 @@
    token's experts and weights (D4_ROUTE), the rows grouped by expert, the
    experts as one indexed product each for gate, up and down (D4_MM_ID,
    from their pool SLOTS), the sums in slot order with the shared expert,
-   HC post: SB into SA."
+   HC post: SB into SA.  SLOTS may be a function, called with the routing
+   (the device's SEL, N x n-used) once it is queued, that returns them."
   (let* ((dev (dk-dev st)) (d (ds4f-d m)) (ff (ds4f-ff-exp m)) (nu (ds4f-n-used m)) (ne (ds4f-n-expert m))
          (rows (* n nu)) (clamp (svref (ds4f-clamps m) li))
          (gb (dk-gate-bytes st)) (sbytes (dk-slot-bytes st)) (base (dbuf-ptr (dk-pool st)))
@@ -314,13 +315,14 @@
          (rank (pb st :p-rank rows)) (bases (pb st :p-bases ne)) (rmap (pb st :p-rmap rows))
          (smap (pb st :p-smap rows)) (wrow (pb st :p-wrow rows)) (x (pb st :p-x (* rows d)))
          (g (pb st :p-g (* rows ff))) (u (pb st :p-u (* rows ff))) (mid (pb st :p-mid (* rows ff)))
-         (down (pb st :p-down (* rows d))) (moe (pb st :p-moe (* n d)))
-         (ptrs (dk-mput st (map 'list (lambda (s) (+ base (* s sbytes))) slots) :u64)))
+         (down (pb st :p-down (* rows d))) (moe (pb st :p-moe (* n d))) (ptrs nil))
     (launch dev "d4_route" n ne
             (list ne nu (if (dl-tid2eid l) 1 0) (ds4f-expert-scale m) (if (dl-probs-b l) 1 0)
                   (pb st :p-logits (* n ne)) (and (dl-probs-b l) (dvec st (dl-probs-b l)))
                   (and (dl-tid2eid l) (dk-tid2eid st li l)) toks sel w)
             :shared (* 4 (+ (* 2 ne) 64 nu)))
+    (when (functionp slots) (setf slots (funcall slots sel)))
+    (setf ptrs (dk-mput st (map 'list (lambda (s) (if (>= s 0) (+ base (* s sbytes)) 0)) slots) :u64))
     (launch dev "d4_group_zero" (ceiling ne 256) (min ne 256) (list ne counts))
     (launch dev "d4_group_count" (ceiling rows 256) 256 (list rows ne nu sel counts rank))
     (launch dev "d4_group_scan" 1 ne (list rows ne nu counts bases))
@@ -356,14 +358,16 @@
         (when (>= (aref owner s) 0)
           (setf (aref (dk-slot-of st) (aref owner s)) -1 (aref owner s) -1))))))
 
-(defun d4-take-layer (m st li)
-  "Slots for all of layer LI's experts, held (pinned) until let go: those
-   the pool holds where they are, the others copied into staging slots, the
-   copies queued on the copy stream.  (values slots event staged)."
+(defun d4-take-layer (m st li &optional needed)
+  "Slots for all of layer LI's experts (those NEEDED, a bit vector, when
+   given; -1 for the others), held (pinned) until let go: those the pool
+   holds where they are, the others copied into staging slots, the copies
+   queued on the copy stream.  (values slots event staged)."
   (let* ((ne (ds4f-n-expert m)) (slot-of (dk-slot-of st)) (pin (dk-pin st)) (used (dk-used st))
          (owner (dk-owner st)) (tick (incf (dk-tick st))) (slots (make-array ne :initial-element -1)) (staged '()))
     (declare (type (simple-array fixnum (*)) slot-of pin used owner))
     (dotimes (e ne)
+      (when (or (null needed) (= 1 (sbit needed e)))
       (let ((key (+ (* li ne) e)))
         (let ((s (aref slot-of key)))
           (if (>= s 0)
@@ -375,13 +379,25 @@
                 (setf (aref owner s) key (aref slot-of key) s (aref used s) 0)
                 (incf (aref pin s)) (incf (dk-misses st)) (push s staged)
                 (d4-copy-expert m st li e s)))
-          (setf (aref slots e) s))))
+          (setf (aref slots e) s)))))
     (let ((ev (cuda-event-create (dk-dev st))))
       (cuda-event-record ev (dk-copy-stream st))
       (values slots ev staged))))
 
+(defun d4-take-routed (m st li sel n)
+  "D4-TAKE-LAYER for the experts the device's routing SEL (N tokens') picked,
+   once it is done; the compute stream waits for their copies."
+  (let* ((dev (dk-dev st)) (k (* n (ds4f-n-used m))) (u (make-array k :element-type '(unsigned-byte 32)))
+         (needed (make-array (ds4f-n-expert m) :element-type 'bit :initial-element 0)))
+    (cuda-sync dev)
+    (sb-sys:with-pinned-objects (u) (cuda-download sel (sb-sys:vector-sap u) (* 4 k)))
+    (loop for e across u do (setf (sbit needed e) 1))
+    (multiple-value-bind (slots ev staged) (d4-take-layer m st li needed)
+      (cuda-stream-wait (cudev-stream dev) ev)
+      (values slots ev staged))))
+
 (defun d4-let-go (st slots staged)
-  (loop for s across slots do (decf (aref (dk-pin st) s)))
+  (loop for s across slots when (>= s 0) do (decf (aref (dk-pin st) s)))
   (setf (car *dk-stage*) (append staged (car *dk-stage*))))
 
 (defun d4-call-keeping-pool (m st thunk)

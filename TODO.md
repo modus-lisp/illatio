@@ -21,8 +21,11 @@ V4.1 file is truncated.  Engram's tables want to be in memory
   3800 in 8.7 s (440 t/s).  A pass costs ~7 s in copies whatever its length
   (every expert the 3090's pool lacks, ~140 GB at ~20 GB/s), so prompts up
   to ~3500 tokens are bound by it.  The P40 could compute the experts it
-  holds (15% fewer copies) and read through its own link; a short pass
-  could take only the experts its tokens route to.  Past that, compute:
+  holds (15% fewer copies) and read through its own link.  Passes under
+  1024 tokens take only the experts their tokens route to (64 tokens: 2.9 s
+  against 7.5; 256: 4.9 against 7.6), but nothing is copied under their
+  compute: the copy stream could fetch likely experts during attention.
+  Past that, compute:
   the experts' D4_MM_ID (~3 s on 3800 tokens), the Q8_0 projections (~2 s),
   the f32 router (D41_MV_F32N, ~0.65 s: a tiled product would do).
 - Speculative decoding and saved state: V4.1 is kept out of both (its

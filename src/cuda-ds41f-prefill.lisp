@@ -23,6 +23,12 @@
    for -- the experts' copies cost a pass the same whatever its length, so
    the fewer passes the better.")
 
+(defparameter *ds41f-cuda-routed-below* 1024
+  "A pass of fewer tokens takes only the experts its tokens route to, each
+   layer's after its routing (no copies under the compute, but a short
+   pass's tokens pick half of them or fewer); a longer one takes all of the
+   next layer's while one computes.")
+
 (defparameter *ds41f-cuda-chunk-bytes* (* 1400 1024)
   "Device memory a token of a V4.1 pass takes, at most (its activations, the
    indexer's scores apart).")
@@ -238,7 +244,7 @@
          (d (ds4f-d m)) (n-hc (ds4f-n-hc m)) (hcd (* n-hc d)) (pos0 (d41ctx-pos ctx))
          (n (length tokens)) (tokv (coerce tokens 'simple-vector)) (wf (ds4f-file m))
          (nl (ds4f-n-layer m)) (positions (loop for i below n collect (+ pos0 i)))
-         (nc-max (floor (+ pos0 n) 1)))
+         (nc-max (floor (+ pos0 n) 1)) (routed (< n *ds41f-cuda-routed-below*)))
     (declare (type u8vec wf))
     (with-cuda
       (cuda-current dev)
@@ -274,12 +280,12 @@
           (let ((p1 (if (oddp pos0) pos0 (1+ pos0))))
             (dk41-cs-rows m st :p-cs2 (loop for p from p1 below (+ pos0 n) by 2 collect (1- p)) li-comp))
           (multiple-value-bind (eg tail) (dk41-engram-inputs m st ctx tokens)
-            (multiple-value-bind (slots ev staged) (d4-take-layer m st 0)
+            (multiple-value-bind (slots ev staged) (if routed (values nil nil nil) (d4-take-layer m st 0))
               (dotimes (li nl)
                 (let* ((l (svref (ds4f-layers m) li)) (tbl (position li (d41-eg-layers v)))
                        (comp (plusp (dl-ratio l))))
                   (multiple-value-bind (nslots nev nstaged)
-                      (if (< (1+ li) nl) (d4-take-layer m st (1+ li)) (values nil nil nil))
+                      (if (and (< (1+ li) nl) (not routed)) (d4-take-layer m st (1+ li)) (values nil nil nil))
                     (when tbl
                       (let ((kv (pb st :p-egkv (* n (1+ n-hc) d))))
                         (dk-f16mm st (lname li "engram_kv.weight") (nth tbl eg) kv n)
@@ -288,8 +294,14 @@
                                 (list d n-hc (ds4f-eps m) sa kv (dvec st (dl-eg-q-norm l)) (dvec st (dl-eg-k-norm l))))))
                     (dk41-attention-chunk m st l li ctx pos0 n sa sb pre pstride
                                           (if comp cs1 cs0) (if comp ics1 ics0))
-                    (cuda-stream-wait (cudev-stream dev) ev)
-                    (dk41-ffn-chunk m st l li n toks slots sb sa)
+                    (if routed
+                        (dk41-ffn-chunk m st l li n toks
+                                        (lambda (sel)
+                                          (multiple-value-setq (slots ev staged) (d4-take-routed m st li sel n))
+                                          slots)
+                                        sb sa)
+                        (progn (cuda-stream-wait (cudev-stream dev) ev)
+                               (dk41-ffn-chunk m st l li n toks slots sb sa)))
                     (cuda-sync dev)
                     (dk-arena-reset st)
                     (setf (cdr *dk-mapped*) 0)
