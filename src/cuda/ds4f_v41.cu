@@ -40,13 +40,16 @@ extern "C" __global__ void d41_rms(int n, float eps, const float* x, const float
   }
 }
 
-// RoPE on the last NROT dims of each of NH heads of WIDTH at X: CS the
-// pairs' (cos, sin), from the CPU; each turned element BF16.
-extern "C" __global__ void d41_rope(int nh, int width, int nrot, float* x, const float* cs) {
-  int half_rot = nrot / 2, gid = blockIdx.x * blockDim.x + threadIdx.x;
-  if (gid >= nh * half_rot) return;
-  int h = gid / half_rot, i = gid % half_rot;
-  float* p = x + (long long)h * width + (width - nrot) + 2 * i;
+// RoPE on the last NROT dims of each of NH heads of WIDTH at X, for NTOK
+// tokens (NH heads each, one after another): CS the pairs' (cos, sin), from
+// the CPU, NROT a token; each turned element BF16.
+extern "C" __global__ void d41_rope(int nh, int width, int nrot, int ntok, float* x, const float* cs) {
+  int half_rot = nrot / 2;
+  long long gid = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+  if (gid >= (long long)ntok * nh * half_rot) return;
+  int t = gid / (nh * half_rot), h = (gid / half_rot) % nh, i = gid % half_rot;
+  float* p = x + ((long long)t * nh + h) * width + (width - nrot) + 2 * i;
+  cs += (long long)t * nrot;
   float c = cs[2 * i], s = cs[2 * i + 1], x0 = p[0], x1 = p[1];
   p[0] = d41_bf16(__fsub_rn(__fmul_rn(x0, c), __fmul_rn(x1, s)));
   p[1] = d41_bf16(__fadd_rn(__fmul_rn(x0, s), __fmul_rn(x1, c)));
@@ -91,10 +94,11 @@ extern "C" __global__ void d41_quant(int n, int kind, float* x) {
 
 // hc_split_sinkhorn_one for 4 streams, kept apart from the sum: MIX's 24
 // into PC: POST[0..4), COMB[4..20) (as D4_HC_POST reads them), PRE[24..28).
-// A warp.
+// A warp a token (32 apart in MIX and PC).
 extern "C" __global__ void d41_hc_split(int iters, float eps, const float* mix, const float* scale,
                                         const float* base, float* pc) {
   const unsigned F = 0xffffffffu;
+  mix += blockIdx.x * 32; pc += blockIdx.x * 32;
   int lane = threadIdx.x, src = lane % 4, dst = (lane / 4) % 4, idx = src + dst * 4;
   float c = mix[8 + idx] * scale[2] + base[8 + idx];
   float mx = fmaxf(c, __shfl_xor_sync(F, c, 1)); mx = fmaxf(mx, __shfl_xor_sync(F, mx, 2));
@@ -114,10 +118,12 @@ extern "C" __global__ void d41_hc_split(int iters, float eps, const float* mix, 
   if (lane >= 4 && lane < 8) pc[lane - 4] = 2.f / (1.f + expf(-(mix[lane] * scale[1] + base[lane])));
 }
 
-// OUT[j] = bf16(sum_h STREAMS[h][j] PRE[h]), in stream order.
-extern "C" __global__ void d41_hc_sum(int d, int n, const float* streams, const float* pre, float* out) {
-  int j = blockIdx.x * blockDim.x + threadIdx.x;
+// OUT[j] = bf16(sum_h STREAMS[h][j] PRE[h]), in stream order; grid (D/256,
+// tokens), a token's PRE PSTRIDE after the one before (0: the same for all).
+extern "C" __global__ void d41_hc_sum(int d, int n, int pstride, const float* streams, const float* pre, float* out) {
+  int j = blockIdx.x * blockDim.x + threadIdx.x, t = blockIdx.y;
   if (j >= d) return;
+  streams += (long long)t * n * d; pre += (long long)t * pstride; out += (long long)t * d;
   float acc = 0.f;
   for (int h = 0; h < n; ++h) acc = __fadd_rn(acc, __fmul_rn(streams[h * d + j], pre[h]));
   out[j] = d41_bf16(acc);
@@ -162,6 +168,7 @@ extern "C" __global__ void d41_engram(int d, int n, float eps, float* streams, c
                                       const float* qw, const float* kw) {
   __shared__ float red[32];
   int h = blockIdx.x;
+  streams += (long long)blockIdx.y * n * d; kv += (long long)blockIdx.y * (n + 1) * d;   // grid (n, tokens)
   float* r = streams + (long long)h * d;
   const float* k = kv + (long long)h * d;
   const float* v = kv + (long long)n * d;
@@ -177,7 +184,8 @@ extern "C" __global__ void d41_engram(int d, int n, float eps, float* streams, c
 }
 
 // The shared expert's middle: bf16(silu(min(bf16 G, CLAMP)) * clamp(bf16 U)),
-// quantized into XQ / XS.
+// for FF values (a chunk's tokens' one after another); quantized into XQ /
+// XS too when XQ isn't null.
 extern "C" __global__ void d41_swiglu(int ff, float clamp, const float* g, const float* u, float* mid,
                                       i8* xq, float* xs) {
   int i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -185,7 +193,7 @@ extern "C" __global__ void d41_swiglu(int ff, float clamp, const float* g, const
   float gv = fminf(d41_bf16(g[i]), clamp), uv = fminf(fmaxf(d41_bf16(u[i]), -clamp), clamp);
   float v = d41_bf16(__fmul_rn(__fmul_rn(gv, d4_sigmoid(gv)), uv));
   mid[i] = v;
-  d4_quant_block(v, xq + (i & ~31), xs + (i >> 5), threadIdx.x & 31);
+  if (xq) d4_quant_block(v, xq + (i & ~31), xs + (i >> 5), threadIdx.x & 31);
 }
 
 // Y = W X, W's rows F32 (the router's): 4 rows a block, K across its 256 threads.
@@ -210,4 +218,76 @@ extern "C" __global__ void d41_mv_f32(int ncols, int nrows, const float* __restr
     float t = d4_block_sum(s[r], red);
     if (tid == 0 && r0 + r < nrows) y[r0 + r] = t;
   }
+}
+
+// --- a prefill chunk's own ------------------------------------------------------------
+
+// Y[t] = W X[t] for a chunk's tokens (grid (ROWS/4, tokens)), W's rows F32:
+// D41_MV_F32's sums, X_STRIDE and Y_STRIDE a token apart.
+extern "C" __global__ void d41_mv_f32n(int ncols, int nrows, int x_stride, int y_stride, const float* __restrict__ w,
+                                       const float* __restrict__ x, float* __restrict__ y) {
+  __shared__ float red[32];
+  int r0 = blockIdx.x * 4, tid = threadIdx.x;
+  x += (long long)blockIdx.y * x_stride; y += (long long)blockIdx.y * y_stride;
+  float s[4] = {0.f, 0.f, 0.f, 0.f};
+  const float4* x4 = (const float4*)x;
+  int n4 = ncols / 4;
+  for (int i = tid; i < n4; i += 256) {
+    float4 xv = x4[i];
+#pragma unroll
+    for (int r = 0; r < 4; ++r)
+      if (r0 + r < nrows) {
+        float4 wv = __ldg((const float4*)(w + (long long)(r0 + r) * ncols) + i);
+        s[r] += wv.x * xv.x + wv.y * xv.y + wv.z * xv.z + wv.w * xv.w;
+      }
+  }
+#pragma unroll
+  for (int r = 0; r < 4; ++r) {
+    float t = d4_block_sum(s[r], red);
+    if (tid == 0 && r0 + r < nrows) y[r0 + r] = t;
+  }
+}
+
+// The ratio-2 compressor's pairs that end in a chunk (from POS0): pair B
+// ends at the odd position P1 + 2B, its first token the one before -- the
+// chunk's row, or the one carried in CKV / CSC when it came before the
+// chunk.  D41_POOL2's arithmetic into LATENT row B.  Grid NB, HD threads.
+extern "C" __global__ void d41_pool2_chunk(int hd, int pos0, int p1, const float* pkv, const float* psc,
+                                           const float* ckv, const float* csc, float* latent) {
+  int b = blockIdx.x, j = threadIdx.x;
+  int p = p1 + 2 * b, a = p - 1;
+  float ka, sa;
+  if (a >= pos0) { ka = pkv[(long long)(a - pos0) * hd + j]; sa = psc[(long long)(a - pos0) * hd + j]; }
+  else { ka = ckv[j]; sa = csc[j]; }
+  float kb = pkv[(long long)(p - pos0) * hd + j], sb = psc[(long long)(p - pos0) * hd + j];
+  float m = fmaxf(sa, sb), ea = expf(sa - m), eb = expf(sb - m);
+  latent[(long long)b * hd + j] = d41_bf16(__fdiv_rn(__fadd_rn(__fmul_rn(ka, ea), __fmul_rn(kb, eb)), __fadd_rn(ea, eb)));
+}
+
+// D41_IX_SCORES for a chunk's tokens: SCORES[t][c] (NC a row) for the keys
+// token t sees (VIS[t]), -inf past them.  Grid (NC/8, tokens), 256 threads.
+extern "C" __global__ void d41_ix_scores_chunk(int nh, int nc, const float* __restrict__ q, const float* __restrict__ w,
+                                               const float* __restrict__ keys, const unsigned* __restrict__ vis,
+                                               float* __restrict__ scores) {
+  extern __shared__ float qs[];
+  int t = blockIdx.y;
+  q += (long long)t * nh * 128; w += (long long)t * nh; scores += (long long)t * nc;
+  int c = blockIdx.x * (blockDim.x >> 5) + (threadIdx.x >> 5), lane = threadIdx.x & 31;
+  unsigned v = vis[t];
+  if ((unsigned)(blockIdx.x * (blockDim.x >> 5)) >= v) {
+    if (c < nc && lane == 0) scores[c] = -INFINITY;
+    return;
+  }
+  for (int i = threadIdx.x; i < nh * 128; i += blockDim.x) qs[i] = q[i];
+  __syncthreads();
+  if (c >= nc) return;
+  if ((unsigned)c >= v) { if (lane == 0) scores[c] = -INFINITY; return; }
+  float4 k = __ldg((const float4*)(keys + (long long)c * 128) + lane);
+  float total = 0.f;
+  for (int h = 0; h < nh; ++h) {
+    float4 a = *(const float4*)(qs + h * 128 + lane * 4);
+    float dot = warp_sum(a.x * k.x + a.y * k.y + a.z * k.z + a.w * k.w);
+    total += fmaxf(dot, 0.f) * w[h];
+  }
+  if (lane == 0) scores[c] = total * (1.f / 64.f);
 }

@@ -16,7 +16,11 @@ V4.1 file is truncated.  Engram's tables want to be in memory
 - Misses cost the most: ~46 experts a token (10 MB each) read through
   PCIe, ~21 ms of ~77.  The P40 could read through its own link too;
   more slots by moving the head or engram_kv off the 3090.
-- Prefill: a token at a time so far (cuda-ds4f-prefill's chunks are V4's).
+- Prefill (cuda-ds41f-prefill.lisp) runs layer-major: 247 tokens in 6.9 s
+  against 29.9 s decoding them.  A pass costs ~6 s whatever its length: each
+  layer copies in every expert the 3090's pool lacks (~140 GB a pass).  A
+  short pass could take only the experts its tokens route to (after the
+  routing, so without the overlap), or compute the P40's there.
 - Speculative decoding and saved state: V4.1 is kept out of both (its
   shared caches, selection and Engram tail need undo/saving).
 - Candidate blocks (past 16384 compressed rows at the ratio-1 layers) are

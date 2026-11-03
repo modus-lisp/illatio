@@ -21,8 +21,8 @@
 (defun dk41-rms (dev x w out n eps &optional q)
   (launch dev "d41_rms" 1 (min 1024 n) (list n eps x w out (car q) (cdr q))))
 
-(defun dk41-rope (dev x cs nh width nrot)
-  (launch dev "d41_rope" (ceiling (* nh (floor nrot 2)) 256) 256 (list nh width nrot x cs)))
+(defun dk41-rope (dev x cs nh width nrot &optional (ntok 1))
+  (launch dev "d41_rope" (ceiling (* ntok nh (floor nrot 2)) 256) 256 (list nh width nrot ntok x cs)))
 
 (defun dk41-quant (dev x n kind)
   (launch dev "d41_quant" (ceiling n 256) 256 (list n (ecase kind (:fp8 0) (:fp4 1) (:fp4-e4m3 2)) x)))
@@ -35,7 +35,7 @@
     (dk-rms dev streams nil flat hcd 1 (ds4f-eps m))
     (dk-mv16 st fn flat mix)
     (launch dev "d41_hc_split" 1 32 (list (ds4f-sinkhorn m) 1f-6 mix (dvec st scale) (dvec st base) pc))
-    (launch dev "d41_hc_sum" (ceiling d 256) 256 (list d n streams pre out))))
+    (launch dev "d41_hc_sum" (ceiling d 256) 256 (list d n 0 streams pre out))))
 
 (defun dk41-engram (m st l li streams x)
   (let* ((dev (dk-dev st)) (d (ds4f-d m)) (n (ds4f-n-hc m))
@@ -203,7 +203,7 @@
       (when logits
         (let* ((q (dk-qbuf st :hnorm d)) (embd (dbuf-of st :hembd (* 4 d))) (norm (dbuf-of st :hnorm (* 4 d)))
                (out (dbuf-of st :out (* 4 (ds4f-n-vocab m)))) (lv (d41ctx-logits ctx)))
-          (launch dev "d41_hc_sum" (ceiling d 256) 256 (list d n sa (cons (dbuf-of st :pcf 0) 96) embd))
+          (launch dev "d41_hc_sum" (ceiling d 256) 256 (list d n 0 sa (cons (dbuf-of st :pcf 0) 96) embd))
           (dk41-rms dev embd (dvec st (ds4f-output-norm m)) norm d (ds4f-eps m) q)
           (dk-q8mv st "output.weight" norm out :q q)
           (sb-sys:with-pinned-objects (lv)

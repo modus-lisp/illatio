@@ -295,6 +295,10 @@
             (sb-sys:with-pinned-objects (u) (cuda-upload b (sb-sys:vector-sap u) (* 4 (length u))))
             (setf (getf (dk-bufs st) key) b))))))
 
+(defvar *dk41-round-moe* nil
+  "During a V4.1 pass (cuda-ds41f-prefill.lisp): DK-FFN-ROUTED-CHUNK rounds
+   the experts' sum and the streams to BF16.")
+
 (defun dk-ffn-routed-chunk (m st l li n toks slots sb sa)
   "The chunk's FFN past its router, routing included, on the device: each
    token's experts and weights (D4_ROUTE), the rows grouped by expert, the
@@ -330,7 +334,10 @@
       (launch dev "d4_swiglu_w" (ceiling (* rows ff) 256) 256 (list rows ff clamp g u wrow mid nil nil))
       (mm-id "d4_mm_id_q2_k" ff drows drb (* 2 gb) mid down))
     (launch dev "d4_moe_sum_rows" (ceiling (* n d) 256) 256 (list d nu n down smap (pb st :p-sout (* n d)) moe))
-    (dk-hc-post-chunk m st moe sb (pb st :p-pcf (* n 32)) sa n)))
+    (when *dk41-round-moe* (launch dev "d41_round" (ceiling (* n d) 256) 256 (list (* n d) moe nil nil)))
+    (dk-hc-post-chunk m st moe sb (pb st :p-pcf (* n 32)) sa n)
+    (when *dk41-round-moe*
+      (let ((k (* n (ds4f-n-hc m) d))) (launch dev "d41_round" (ceiling k 256) 256 (list k sa nil nil))))))
 
 (defvar *dk-stage* nil
   "During a pass: the staging slots free to take ((slot ...)), the only slots
