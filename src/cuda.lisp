@@ -63,6 +63,7 @@
   name ctx stream module arch
   (total-memory 0)
   (max-shared 49152)                    ; bytes of shared memory a block may opt in to
+  (numa-node -1)                        ; the host memory node its bus is on, -1 when unknown
   (functions (make-hash-table :test 'equal))
   (shared-set (make-hash-table :test 'equal)) ; kernel -> the dynamic shared size allowed it
   ;; cuLaunchKernel's argument block: 64 values of 8 bytes, then 64 pointers to them
@@ -114,6 +115,15 @@
                                   (sb-alien:int a) (sb-alien:int d))
                               v)))
                      (+ (* 10 (attr 75)) (attr 76)))) ; compute capability major, minor
+             (numa-node (flet ((attr (a)
+                                 (sb-alien:with-alien ((v sb-alien:int 0))
+                                   (cu "cuDeviceGetAttribute" ((* sb-alien:int) (sb-alien:addr v))
+                                       (sb-alien:int a) (sb-alien:int d))
+                                   v)))
+                          ;; PCI domain, bus, device: the node sysfs gives the device
+                          (let ((path (format nil "/sys/bus/pci/devices/~(~4,'0x:~2,'0x:~2,'0x~).0/numa_node"
+                                              (attr 50) (attr 33) (attr 34))))
+                            (or (ignore-errors (with-open-file (f path) (parse-integer (read-line f)))) -1))))
              (max-shared (sb-alien:with-alien ((v sb-alien:int 0))
                            (cu "cuDeviceGetAttribute" ((* sb-alien:int) (sb-alien:addr v))
                                (sb-alien:int 97) (sb-alien:int d)) ; ..._PER_BLOCK_OPTIN
@@ -130,6 +140,7 @@
             (%make-cudev :index index :name name :arch arch
                          :ctx (sb-sys:int-sap ctx) :stream (sb-sys:int-sap stream)
                          :module (sb-sys:int-sap module) :total-memory mem :max-shared max-shared
+                         :numa-node numa-node
                          :params (sb-sys:int-sap (%mmap-anon (* 2 64 8))))))))))
 
 (defun cuda-function (dev name)

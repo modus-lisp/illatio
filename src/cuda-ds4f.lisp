@@ -98,11 +98,23 @@
   (let ((path (namestring (truename (gguf-path (ds4f-gguf m))))))
     (or (sb-unix:unix-open path sb-unix:o_rdonly 0) (error "cannot open ~A" path))))
 
-(defun d4-host-experts (m slot-bytes gate-bytes)
+(defun d4-prefer-node (base bytes node)
+  "BYTES at BASE, not yet touched, to come from memory node NODE while it
+   has room (mbind, MPOL_PREFERRED): copies to a device run at its bus's
+   speed only from its own node (26 GB/s against 16 from the other socket)."
+  (when (<= 0 node 63)
+    (let ((mask (make-array 1 :element-type '(unsigned-byte 64) :initial-element (ash 1 node))))
+      (sb-sys:with-pinned-objects (mask)
+        (sb-alien:alien-funcall
+         (sb-alien:extern-alien "syscall" (function sb-alien:long sb-alien:long sb-alien:unsigned-long sb-alien:unsigned-long
+                                                    sb-alien:long sb-alien:unsigned-long sb-alien:unsigned-long sb-alien:unsigned-long))
+         237 base bytes 1 (sb-sys:sap-int (sb-sys:vector-sap mask)) 65 0)))))  ; SYS_mbind, MPOL_PREFERRED
+
+(defun d4-host-experts (m slot-bytes gate-bytes &key (node -1))
   "Every routed expert in host memory, pinned: expert E of layer LI in slot
    LI*N-EXPERT+E (SLOT-BYTES each) as a device slot holds it -- gate, up,
    then down -- so a copy into the pool is one DMA.  Read by the model's
-   threads, an expert's tensor a read."
+   threads, an expert's tensor a read; from memory node NODE where it can."
   (let* ((ne (ds4f-n-expert m)) (keys (* (ds4f-n-layer m) ne))
          (span (* 2097152 (ceiling (* keys slot-bytes) 2097152)))
          (base (%mmap-anon span)) (sap (sb-sys:int-sap base)) (fd (d4-open m))
@@ -111,6 +123,7 @@
     (sb-alien:alien-funcall (sb-alien:extern-alien "madvise" (function sb-alien:int sb-alien:unsigned-long
                                                                        sb-alien:unsigned-long sb-alien:int))
                             base span 14)  ; MADV_HUGEPAGE
+    (d4-prefer-node base span node)
     (unwind-protect
          (parallel-for (k (* 3 keys) (ds4f-pool m))
            (multiple-value-bind (key part) (floor k 3)
@@ -217,7 +230,7 @@
                 (dk-event st) (cuda-event-create dev)
                 (dk-arena-host st) (cuda-host-alloc (* 1024 1024)) (dk-arena-dev st) (cuda-alloc dev (* 1024 1024))
                 (dk-rb st) (cuda-host-alloc (* 64 1024)))
-          (multiple-value-bind (sap bytes) (d4-host-experts m (dk-slot-bytes st) gb)
+          (multiple-value-bind (sap bytes) (d4-host-experts m (dk-slot-bytes st) gb :node (cudev-numa-node dev))
             (setf (dk-host st) sap (dk-host-bytes st) bytes))
           (d4-upload-weights m st)
           (d4-make-pool m st)
