@@ -513,3 +513,146 @@ extern "C" __global__ void d41_block_apply(int nc, int nb, int bsz, const unsign
   const unsigned b = c / (unsigned)bsz;
   if (b >= (unsigned)nb || !mask[(long long)t * nb + b]) scores[(long long)t * nc + c] = -INFINITY;
 }
+
+// Y[t][r] = W[r] . X[t], all f32, for many tokens (the router): a block
+// 64 tokens x 64 rows, a thread 4 x 4 of them, K 16 a step through shared
+// memory (each sum in K's order, one FMA a term).  NCOLS a multiple of 16;
+// X_STRIDE and Y_STRIDE a token apart.  grid (ceil(N/64), ceil(NROWS/64)), block 256.
+extern "C" __global__ void __launch_bounds__(256)
+d41_mm_f32(int ncols, int nrows, int n, int x_stride, int y_stride, const float* __restrict__ w,
+           const float* __restrict__ x, float* __restrict__ y) {
+  __shared__ float xs[16][64 + 4], ws[16][64 + 4];
+  const int t0 = blockIdx.x * 64, r0 = blockIdx.y * 64, tid = threadIdx.x;
+  const int tx = tid & 15, ty = tid >> 4;          // rows 4tx.., tokens 4ty..
+  const int lr = tid >> 2, lk = (tid & 3) * 4;     // loads: row/token lr, columns lk..lk+3
+  float acc[4][4];
+#pragma unroll
+  for (int i = 0; i < 4; ++i)
+#pragma unroll
+    for (int j = 0; j < 4; ++j) acc[i][j] = 0.f;
+  for (int k0 = 0; k0 < ncols; k0 += 16) {
+    float4 xv = make_float4(0.f, 0.f, 0.f, 0.f), wv = make_float4(0.f, 0.f, 0.f, 0.f);
+    if (t0 + lr < n) xv = *(const float4*)(x + (long long)(t0 + lr) * x_stride + k0 + lk);
+    if (r0 + lr < nrows) wv = __ldg((const float4*)(w + (long long)(r0 + lr) * ncols + k0 + lk));
+    xs[lk][lr] = xv.x; xs[lk + 1][lr] = xv.y; xs[lk + 2][lr] = xv.z; xs[lk + 3][lr] = xv.w;
+    ws[lk][lr] = wv.x; ws[lk + 1][lr] = wv.y; ws[lk + 2][lr] = wv.z; ws[lk + 3][lr] = wv.w;
+    __syncthreads();
+#pragma unroll
+    for (int k = 0; k < 16; ++k) {
+      const float4 a = *(const float4*)&xs[k][4 * ty], b = *(const float4*)&ws[k][4 * tx];
+      const float av[4] = {a.x, a.y, a.z, a.w}, bv[4] = {b.x, b.y, b.z, b.w};
+#pragma unroll
+      for (int i = 0; i < 4; ++i)
+#pragma unroll
+        for (int j = 0; j < 4; ++j) acc[i][j] = fmaf(av[i], bv[j], acc[i][j]);
+    }
+    __syncthreads();
+  }
+#pragma unroll
+  for (int i = 0; i < 4; ++i) {
+    const int t = t0 + 4 * ty + i;
+    if (t >= n) continue;
+#pragma unroll
+    for (int j = 0; j < 4; ++j) {
+      const int r = r0 + 4 * tx + j;
+      if (r < nrows) y[(long long)t * y_stride + r] = acc[i][j];
+    }
+  }
+}
+
+// D41_IX_SCORES_CHUNK on the tensor cores (NH 32): Q and the keys are FP4
+// values with power-of-two scales, exact in BF16, so each head's dot is
+// exact products summed in f32; the heads then added in order, as there.
+// A block 128 keys x 32 tokens, 8 warps: the keys in shared memory, then
+// token by token its Q, warp w's dots keys 16w.. for all 32 heads, the
+// heads' sum a thread a key.  grid (ceil(NC/128), ceil(N/32)), block 256,
+// shared D41_IXM_SHARED.
+#define D41_IXR (128 + 8)               // a BF16 row of 128 (+8 against bank conflicts)
+#define D41_IXS2 (128 + 4)              // a row of the dots
+#define D41_IXM_SHARED (2 * 128 * D41_IXR + 2 * 32 * D41_IXR + 4 * 32 * D41_IXS2)
+
+extern "C" __global__ void __launch_bounds__(256)
+d41_ix_scores_mma(int nc, int n, const float* __restrict__ q, const float* __restrict__ w,
+                  const float* __restrict__ keys, const unsigned* __restrict__ vis, float* __restrict__ scores) {
+  extern __shared__ __align__(16) unsigned char d41_ixm[];
+  unsigned short* ks = (unsigned short*)d41_ixm;               // [128][D41_IXR]
+  unsigned short* qs = ks + 128 * D41_IXR;                      // [32][D41_IXR]
+  float* ss = (float*)(qs + 32 * D41_IXR);                      // [32][D41_IXS2]
+  const int c0 = blockIdx.x * 128, t0 = blockIdx.y * 32, tid = threadIdx.x;
+  const int lane = tid & 31, wp = tid >> 5, g = lane >> 2, tq = lane & 3;
+  const int tn = min(32, n - t0);
+  unsigned maxvis = 0;
+  for (int i = 0; i < tn; ++i) maxvis = max(maxvis, vis[t0 + i]);
+  if ((unsigned)c0 >= maxvis) {
+    for (int i = tid; i < tn * 128; i += 256) {
+      const int c = c0 + (i & 127);
+      if (c < nc) scores[(long long)(t0 + (i >> 7)) * nc + c] = -INFINITY;
+    }
+    return;
+  }
+  for (int i = tid; i < 128 * 64; i += 256) {
+    const int r = i >> 6, c = 2 * (i & 63);
+    float2 v = make_float2(0.f, 0.f);
+    if (c0 + r < nc) v = *(const float2*)(keys + (long long)(c0 + r) * 128 + c);
+    *(unsigned*)(ks + r * D41_IXR + c) = d41_bf16_pair(v.x, v.y);
+  }
+  for (int ti = 0; ti < tn; ++ti) {
+    const int t = t0 + ti;
+    const unsigned v = vis[t];
+    __syncthreads();                    // the keys in; the last token's dots read
+    const float2* qt = (const float2*)(q + (long long)t * 32 * 128);
+    for (int i = tid; i < 32 * 64; i += 256) {
+      const float2 x = qt[i];
+      *(unsigned*)(qs + (i >> 6) * D41_IXR + 2 * (i & 63)) = d41_bf16_pair(x.x, x.y);
+    }
+    __syncthreads();
+    if ((unsigned)(c0 + 16 * wp) < v) {
+      float c[2][2][4];
+#pragma unroll
+      for (int mt = 0; mt < 2; ++mt)
+#pragma unroll
+        for (int nt = 0; nt < 2; ++nt)
+#pragma unroll
+          for (int r = 0; r < 4; ++r) c[mt][nt][r] = 0.f;
+#pragma unroll
+      for (int k = 0; k < 128; k += 16) {
+        unsigned b[2][2];
+#pragma unroll
+        for (int nt = 0; nt < 2; ++nt) {
+          const unsigned short* kp = ks + (16 * wp + 8 * nt + g) * D41_IXR + k + 2 * tq;
+          b[nt][0] = *(const unsigned*)kp; b[nt][1] = *(const unsigned*)(kp + 8);
+        }
+#pragma unroll
+        for (int mt = 0; mt < 2; ++mt) {
+          const unsigned short* qa = qs + (16 * mt + g) * D41_IXR + k + 2 * tq;
+          const unsigned a0 = *(const unsigned*)qa, a1 = *(const unsigned*)(qa + 8 * D41_IXR),
+                         a2 = *(const unsigned*)(qa + 8), a3 = *(const unsigned*)(qa + 8 * D41_IXR + 8);
+#pragma unroll
+          for (int nt = 0; nt < 2; ++nt) d41_mma_bf16(c[mt][nt], a0, a1, a2, a3, b[nt][0], b[nt][1]);
+        }
+      }
+#pragma unroll
+      for (int mt = 0; mt < 2; ++mt)
+#pragma unroll
+        for (int nt = 0; nt < 2; ++nt) {
+          float* s0 = ss + (16 * mt + g) * D41_IXS2 + 16 * wp + 8 * nt + 2 * tq;
+          s0[0] = c[mt][nt][0]; s0[1] = c[mt][nt][1];
+          s0[8 * D41_IXS2] = c[mt][nt][2]; s0[8 * D41_IXS2 + 1] = c[mt][nt][3];
+        }
+    }
+    __syncthreads();
+    if (tid < 128) {
+      const int cc = c0 + tid;
+      if (cc < nc) {
+        float out = -INFINITY;
+        if ((unsigned)cc < v) {
+          const float* wt = w + (long long)t * 32;
+          float total = 0.f;
+          for (int h = 0; h < 32; ++h) total += fmaxf(ss[h * D41_IXS2 + tid], 0.f) * wt[h];
+          out = total * (1.f / 64.f);
+        }
+        scores[(long long)t * nc + cc] = out;
+      }
+    }
+  }
+}

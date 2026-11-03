@@ -148,9 +148,14 @@
               (dk41-quant dev ixq (* n ixh ixd) :fp4)
               (dk-f16mm st (lname li "indexer.proj.weight") norm ixw n)
               (dk41-round dev ixw (* n ixh))
-              (launch dev "d41_ix_scores_chunk" (list (ceiling nc 8) n) 256
-                      (list ixh nc ixq ixw (dvec st (svref (d41ctx-ix-comp ctx) k)) bvis scores)
-                      :shared (* 4 ixh ixd))
+              (if (and (>= (cudev-arch dev) 80) (= ixh 32))
+                  ;; on the tensor cores: Q and the keys are BF16 values
+                  (launch dev "d41_ix_scores_mma" (list (ceiling nc 128) (ceiling n 32)) 256
+                          (list nc n ixq ixw (dvec st (svref (d41ctx-ix-comp ctx) k)) bvis scores)
+                          :shared 60416)
+                  (launch dev "d41_ix_scores_chunk" (list (ceiling nc 8) n) 256
+                          (list ixh nc ixq ixw (dvec st (svref (d41ctx-ix-comp ctx) k)) bvis scores)
+                          :shared (* 4 ixh ixd)))
               (dk41-candidates m st li n nc bvis 0 scores)
               (launch dev "d4_topk_chunk" n 1024 (list nc top-k nc scores idx bvis)))))
         (when *dk41-pick* (setf ident 0))
@@ -190,7 +195,7 @@
     (dk41-rms-rows dev cur (dvec st (dl-ffn-norm l)) norm2 d n (ds4f-eps m))
     (destructuring-bind (w rows cols &optional type) (gethash (lname li "ffn_gate_inp.weight") (dk-f16 st))
       (declare (ignore type))
-      (launch dev "d41_mv_f32n" (list (ceiling rows 4) n) 256 (list cols rows cols rows w norm2 logits)))
+      (launch dev "d41_mm_f32" (list (ceiling n 64) (ceiling rows 64)) 256 (list cols rows n cols rows w norm2 logits)))
     (dk-q8mm st (lname li "ffn_gate_shexp.weight") norm2 sg n)
     (dk-q8mm st (lname li "ffn_up_shexp.weight") norm2 su n)
     (launch dev "d41_swiglu" (ceiling (* n ff) 256) 256 (list (* n ff) (svref (ds4f-clamps m) li) sg su smid nil nil))

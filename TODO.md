@@ -25,14 +25,13 @@ V4.1 file is truncated.  Engram's tables want to be in memory
   1024 tokens take only the experts their tokens route to (64 tokens: 2.9 s
   against 7.5; 256: 4.9 against 7.6), but nothing is copied under their
   compute: the copy stream could fetch likely experts during attention.
-  Past that, compute:
-  the experts' D4_MM_ID (~3 s on 3800 tokens), the Q8_0 projections (~2 s),
-  the f32 router (D41_MV_F32N, ~0.65 s: a tiled product would do).
+  Past that, compute: the experts' D4_MM_ID (~3 s on 3800 tokens) and
+  the Q8_0 projections (~2 s).
 - Speculative decoding and saved state: V4.1 is kept out of both (its
   shared caches, selection and Engram tail need undo/saving).
-- Long prompts are compute-bound: 20165 tokens in 62 s (6 passes), of it
-  the experts' D4_MM_ID 17 s and the Q8_0 projections 11 s (20-24
-  TFLOPS), the indexer's f32 scores 6.7 s and the f32 router 3.4 s.
+- Long prompts are compute-bound: 20181 tokens in 52 s (6 passes), most
+  of it the experts' D4_MM_ID (~17 s) and the Q8_0 projections (~11 s),
+  both at 20-24 TFLOPS of the 3090's ~70.
 - The hotlist (ds41f-hotlist.lisp) is from ~1,500 tokens; more traces.
 - ~450 launches a token, many of them BF16 passes that could fold into
   their producers.
