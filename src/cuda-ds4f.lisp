@@ -283,7 +283,7 @@
 (defvar *ds4f-hotlist-file* nil
   "A route trace (lines of *DS4F-ROUTE-TRACE*'s: a layer, its experts) to
    seed the pools from, the most used experts first, in place of the
-   built-in hotlist (V4's; V4.1 has none): NIL, none.")
+   built-in hotlists (ds4f-hotlist.lisp, ds41f-hotlist.lisp): NIL, none.")
 
 (defun d4-hotlist (m)
   "The experts the pools are seeded with, the most used first: (layer
@@ -300,6 +300,7 @@
                                        :key (lambda (k) (gethash k counts)))))
                        (coerce (loop for k in keys append (multiple-value-list (floor k ne))) 'simple-vector))))
                   ((and (= (ds4f-n-layer m) 43) (= (ds4f-n-expert m) 256)) +ds4f-hotlist+)
+                  ((and (ds4f-v41 m) (= (ds4f-n-layer m) 40) (= (ds4f-n-expert m) 384)) +ds41f-hotlist+)
                   (t #())))))
 
 (defun d4-make-pool (m st)

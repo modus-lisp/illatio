@@ -37,6 +37,7 @@
      (:file "ds41f")       ; DeepSeek V4.1 Flash (deepseek41): V4's pieces, ds4's V4.1 graph
      (:file "ds4f-kv")      ; its state saved: a long prompt prefilled once
      (:file "ds4f-hotlist") ; its most used experts (ds4's profile)
+     (:file "ds41f-hotlist") ; V4.1's (illatio's own profile)
      (:file "avx2" :if-feature (:and :sbcl :x86-64)) ; its experts' row dots as AVX2
      (:file "cuda-ds4f" :if-feature (:and :sbcl :linux)) ; its decode on an NVIDIA GPU, experts in host memory
      (:file "cuda-ds4f-prefill" :if-feature (:and :sbcl :linux)) ; its prefill there, layer-major

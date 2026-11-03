@@ -76,7 +76,7 @@
 
 (defstruct d41
   kv-src ix-src (cand-src -1) (cand-top 2048) (cand-block 8)
-  eg-layers token-map (pad 0) primes mults eg-offs
+  eg-layers token-map (pad 0) primes mults eg-offs eg-file   ; the tables' bytes: the mapped file, or a copy
   rope-plain rope-comp)                 ; 32 frequencies each: layers 0-1, the compressed ones
 
 (defun d41-rope-freqs (m base compressed)
@@ -124,6 +124,26 @@
 
 ;;; --- loading -------------------------------------------------------------------------
 
+(defvar *ds41f-engram-file* "/dev/shm/ds41f-engram.bin"
+  "A copy of the GGUF's Engram tables (its bytes from the first table to its
+   end) somewhere quick to read at random -- memory: a token reads 48 rows
+   scattered over 189 GB.  Used when it is there and the right size; else
+   the rows are read in the model's file.")
+
+(defun d41-engram-source! (v file path)
+  "Point V's tables at *DS41F-ENGRAM-FILE* when it holds them, else at FILE."
+  (let* ((base (reduce #'min (d41-eg-offs v)))
+         (size (with-open-file (s path :element-type '(unsigned-byte 8)) (file-length s)))
+         (copy (and *ds41f-engram-file* (probe-file *ds41f-engram-file*)
+                    (= (with-open-file (s *ds41f-engram-file* :element-type '(unsigned-byte 8)) (file-length s))
+                       (- size base))
+                    *ds41f-engram-file*)))
+    (if copy
+        (setf (d41-eg-file v) (map-file-vector copy)
+              (d41-eg-offs v) (mapcar (lambda (o) (- o base)) (d41-eg-offs v)))
+        (setf (d41-eg-file v) file))
+    v))
+
 (defun load-ds41f (path &key (threads (default-thread-count)))
   "DeepSeek V4.1 Flash at PATH, as LOAD-DS4F loads V4: the routed experts and
    Engram's tables left in the mapped file, the rest in memory."
@@ -170,6 +190,7 @@
                                              (+ (gguf-data-offset g)
                                                 (tensor-info-offset (gguf-tensor g (format nil "blk.~D.engram_embd.weight" li)))))
                                            eg-layers)))
+          (d41-engram-source! (ds4f-v41 m) (ds4f-file m) path)
           (setf (d41-rope-plain (ds4f-v41 m)) (d41-rope-freqs m (ds4f-rope-base m) nil)
                 (d41-rope-comp (ds4f-v41 m)) (d41-rope-freqs m (ds4f-comp-rope-base m) t))
           (setf (ds4f-layers m)
@@ -311,7 +332,7 @@
 (defun d41-engram-input (m tbl rows)
   "The 24 rows ROWS of Engram table TBL, decoded ([col][256]): E4M3 codes
    times their E8M0 scale per 32, BF16."
-  (let* ((wf (ds4f-file m)) (base (nth tbl (d41-eg-offs (ds4f-v41 m)))) (x (f32vec (* 256 (length rows)))))
+  (let* ((wf (d41-eg-file (ds4f-v41 m))) (base (nth tbl (d41-eg-offs (ds4f-v41 m)))) (x (f32vec (* 256 (length rows)))))
     (declare (type u8vec wf))
     (loop for r in rows for col from 0
           do (let ((o (+ base (* r 264))))
