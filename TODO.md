@@ -19,7 +19,7 @@ V4.1 file is truncated.  Engram's tables want to be in memory
 - Prefill (cuda-ds41f-prefill.lisp) runs layer-major, a pass as long as
   the pool has room for (~4000 tokens): 247 tokens in ~7 s, 1904 in 7.6 s,
   3800 in 8.7 s (440 t/s).  A pass costs ~7 s in copies whatever its length
-  (every expert the 3090's pool lacks, ~140 GB at ~20 GB/s), so prompts up
+  (every expert the 3090's pool lacks, ~140 GB at ~25 GB/s, the experts on the cards' own memory node), so prompts up
   to ~3500 tokens are bound by it.  The P40 could compute the experts it
   holds (15% fewer copies) and read through its own link.  Passes under
   1024 tokens take only the experts their tokens route to (64 tokens: 2.9 s
