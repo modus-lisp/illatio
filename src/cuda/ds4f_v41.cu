@@ -470,3 +470,46 @@ d41_attend_mma(int nh, int hd, float scale, int maxc, int rcap, int ident,
     }
   }
 }
+
+// --- candidate blocks (the late indexers past CAND_TOP blocks) ---------------------
+//
+// On the candidate source layer each token keeps its CAND_TOP best blocks of
+// BSZ compressed rows (its newest always); the later index layers pick only
+// in them.  D41_BLOCK_MAX: BMAX[t][b] = the best of token t's SCORES (rows of
+// NC) in block b (among its VIS[t] rows, VIS1 when VIS is null), its newest
+// block +inf; BVIS[t] its blocks.  grid (ceil(NB/256), N), block 256.
+extern "C" __global__ void d41_block_max(int nc, int nb, int bsz, const unsigned* vis, int vis1,
+                                         const float* __restrict__ scores, float* bmax, unsigned* bvis) {
+  const int t = blockIdx.y;
+  const unsigned b = blockIdx.x * 256 + threadIdx.x, v = vis ? vis[t] : (unsigned)vis1, ub = bsz;
+  const unsigned blocks = (v + ub - 1) / ub;
+  if (blockIdx.x == 0 && threadIdx.x == 0) bvis[t] = blocks;
+  if (b >= (unsigned)nb) return;
+  float m = -INFINITY;
+  if (b < blocks) {
+    if (b == (v - 1) / ub) m = INFINITY;
+    else for (unsigned j = b * ub; j < min(v, (b + 1) * ub); ++j) m = fmaxf(m, scores[(long long)t * nc + j]);
+  }
+  bmax[(long long)t * nb + b] = m;
+}
+
+// MASK[t][b] = 1 for the blocks BIDX lists for token t (the first
+// min(BVIS[t], K) of its row of K), else 0.  grid N, block 1024.
+extern "C" __global__ void d41_block_mask(int nb, int k, const unsigned* bvis, const unsigned* bidx,
+                                          unsigned char* mask) {
+  const int t = blockIdx.x;
+  unsigned char* mr = mask + (long long)t * nb;
+  for (int b = threadIdx.x; b < nb; b += blockDim.x) mr[b] = 0;
+  __syncthreads();
+  const unsigned m = min(bvis[t], (unsigned)k);
+  for (unsigned i = threadIdx.x; i < m; i += blockDim.x) mr[bidx[(long long)t * k + i]] = 1;
+}
+
+// SCORES[t][c] = -inf outside token t's candidate blocks.  grid (ceil(NC/256), N), block 256.
+extern "C" __global__ void d41_block_apply(int nc, int nb, int bsz, const unsigned char* mask, float* scores) {
+  const int t = blockIdx.y;
+  const unsigned c = blockIdx.x * 256 + threadIdx.x;
+  if (c >= (unsigned)nc) return;
+  const unsigned b = c / (unsigned)bsz;
+  if (b >= (unsigned)nb || !mask[(long long)t * nb + b]) scores[(long long)t * nc + c] = -INFINITY;
+}

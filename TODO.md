@@ -30,8 +30,9 @@ V4.1 file is truncated.  Engram's tables want to be in memory
   the f32 router (D41_MV_F32N, ~0.65 s: a tiled product would do).
 - Speculative decoding and saved state: V4.1 is kept out of both (its
   shared caches, selection and Engram tail need undo/saving).
-- Candidate blocks (past 16384 compressed rows at the ratio-1 layers) are
-  on the CPU only; the GPU asserts.
+- Long prompts are compute-bound: 20165 tokens in 62 s (6 passes), of it
+  the experts' D4_MM_ID 17 s and the Q8_0 projections 11 s (20-24
+  TFLOPS), the indexer's f32 scores 6.7 s and the f32 router 3.4 s.
 - The hotlist (ds41f-hotlist.lisp) is from ~1,500 tokens; more traces.
 - ~450 launches a token, many of them BF16 passes that could fold into
   their producers.

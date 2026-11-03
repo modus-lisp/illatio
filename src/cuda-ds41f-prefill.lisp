@@ -142,9 +142,6 @@
             (let* ((ixh (ds4f-ix-heads m)) (ixd (ds4f-ix-dim m)) (nc (aref vis (1- n)))
                    (ixq (pb st :p-ixq (* n ixh ixd))) (ixw (pb st :p-ixw (* n ixh)))
                    (scores (pb st :p-ixs (* n nc))) (bvis (dk-u32s st vis)))
-              (assert (<= (ceiling nc (d41-cand-block v)) (d41-cand-top v)) ()
-                      "V4.1's candidate blocks (past ~D compressed rows) are not on the GPU yet"
-                      (* (d41-cand-block v) (d41-cand-top v)))
               (dk-f16mm st (lname li "indexer.attn_q_b.weight") qrn ixq n)
               (dk41-round dev ixq (* n ixh ixd))
               (dk41-rope dev ixq cs ixh ixd nrot n)
@@ -154,6 +151,7 @@
               (launch dev "d41_ix_scores_chunk" (list (ceiling nc 8) n) 256
                       (list ixh nc ixq ixw (dvec st (svref (d41ctx-ix-comp ctx) k)) bvis scores)
                       :shared (* 4 ixh ixd))
+              (dk41-candidates m st li n nc bvis 0 scores)
               (launch dev "d4_topk_chunk" n 1024 (list nc top-k nc scores idx bvis)))))
         (when *dk41-pick* (setf ident 0))
         (dotimes (tk n) (setf (aref ncomp tk) (min top-k (aref vis tk))))))
@@ -248,7 +246,7 @@
     (declare (type u8vec wf))
     (with-cuda
       (cuda-current dev)
-      (let* ((run (d4-borrow-slots st (+ (* n *ds41f-cuda-chunk-bytes*) (* 4 n nc-max) (* 64 1024 1024))))
+      (let* ((run (d4-borrow-slots st (+ (* n *ds41f-cuda-chunk-bytes*) (* 5 n nc-max) (* 64 1024 1024))))
              (base (+ (dbuf-ptr (dk-pool st)) (* (car run) (dk-slot-bytes st))))
              (*dk-scratch* (list base (+ base (* (cdr run) (dk-slot-bytes st))) (make-hash-table)))
              (*dk-stage* (list (d4-stage-slots st (* 2 (ds4f-n-expert m)) run)))
@@ -329,7 +327,7 @@
    the staging ones (two layers' experts, and a few spare) hold its scratch."
   (let* ((st (ds4f-cuda-state m))
          (room (* (- (dk-n-slots st) (* 2 (ds4f-n-expert m)) 8) (dk-slot-bytes st))))
-    (flet ((bytes (n) (+ (* n *ds41f-cuda-chunk-bytes*) (* 4 n (+ pos0 n)) (* 64 1024 1024))))
+    (flet ((bytes (n) (+ (* n *ds41f-cuda-chunk-bytes*) (* 5 n (+ pos0 n)) (* 64 1024 1024))))
       (let ((n (floor room *ds41f-cuda-chunk-bytes*)))
         (loop while (and (> n 1) (> (bytes n) room)) do (setf n (floor (* n 15) 16)))
         (max n 1)))))

@@ -71,6 +71,22 @@
         (dk41-rope dev row cs 1 hd nrot)
         (dk41-quant dev row hd :fp4-e4m3)))))
 
+(defun dk41-candidates (m st li n nc vis vis1 scores)
+  "Candidate blocks, once more than the kept number of blocks are seen: on
+   their source layer each of the N tokens' best blocks of its SCORES (rows
+   of NC; token t's first VIS[t], or VIS1) into the mask, on a later index
+   layer its SCORES outside them -inf."
+  (let* ((v (ds4f-v41 m)) (dev (dk-dev st)) (src (d41-cand-src v)) (bsz (d41-cand-block v))
+         (top (d41-cand-top v)) (nb (ceiling nc bsz)))
+    (when (and (>= src 0) (>= li src) (> nb top))
+      (let ((mask (pb st :p-cmask (ceiling (* n nb) 4))))
+        (if (= li src)
+            (let ((bmax (pb st :p-cbmax (* n nb))) (bv (pb st :p-cbvis n)) (bidx (pb st :p-cbidx (* n top))))
+              (launch dev "d41_block_max" (list (ceiling nb 256) n) 256 (list nc nb bsz vis vis1 scores bmax bv))
+              (launch dev "d4_topk_chunk" n 1024 (list nb top nb bmax bidx bv))
+              (launch dev "d41_block_mask" n 1024 (list nb top bv bidx mask)))
+            (launch dev "d41_block_apply" (list (ceiling nc 256) n) 256 (list nc nb bsz mask scores)))))))
+
 (defun dk41-attention (m st l li ctx pos sa sb pre)
   "Layer LI's attention for the token at POS: streams SA into SB, summed by PRE."
   (let* ((v (ds4f-v41 m)) (dev (dk-dev st)) (d (ds4f-d m)) (hd (ds4f-head-dim m)) (nh (ds4f-n-head m))
@@ -113,9 +129,6 @@
                    (ixq (dbuf-of st :ixq (* 4 ixh ixd))) (ixw (dbuf-of st :ixw (* 4 ixh)))
                    (scores (dbuf-of st :ixs (* 4 nc))))
               (assert (= ixd 128))
-              (assert (<= (ceiling nc (d41-cand-block v)) (d41-cand-top v)) ()
-                      "V4.1's candidate blocks (past ~D compressed rows) are not on the GPU yet"
-                      (* (d41-cand-block v) (d41-cand-top v)))
               (dk-mv16 st (lname li "indexer.attn_q_b.weight") qrn ixq)
               (dk41-round dev ixq (* ixh ixd))
               (dk41-rope dev ixq cs ixh ixd nrot)
@@ -125,6 +138,7 @@
               (launch dev "d41_ix_scores" (ceiling nc 8) 256
                       (list ixh nc ixq ixw (dvec st (svref (d41ctx-ix-comp ctx) k)) scores)
                       :shared (* 4 ixh ixd))
+              (dk41-candidates m st li 1 nc nil nc scores)
               (launch dev "d4_topk" 1 1024 (list nc top-k scores idx)))))
         (setf attended (min nc top-k))))
     (launch dev "d4_attend1" (floor nh 4) 128
