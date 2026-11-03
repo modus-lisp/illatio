@@ -384,6 +384,24 @@
   (loop for s across slots do (decf (aref (dk-pin st) s)))
   (setf (car *dk-stage*) (append staged (car *dk-stage*))))
 
+(defun d4-call-keeping-pool (m st thunk)
+  "THUNK's passes, then the pool as decode had it: the experts their
+   staging and scratch put out copied back into their slots (a pass takes
+   over half the pool, and decode would miss them for long after)."
+  (let ((owner (copy-seq (dk-owner st))) (used (copy-seq (dk-used st))))
+    (multiple-value-prog1 (funcall thunk)
+      (let ((ne (ds4f-n-expert m)) (now (dk-owner st)) (slot-of (dk-slot-of st)) (pin (dk-pin st)))
+        (declare (type (simple-array fixnum (*)) now slot-of pin))
+        (with-cuda
+          (cuda-current (dk-dev st))
+          (dotimes (s (length owner))
+            (let ((o (aref owner s)))
+              (when (and (>= o 0) (/= (aref now s) o) (< (aref slot-of o) 0) (zerop (aref pin s)))
+                (when (>= (aref now s) 0) (setf (aref slot-of (aref now s)) -1))
+                (setf (aref now s) o (aref slot-of o) s (aref (dk-used st) s) (aref used s))
+                (d4-copy-expert m st (floor o ne) (mod o ne) s))))
+          (cuda-stream-sync (dk-copy-stream st)))))))
+
 (defun dk-ready (m st ctx)
   "What is copied in once (the hash tables, the layers' vectors, a fresh
    context's caches), before a pass queues anything: behind its copies a

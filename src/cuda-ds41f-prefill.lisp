@@ -326,13 +326,19 @@
   "TOKENS into V4.1 context CTX on the device, a pass's most at a time
    (a short last piece decoded a token at a time)."
   (sb-int:with-float-traps-masked (:overflow :inexact :underflow :invalid)
-    (loop while tokens
-          do (let* ((k (min (length tokens)
-                            (or *ds41f-cuda-chunk* (ds41f-cuda-chunk-max (d41ctx-model ctx) (d41ctx-pos ctx)))))
-                    (chunk (subseq tokens 0 k)))
-               (setf tokens (nthcdr k tokens))
-               (if (>= k *ds41f-cuda-chunk-from*)
-                   (ds41f-cuda-prefill-1 ctx chunk (and logits (null tokens)))
-                   (loop for (tk . more) on chunk
-                         do (ds41f-forward-1 ctx tk (and logits (null more) (null tokens))))))))
+    (if (>= (length tokens) *ds41f-cuda-chunk-from*)
+        (let ((m (d41ctx-model ctx)))
+          (d4-call-keeping-pool m (ds4f-cuda-state m) (lambda () (ds41f-cuda-prefill-chunks ctx tokens logits))))
+        (ds41f-cuda-prefill-chunks ctx tokens logits)))
   ctx)
+
+(defun ds41f-cuda-prefill-chunks (ctx tokens logits)
+  (loop while tokens
+        do (let* ((k (min (length tokens)
+                          (or *ds41f-cuda-chunk* (ds41f-cuda-chunk-max (d41ctx-model ctx) (d41ctx-pos ctx)))))
+                  (chunk (subseq tokens 0 k)))
+             (setf tokens (nthcdr k tokens))
+             (if (>= k *ds41f-cuda-chunk-from*)
+                 (ds41f-cuda-prefill-1 ctx chunk (and logits (null tokens)))
+                 (loop for (tk . more) on chunk
+                       do (ds41f-forward-1 ctx tk (and logits (null more) (null tokens))))))))
