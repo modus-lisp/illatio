@@ -4,13 +4,26 @@
 
 - **GLM** (glm4moe): GLM-4.7-Flash, `GLM-4.7-Flash-UD-Q4_K_XL.gguf` on the
   Linux box (`/mnt/ollama/models/hf/glm-4.7-flash/`).
-- **DeepSeek V4.1 Flash** (`deepseek41`, "ds41f"): a different architecture
-  from ds4f -- 40 layers of 5120, 384 experts, engram (hashed n-gram)
-  embeddings at layers 1 and 14, KV and indexer rows shared across layers
-  (`kv_source_layer_ids`, `index_source_layer_ids`), candidate blocks.
-  `/mnt/ollama/DeepSeek-V4.1-Flash-Q2.gguf` (60 GB).  ds4 runs it -- the
-  reference to port from, as for ds4f (`ds4_deepseek41_*.h`, `ds4_engram.c`,
-  and a CUDA path, `ds4_deepseek41_cuda.cuh`).
+
+## DS41F (DeepSeek V4.1 Flash) on CUDA
+
+Decode runs (ds41f.lisp, cuda-ds41f.lisp): 13.0 t/s on the 3090 + P40,
+experts found on a device 81% of the time.  The GGUF is audreyt's
+(`/mnt/ollama/huggingface/hub/blobs/38/38e0...`); the `/mnt/ollama`
+V4.1 file is truncated.  Engram's tables want to be in memory
+(`/dev/shm/ds41f-engram.bin`, *ds41f-engram-file*).
+
+- Misses cost the most: ~46 experts a token (10 MB each) read through
+  PCIe, ~21 ms of ~77.  The P40 could read through its own link too;
+  more slots by moving the head or engram_kv off the 3090.
+- Prefill: a token at a time so far (cuda-ds4f-prefill's chunks are V4's).
+- Speculative decoding and saved state: V4.1 is kept out of both (its
+  shared caches, selection and Engram tail need undo/saving).
+- Candidate blocks (past 16384 compressed rows at the ratio-1 layers) are
+  on the CPU only; the GPU asserts.
+- The hotlist (ds41f-hotlist.lisp) is from ~1,500 tokens; more traces.
+- ~450 launches a token, many of them BF16 passes that could fold into
+  their producers.
 
 ## DS4F on CUDA
 

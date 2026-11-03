@@ -513,6 +513,10 @@
 
 ;;; --- a token -------------------------------------------------------------------------------
 
+(defvar *d41-probe* nil
+  "For tests: a function of (layer stage streams) called after each of a
+   token's sublayers (STAGE :ENGRAM, :ATTN, :FFN), by both decodes.")
+
 (defun ds41f-forward-1 (ctx token logits)
   #+(and sbcl linux)
   (when (ds4f-cuda-p)
@@ -528,17 +532,21 @@
     (multiple-value-bind (rows tail) (d41-engram-hash m (d41ctx-tail ctx) token)
       (dotimes (li (ds4f-n-layer m))
         (let ((l (svref (ds4f-layers m) li)) (tbl (position li (d41-eg-layers v))))
-          (when tbl (d41-engram! m l streams (d41-engram-input m tbl (nth tbl rows))))
+          (when tbl
+            (d41-engram! m l streams (d41-engram-input m tbl (nth tbl rows)))
+            (when *d41-probe* (funcall *d41-probe* li :engram streams)))
           (multiple-value-bind (pre-a post-a comb-a)
               (d41-hc-mix m (dl-hc-attn-fn l) (dl-hc-attn-scale l) (dl-hc-attn-base l) streams)
             (d41-hc-sum m streams pre x)
             (d41-hc-expand! m next (d41-attention m l li ctx x pos) streams post-a comb-a)
             (rotatef streams next)
+            (when *d41-probe* (funcall *d41-probe* li :attn streams))
             (multiple-value-bind (pre-f post-f comb-f)
                 (d41-hc-mix m (dl-hc-ffn-fn l) (dl-hc-ffn-scale l) (dl-hc-ffn-base l) streams)
               (d41-hc-sum m streams pre-a x)
               (d41-hc-expand! m next (d41-ffn m l li x) streams post-f comb-f)
               (rotatef streams next)
+              (when *d41-probe* (funcall *d41-probe* li :ffn streams))
               (setf pre pre-f)))))
       (setf (d41ctx-tail ctx) tail))
     (incf (d41ctx-pos ctx))
