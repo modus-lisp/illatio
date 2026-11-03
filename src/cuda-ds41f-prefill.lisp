@@ -15,10 +15,13 @@
 
 (defparameter *ds41f-cuda-chunk-from* 64
   "From this many tokens a V4.1 prompt goes through layer-major passes: a
-   pass reads nearly all of every layer's experts (about 4 s over the bus
+   pass reads nearly all of every layer's experts (about 7 s over the bus
    when the pool holds few), against about 50 ms a token decoding.")
 
-(defparameter *ds41f-cuda-chunk* 1024 "Tokens a V4.1 pass takes at most.")
+(defparameter *ds41f-cuda-chunk* nil
+  "Tokens a V4.1 pass takes at most; NIL, as many as the pool leaves room
+   for -- the experts' copies cost a pass the same whatever its length, so
+   the fewer passes the better.")
 
 (defparameter *ds41f-cuda-chunk-bytes* (* 1400 1024)
   "Device memory a token of a V4.1 pass takes, at most (its activations, the
@@ -150,10 +153,13 @@
         (dotimes (tk n) (setf (aref ncomp tk) (min top-k (aref vis tk))))))
     (let ((raws (make-array n)) (nraw (make-array n)))
       (dotimes (tk n) (setf (aref raws tk) (max 0 (- (+ prev tk 1) swa)) (aref nraw tk) (min swa (+ prev tk 1))))
-      (launch dev "d4_attend" n 512
-              (list nh hd (/ 1f0 (sqrt (float hd 1f0))) top-k 0 ident
-                    q kr (if k (dvec st (svref (d41ctx-comp ctx) k)) kr)
-                    (dk-u32s st raws) (dk-u32s st nraw) (dk-u32s st ncomp) idx (dvec st (dl-sinks l)) heads)))
+      ;; on the tensor cores where there are some: Q and the keys are BF16 values
+      (multiple-value-call #'launch dev
+        (if (>= (cudev-arch dev) 80) (values "d41_attend_mma" n 256) (values "d4_attend" n 512))
+        (list nh hd (/ 1f0 (sqrt (float hd 1f0))) top-k 0 ident
+              q kr (if k (dvec st (svref (d41ctx-comp ctx) k)) kr)
+              (dk-u32s st raws) (dk-u32s st nraw) (dk-u32s st ncomp) idx (dvec st (dl-sinks l)) heads)
+        :shared (if (>= (cudev-arch dev) 80) 94464 0)))
     (dk41-round dev heads (* n nh hd))
     (dk41-rope dev heads ics nh hd nrot n)
     (dk41-round dev heads (* n nh hd))
@@ -192,18 +198,26 @@
 
 (defun dk41-engram-inputs (m st ctx tokens)
   "Engram's table rows for each of TOKENS (hashed in turn from CTX's tail),
-   decoded and uploaded: a buffer a table, 24 x 256 a token; and the tail
-   after them."
-  (let* ((v (ds4f-v41 m)) (n (length tokens)) (ntab (length (d41-eg-layers v))) (w (* 24 256))
-         (bufs (loop for tbl below ntab collect (f32vec (* n w)))) (tail (d41ctx-tail ctx)))
+   their bytes uploaded and decoded on the device (D41_EG_DECODE): a buffer
+   a table, 24 x 256 a token; and the tail after them."
+  (let* ((v (ds4f-v41 m)) (n (length tokens)) (ntab (length (d41-eg-layers v))) (rb 264) (tw (* 24 rb))
+         (wf (d41-eg-file v)) (raws (loop repeat ntab collect (make-array (* n tw) :element-type '(unsigned-byte 8))))
+         (tail (d41ctx-tail ctx)) (dev (dk-dev st)))
+    (declare (type u8vec wf))
     (loop for tk in tokens for i from 0
           do (multiple-value-bind (rows nt) (d41-engram-hash m tail tk)
-               (loop for tbl below ntab for b in bufs
-                     do (replace b (d41-engram-input m tbl (nth tbl rows)) :start1 (* i w)))
+               (loop for tbl below ntab for raw in raws for base in (d41-eg-offs v)
+                     do (loop for r in (nth tbl rows) for col from 0
+                              do (let ((o (+ base (* r rb))))
+                                   (replace raw wf :start1 (+ (* i tw) (* col rb)) :start2 o :end2 (+ o rb)))))
                (setf tail nt)))
-    (values (loop for b in bufs for tbl from 0
-                  collect (let ((d (pb st (intern (format nil "P-EG~D" tbl) :keyword) (* n w))))
-                            (cuda-upload-vector d b) d))
+    (values (loop for raw in raws for tbl from 0
+                  collect (let ((b (pb st (intern (format nil "P-EGB~D" tbl) :keyword) (ceiling (* n tw) 4)))
+                                (d (pb st (intern (format nil "P-EG~D" tbl) :keyword) (* n 24 256))))
+                            (sb-sys:with-pinned-objects (raw) (cuda-upload b (sb-sys:vector-sap raw) (* n tw)))
+                            (launch dev "d41_eg_decode" (ceiling (* n 24 256) 256) 256
+                                    (list (* n 24) b (dvec st +d41-e4m3-codes+) d))
+                            d))
             tail)))
 
 (defun dk41-ready (m st ctx)
@@ -298,12 +312,24 @@
         (d4-return-slots st run)))
     ctx))
 
+(defun ds41f-cuda-chunk-max (m pos0)
+  "The most tokens a pass from POS0 has room for: the pool's slots past
+   the staging ones (two layers' experts, and a few spare) hold its scratch."
+  (let* ((st (ds4f-cuda-state m))
+         (room (* (- (dk-n-slots st) (* 2 (ds4f-n-expert m)) 8) (dk-slot-bytes st))))
+    (flet ((bytes (n) (+ (* n *ds41f-cuda-chunk-bytes*) (* 4 n (+ pos0 n)) (* 64 1024 1024))))
+      (let ((n (floor room *ds41f-cuda-chunk-bytes*)))
+        (loop while (and (> n 1) (> (bytes n) room)) do (setf n (floor (* n 15) 16)))
+        (max n 1)))))
+
 (defun ds41f-cuda-prefill (ctx tokens &key (logits t))
-  "TOKENS into V4.1 context CTX on the device, *DS41F-CUDA-CHUNK* at a time
+  "TOKENS into V4.1 context CTX on the device, a pass's most at a time
    (a short last piece decoded a token at a time)."
   (sb-int:with-float-traps-masked (:overflow :inexact :underflow :invalid)
     (loop while tokens
-          do (let* ((k (min (length tokens) *ds41f-cuda-chunk*)) (chunk (subseq tokens 0 k)))
+          do (let* ((k (min (length tokens)
+                            (or *ds41f-cuda-chunk* (ds41f-cuda-chunk-max (d41ctx-model ctx) (d41ctx-pos ctx)))))
+                    (chunk (subseq tokens 0 k)))
                (setf tokens (nthcdr k tokens))
                (if (>= k *ds41f-cuda-chunk-from*)
                    (ds41f-cuda-prefill-1 ctx chunk (and logits (null tokens)))

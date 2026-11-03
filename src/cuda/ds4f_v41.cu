@@ -291,3 +291,182 @@ extern "C" __global__ void d41_ix_scores_chunk(int nh, int nc, const float* __re
   }
   if (lane == 0) scores[c] = total * (1.f / 64.f);
 }
+
+// Engram's table rows, decoded: OUT[r][j] = bf16(CODES[RAW[r][j]] *
+// 2^(RAW[r][256 + j/32] - 127)), a row 264 bytes (256 E4M3 codes, 8 E8M0
+// scales).  grid ceil(NROWS*256/256), block 256.
+extern "C" __global__ void d41_eg_decode(int nrows, const unsigned char* __restrict__ raw,
+                                         const float* __restrict__ codes, float* __restrict__ out) {
+  const long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= (long long)nrows * 256) return;
+  const unsigned char* p = raw + (i / 256) * 264;
+  const int j = (int)(i % 256);
+  out[i] = d41_bf16(ldexpf(codes[p[j]], (int)p[256 + j / 32] - 127));
+}
+
+// --- a chunk's attention on the tensor cores ---------------------------------------
+//
+// D4_ATTEND's (ds4f_chunk.cu) attention, args as its, for V4.1, whose Q
+// and keys are BF16 values already (Q rounded and turned through BF16, the
+// keys through FP8 or FP4 into BF16): S = Q K^T as BF16 products summed in
+// f32 is exact but for the order of its sums.  P goes in as two BF16 parts
+// (hi + lo, 16 bits of it), V (the keys) exactly.  A block a token, 8
+// warps; keys 16 a step: warp w's S tile heads 16*(w%4).., keys 8*(w/4)..;
+// its O columns 64w.. for all 64 heads, in registers (m16n8k16's fragments:
+// lane l's rows l/4 and l/4+8, columns 2*(l%4) and the next).  HD 512, NH 64.
+// grid N, block 256, shared D41_ATTEND_SHARED (sm_80 and up).
+
+#define D41_AQ (512 + 8)                // a row of Q or of a key, BF16 (+8 against bank conflicts)
+#define D41_AK 16                       // keys a step
+#define D41_AP (D41_AK + 8)             // a row of P
+#define D41_AS (D41_AK + 1)             // a row of S
+// 66560 + 16640 + 4352 + 2 * 3072 + 768 = 94464
+#define D41_ATTEND_SHARED (2 * 64 * D41_AQ + 2 * D41_AK * D41_AQ + 4 * 64 * D41_AS + 2 * 2 * 64 * D41_AP + 4 * 192)
+
+__device__ __forceinline__ unsigned d41_bf16_bits(float x) {   // the nearest BF16 (ties even): its bits
+  unsigned u = __float_as_uint(x);
+  return (u + 0x7fffu + ((u >> 16) & 1u)) >> 16;
+}
+__device__ __forceinline__ unsigned d41_bf16_pair(float x, float y) {
+  return d41_bf16_bits(x) | (d41_bf16_bits(y) << 16);
+}
+__device__ __forceinline__ void d41_mma_bf16(float* c, unsigned a0, unsigned a1, unsigned a2, unsigned a3,
+                                             unsigned b0, unsigned b1) {
+#if __CUDA_ARCH__ >= 800
+  asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
+               : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
+               : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
+#endif
+}
+
+extern "C" __global__ void __launch_bounds__(256, 1)
+d41_attend_mma(int nh, int hd, float scale, int maxc, int rcap, int ident,
+               const float* __restrict__ q, const float* __restrict__ kr, const float* __restrict__ kc,
+               const unsigned* __restrict__ raws, const unsigned* __restrict__ nraw,
+               const unsigned* __restrict__ ncomp, const unsigned* __restrict__ idx,
+               const float* __restrict__ sinks, float* __restrict__ out) {
+  extern __shared__ __align__(16) unsigned char d41_sm[];
+  unsigned short* qs = (unsigned short*)d41_sm;                 // [64][D41_AQ]
+  unsigned short* ks = qs + 64 * D41_AQ;                        // [D41_AK][D41_AQ]
+  float* ss = (float*)(ks + D41_AK * D41_AQ);                   // [64][D41_AS]
+  unsigned short* ph = (unsigned short*)(ss + 64 * D41_AS);     // [64][D41_AP]
+  unsigned short* pl = ph + 64 * D41_AP;
+  float* ml = (float*)(pl + 64 * D41_AP);                       // 64 maxima, then 64 sums
+  float* al = ml + 128;                                         // the step's alphas, then 1/L
+  const int t = blockIdx.x, tid = threadIdx.x, lane = tid & 31, w = tid >> 5, g = lane >> 2, tq = lane & 3;
+  const unsigned nr = nraw[t], nc = ncomp[t], total = nr + nc, r0 = raws[t];
+  const float2* qt = (const float2*)(q + (long long)t * 64 * 512);
+  for (int i = tid; i < 64 * 256; i += 256) {
+    const float2 v = qt[i];
+    *(unsigned*)(qs + (i >> 8) * D41_AQ + 2 * (i & 255)) = d41_bf16_pair(v.x, v.y);
+  }
+  if (tid < 64) { ml[tid] = sinks[tid]; ml[64 + tid] = 1.0f; }   // max = sink, sum = exp(0)
+  float o[4][8][4];
+#pragma unroll
+  for (int mt = 0; mt < 4; ++mt)
+#pragma unroll
+    for (int nt = 0; nt < 8; ++nt)
+#pragma unroll
+      for (int r = 0; r < 4; ++r) o[mt][nt][r] = 0.f;
+  __syncthreads();
+  for (unsigned kb = 0; kb < total; kb += D41_AK) {
+    // this step's keys, as BF16
+    for (int i = tid; i < D41_AK * 256; i += 256) {
+      const unsigned j = kb + (i >> 8);
+      const int c = 2 * (i & 255);
+      float2 v = make_float2(0.f, 0.f);
+      if (j < nr) v = *(const float2*)(kr + (long long)(rcap ? (r0 + j) % (unsigned)rcap : r0 + j) * 512 + c);
+      else if (j < total) v = *(const float2*)(kc + (long long)(ident ? j - nr : idx[(long long)t * maxc + (j - nr)]) * 512 + c);
+      *(unsigned*)(ks + (i >> 8) * D41_AQ + c) = d41_bf16_pair(v.x, v.y);
+    }
+    __syncthreads();
+    // S, a tile a warp
+    {
+      const int mt = w & 3, nt = w >> 2;
+      float c[4] = {0.f, 0.f, 0.f, 0.f};
+      const unsigned short* qa = qs + (mt * 16 + g) * D41_AQ + 2 * tq;
+      const unsigned short* kp = ks + (nt * 8 + g) * D41_AQ + 2 * tq;
+#pragma unroll 8
+      for (int k = 0; k < 512; k += 16)
+        d41_mma_bf16(c, *(const unsigned*)(qa + k), *(const unsigned*)(qa + 8 * D41_AQ + k),
+                     *(const unsigned*)(qa + k + 8), *(const unsigned*)(qa + 8 * D41_AQ + k + 8),
+                     *(const unsigned*)(kp + k), *(const unsigned*)(kp + k + 8));
+      float* s0 = ss + (mt * 16 + g) * D41_AS + nt * 8 + 2 * tq;
+      s0[0] = c[0]; s0[1] = c[1]; s0[8 * D41_AS] = c[2]; s0[8 * D41_AS + 1] = c[3];
+    }
+    __syncthreads();
+    // the running softmax: a thread a head's 4 keys; P split hi + lo
+    {
+      const int h = tid >> 2, j0 = (tid & 3) * 4;
+      const unsigned F = 0xffffffffu;
+      float v[4], mx = -INFINITY;
+#pragma unroll
+      for (int j = 0; j < 4; ++j) {
+        v[j] = (kb + j0 + j < total) ? ss[h * D41_AS + j0 + j] * scale : -INFINITY;
+        mx = fmaxf(mx, v[j]);
+      }
+      mx = fmaxf(mx, __shfl_xor_sync(F, mx, 1)); mx = fmaxf(mx, __shfl_xor_sync(F, mx, 2));
+      const float m = ml[h], mn = fmaxf(m, mx);
+      float sum = 0.f;
+#pragma unroll
+      for (int j = 0; j < 4; ++j) {
+        const float e = expf(v[j] - mn);
+        const unsigned hb = d41_bf16_bits(e);
+        sum += e;
+        ph[h * D41_AP + j0 + j] = (unsigned short)hb;
+        pl[h * D41_AP + j0 + j] = (unsigned short)d41_bf16_bits(e - __uint_as_float(hb << 16));
+      }
+      sum += __shfl_xor_sync(F, sum, 1); sum += __shfl_xor_sync(F, sum, 2);
+      if ((tid & 3) == 0) {
+        const float alpha = expf(m - mn);
+        ml[h] = mn;
+        ml[64 + h] = ml[64 + h] * alpha + sum;
+        al[h] = alpha;
+      }
+    }
+    __syncthreads();
+    // O = diag(alpha) O + P V for this warp's columns
+    {
+      unsigned b[8][2];
+#pragma unroll
+      for (int nt = 0; nt < 8; ++nt) {
+        const unsigned short* vp = ks + 2 * tq * D41_AQ + 64 * w + 8 * nt + g;
+        b[nt][0] = vp[0] | ((unsigned)vp[D41_AQ] << 16);
+        b[nt][1] = vp[8 * D41_AQ] | ((unsigned)vp[9 * D41_AQ] << 16);
+      }
+#pragma unroll
+      for (int mt = 0; mt < 4; ++mt) {
+        const float a0 = al[mt * 16 + g], a1 = al[mt * 16 + g + 8];
+        const unsigned short* hp = ph + (mt * 16 + g) * D41_AP + 2 * tq;
+        const unsigned short* lp = pl + (mt * 16 + g) * D41_AP + 2 * tq;
+        const unsigned h0 = *(const unsigned*)hp, h1 = *(const unsigned*)(hp + 8 * D41_AP),
+                       h2 = *(const unsigned*)(hp + 8), h3 = *(const unsigned*)(hp + 8 * D41_AP + 8);
+        const unsigned l0 = *(const unsigned*)lp, l1 = *(const unsigned*)(lp + 8 * D41_AP),
+                       l2 = *(const unsigned*)(lp + 8), l3 = *(const unsigned*)(lp + 8 * D41_AP + 8);
+#pragma unroll
+        for (int nt = 0; nt < 8; ++nt) {
+          float* c = o[mt][nt];
+          c[0] = __fmul_rn(c[0], a0); c[1] = __fmul_rn(c[1], a0);
+          c[2] = __fmul_rn(c[2], a1); c[3] = __fmul_rn(c[3], a1);
+          d41_mma_bf16(c, l0, l1, l2, l3, b[nt][0], b[nt][1]);
+          d41_mma_bf16(c, h0, h1, h2, h3, b[nt][0], b[nt][1]);
+        }
+      }
+    }
+    __syncthreads();
+  }
+  if (tid < 64) al[tid] = 1.0f / ml[64 + tid];
+  __syncthreads();
+  float* ot = out + (long long)t * 64 * 512;
+#pragma unroll
+  for (int mt = 0; mt < 4; ++mt) {
+    const int h = mt * 16 + g;
+    const float i0 = al[h], i1 = al[h + 8];
+#pragma unroll
+    for (int nt = 0; nt < 8; ++nt) {
+      const int col = 64 * w + 8 * nt + 2 * tq;
+      *(float2*)(ot + (long long)h * 512 + col) = make_float2(__fmul_rn(o[mt][nt][0], i0), __fmul_rn(o[mt][nt][1], i0));
+      *(float2*)(ot + (long long)(h + 8) * 512 + col) = make_float2(__fmul_rn(o[mt][nt][2], i1), __fmul_rn(o[mt][nt][3], i1));
+    }
+  }
+}
