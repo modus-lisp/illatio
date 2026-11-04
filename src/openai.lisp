@@ -337,7 +337,9 @@
            (glm (equal (model-arch m) "glm5-next"))
            (prompt (render-chat m (jget req "messages") (jget req "tools") :thinking thinking))
            (ids (tokenize m prompt))
-           (max (or (jget req "max_completion_tokens") (jget req "max_tokens") (engine-max-tokens engine)))
+           (max (let ((n (or (jget req "max_completion_tokens") (jget req "max_tokens") (engine-max-tokens engine))))
+                  ;; -1 (llama.cpp's web UI) or 0: no limit but the context's room
+                  (if (and (integerp n) (plusp n)) n (max 1 (- (context-n-ctx ctx) (length ids))))))
            (t0 (get-internal-real-time))
            (t1 nil))
       (multiple-value-bind (text out reason reused)

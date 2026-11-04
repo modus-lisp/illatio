@@ -106,6 +106,14 @@
                                "meta" (hobj "n_ctx_train" (model-context-length m)
                                             "n_vocab" (model-n-vocab m)))))))
 
+;; GET /props: what llama.cpp's web UI asks of its server (its model, context size, and whether
+;; images or audio may be attached -- neither, here)
+(defun props-object (engine)
+  (hobj "model_path" (model-name (engine-model engine))
+        "build_info" "illatio"
+        "n_ctx" (context-n-ctx (engine-context engine))
+        "modalities" (hobj "vision" nil "audio" nil)))
+
 ;;; --- streaming --------------------------------------------------------------
 ;;; The chunks come from CHAT-COMPLETION-CHUNKS; here they only become SSE.
 
@@ -134,6 +142,8 @@
              (respond s "200 OK" (hobj "status" "ok")))
             ((and (string= method "GET") (string= path "/v1/models"))
              (respond s "200 OK" (models-object engine)))
+            ((and (string= method "GET") (string= path "/props"))
+             (respond s "200 OK" (props-object engine)))
             ((and (string= method "POST") (member path '("/v1/chat/completions" "/chat/completions") :test #'string=))
              (let ((req (handler-case (json-simple:parse body)
                           (error () nil))))
