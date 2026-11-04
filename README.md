@@ -135,12 +135,15 @@ about 81% of the experts a token wants are on a device.
 | prefill, 267 / 1,917 / 3,817 tokens | 3.8 s / 5.2 s / 11.3 s |
 | prefill, 12,017 tokens | 38 s (315 tok/s) |
 | decode at 12K tokens of context | 18 tok/s |
+| a chat's next turn, at 4.4K tokens | first token in 0.8-2.7 s (a fresh prompt: 17-20 s) |
 
 Greedy replies to ds4's GLM-5.3 quality prompts read as Z.AI's do (the
-same structure, often their first lines word for word).  The MTP layer
-(a drafted token ahead) is not run yet, and a context does not rewind (KDA's
-state goes forward only): a conversation that changes its history starts
-over.
+same structure, often their first lines word for word).  KDA's state goes
+forward only, so a context saves it (in pinned host memory) before a
+prompt's last token and every 512 tokens decoded, and goes back to the
+latest save before where its history changes: a chat's next turn evaluates
+only what is new since the last prompt (its reply, as rendered, and the
+next message).  The MTP layer (a drafted token ahead) is not run yet.
 
 ## The other models
 

@@ -110,7 +110,40 @@
 (defun free-g53ctx (ctx)
   (when (g53ctx-dev ctx)
     (loop for bufs across (g53ctx-dev ctx) do (mapc #'cuda-free bufs))
-    (setf (g53ctx-dev ctx) nil)))
+    (setf (g53ctx-dev ctx) nil))
+  (g53-cuda-drop-saves ctx (g53ctx-saves ctx))
+  (setf (g53ctx-saves ctx) nil))
+
+;;; Saved states (G53-SAVE!) in pinned host memory, each KDA layer's
+;;; history and S in turn.
+
+(defun g53-cuda-kda-bufs (ctx)
+  (loop for b across (g53ctx-dev ctx) for l across (ds4f-layers (d4ctx-model ctx))
+        when (eq (gl-kind l) :kda) append (list (first b) (second b))))
+
+(defun g53-cuda-save (ctx sap)
+  "CTX's KDA state into SAP (made if NIL), returned."
+  (let* ((bufs (g53-cuda-kda-bufs ctx)) (dev (dbuf-dev (first bufs)))
+         (sap (or sap (cuda-host-alloc (reduce #'+ bufs :key #'dbuf-bytes)))) (off 0))
+    (with-cuda
+      (cuda-current dev)
+      (dolist (b bufs) (cuda-copy-out (sb-sys:sap+ sap off) b 0 (dbuf-bytes b)) (incf off (dbuf-bytes b)))
+      (cuda-sync dev))
+    sap))
+
+(defun g53-cuda-restore (ctx sap)
+  "CTX's KDA state from SAP (a G53-CUDA-SAVE's), or zero for NIL."
+  (let* ((bufs (g53-cuda-kda-bufs ctx)) (dev (dbuf-dev (first bufs))) (off 0))
+    (with-cuda
+      (cuda-current dev)
+      (dolist (b bufs)
+        (if sap (cuda-copy-in b 0 (sb-sys:sap+ sap off) (dbuf-bytes b)) (cuda-zero b))
+        (incf off (dbuf-bytes b)))
+      (cuda-sync dev))))
+
+(defun g53-cuda-drop-saves (ctx saves)
+  (declare (ignore ctx))
+  (loop for (nil . sap) in saves when (sb-sys:system-area-pointer-p sap) do (cuda-host-free sap)))
 
 ;;; --- the products ------------------------------------------------------------------
 

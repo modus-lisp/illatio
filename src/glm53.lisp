@@ -138,7 +138,8 @@
 (defstruct (g53ctx (:include d4ctx (caches #())) (:constructor %make-g53ctx))
   conv state                            ; per KDA layer: 3 x 3 x P raw history; heads x V x K
   kv ixk tail                           ; per DSA layer: positions x latent (F16's values); pools x key; 2 x 4 x key raw
-  dev)                                  ; on CUDA, all of it on the device instead (G53-CTX-DEV)
+  dev                                   ; on CUDA, all of it on the device instead (G53-CTX-DEV)
+  saves)                                ; (pos . KDA's state there), the latest first (G53-SAVE!)
 
 (defun make-g53ctx (m &key (n-ctx 4096))
   (if (and (fboundp 'ds4f-cuda-p) (funcall 'ds4f-cuda-p))
@@ -396,8 +397,12 @@
     streams))
 
 (defun g53-forward-1 (ctx token logits)
-  #+(and sbcl linux)
-  (when (ds4f-cuda-p) (return-from g53-forward-1 (g53-cuda-forward ctx token logits)))
+  (prog1 (if (and (fboundp 'ds4f-cuda-p) (funcall 'ds4f-cuda-p))
+             (funcall 'g53-cuda-forward ctx token logits)
+             (g53-cpu-forward ctx token logits))
+    (when (zerop (mod (d4ctx-pos ctx) *g53-save-every*)) (g53-save! ctx))))
+
+(defun g53-cpu-forward (ctx token logits)
   (let* ((m (d4ctx-model ctx)) (d (ds4f-d m)) (n (ds4f-n-hc m)) (eps (ds4f-eps m)) (pos (d4ctx-pos ctx))
          (streams (f32vec (* n d))) (next (f32vec (* n d))) (cur (f32vec d)) (norm (f32vec d))
          (flat (f32vec (* n d))))
@@ -433,13 +438,85 @@
   #-sbcl (g53-forward-1 ctx token logits))
 
 (defun g53-eval-tokens (c tokens)
-  "TOKENS into C from its position, the last one's logits: on CUDA in
-   layer-major passes (cuda-glm53.lisp), else a token at a time."
+  "TOKENS into C from its position, the last one's logits; its state saved
+   at the last multiple of 4 before the last token (where a prompt that
+   repeats these goes back to)."
+  (let* ((pos (d4ctx-pos c)) (s (* 4 (floor (+ pos (length tokens) -1) 4))))
+    (when (> s pos)
+      (g53-eval-1 c (subseq tokens 0 (- s pos)) nil)
+      (g53-save! c)
+      (setf tokens (nthcdr (- s pos) tokens)))
+    (g53-eval-1 c tokens t)))
+
+(defun g53-eval-1 (c tokens logits)
+  "TOKENS into C: on CUDA in layer-major passes (cuda-glm53.lisp), else a
+   token at a time."
   #+(and sbcl linux)
   (when (and (rest tokens) (ds4f-cuda-p))
-    (return-from g53-eval-tokens
-      (sb-int:with-float-traps-masked (:overflow :inexact :underflow :invalid) (g53-cuda-prefill c tokens t))))
-  (loop for (tk . more) on tokens do (g53-forward c tk :logits (null more))))
+    (return-from g53-eval-1
+      (sb-int:with-float-traps-masked (:overflow :inexact :underflow :invalid) (g53-cuda-prefill c tokens logits))))
+  (loop for (tk . more) on tokens do (g53-forward c tk :logits (and logits (null more)))))
+
+;;; --- going back -----------------------------------------------------------------------
+;;; KDA's state only goes forward, so a context saves it (and its conv's
+;;; history) at some positions, all multiples of 4 -- there the indexer's
+;;; pools are whole, and every other cache is by position -- and goes back
+;;; to the latest one at or before where it is told to, evaluating the
+;;; tokens from there again.  Saved: before a prompt's last token (a repeat
+;;; of the prompt re-runs it; the next turn's prompt extends it) and every
+;;; *G53-SAVE-EVERY* positions decoded; *G53-SAVES* at most, the oldest dropped.
+
+(defparameter *g53-save-every* 512 "Decoded positions between saved states (a multiple of 4).")
+(defparameter *g53-saves* 6 "Saved states a context keeps (~150 MB each for GLM-5.3 Flash).")
+
+(defun g53-kda-layers (m)
+  (loop for l across (ds4f-layers m) for li from 0 when (eq (gl-kind l) :kda) collect li))
+
+(defun g53-save! (ctx)
+  "CTX's KDA state saved at its position (a multiple of 4), reusing the
+   oldest save's memory when it has as many as it keeps."
+  (let ((pos (d4ctx-pos ctx)) (saves (g53ctx-saves ctx)))
+    (unless (or (zerop pos) (plusp (mod pos 4)) (and saves (>= (car (first saves)) pos)) (< *g53-saves* 1))
+      (let ((old (when (>= (length saves) *g53-saves*) (cdr (car (last saves))))))
+        (when old (setf saves (butlast saves)))
+        (setf (g53ctx-saves ctx)
+              (cons (cons pos (if (g53ctx-dev ctx)
+                                  (funcall 'g53-cuda-save ctx old)
+                                  (let ((m (d4ctx-model ctx)))
+                                    (or (and old (loop for li in (g53-kda-layers m) for (cv sv) on old by #'cddr
+                                                       do (replace cv (svref (g53ctx-conv ctx) li))
+                                                          (replace sv (svref (g53ctx-state ctx) li))
+                                                       finally (return old)))
+                                        (loop for li in (g53-kda-layers m)
+                                              collect (copy-seq (svref (g53ctx-conv ctx) li))
+                                              collect (copy-seq (svref (g53ctx-state ctx) li)))))))
+                    saves))))))
+
+(defun g53-restore! (ctx data)
+  "CTX's KDA state as DATA has it (a save's), or zero for NIL."
+  (let ((m (d4ctx-model ctx)))
+    (cond ((g53ctx-dev ctx) (funcall 'g53-cuda-restore ctx data))
+          ((g53ctx-conv ctx)
+           (loop for li in (g53-kda-layers m)
+                 for (cv sv) on (or data (make-list (* 2 (length (g53-kda-layers m))))) by #'cddr
+                 do (if data
+                        (progn (replace (svref (g53ctx-conv ctx) li) cv) (replace (svref (g53ctx-state ctx) li) sv))
+                        (progn (fill (svref (g53ctx-conv ctx) li) 0f0) (fill (svref (g53ctx-state ctx) li) 0f0))))))))
+
+(defun g53-rewind (ctx pos history tokens)
+  "CTX to continue at POS (back from where it is) with TOKENS, HISTORY the
+   tokens before POS: the tokens to evaluate from where it goes back to."
+  (let* ((hist (coerce history 'simple-vector))
+         (keep (member-if (lambda (s) (<= (car s) pos)) (g53ctx-saves ctx)))
+         (p (if keep (car (first keep)) 0)))
+    (assert (>= (length hist) pos) () "a GLM rewind needs the ~D tokens before it" pos)
+    (when (fboundp 'g53-cuda-drop-saves) (funcall 'g53-cuda-drop-saves ctx (ldiff (g53ctx-saves ctx) keep)))
+    (setf (g53ctx-saves ctx) keep)
+    (g53-restore! ctx (cdr (first keep)))
+    (setf (d4ctx-pos ctx) p)
+    (append (coerce (subseq hist p pos) 'list) tokens)))
+
+(defmethod impl-rewinds-p ((impl g53)) t)
 
 (defun g53-hotlist (m)
   "The experts the device pools are seeded with, (layer expert) pairs flat:

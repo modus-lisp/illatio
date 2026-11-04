@@ -11,9 +11,13 @@ Decode ~21 tok/s, prefill ~340 tok/s at 2-4K tokens (glm53.lisp,
 cuda-glm53.lisp): DS4F's pool and tier, KDA and DSA of its own.
 
 - MTP: layer 45 drafts a token ahead (ds4 verifies it in a 2-token batch);
-  the verifying pass would want KDA's state saved and restored.
-- Rewinds: KDA's state only goes forward.  Snapshots of it (4 MB a layer)
-  every so many tokens would let a context go back to one.
+  the verifying pass would restore KDA's state (G53-SAVE!'s, but on the
+  device: a rejected token's step undone).
+- Rewinds (G53-REWIND) go back to saved KDA states (~150 MB each, pinned
+  host memory): before a prompt's last token and every 512 decoded.  A
+  history edited far back goes to the latest save before the edit, often
+  the start; the passes could save at their ends, or the recurrence
+  kernel at given steps.
 - Prefill: D4_ATTEND over a float copy of the latents (exact, f32); the
   tensor cores could take it.  The passes' copies as V4.1's: the P40
   could compute its own experts.

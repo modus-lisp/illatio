@@ -1231,7 +1231,8 @@
 ;;; logits shared), FORWARD and EVAL-TOKENS come here, and the model counts as
 ;;; recurrent -- its compressors and window can't go back -- so SYNC-PROMPT
 ;;; continues a context only past what it has seen and otherwise starts over.
-;;; V4.1's go back exactly (D41-REWIND), so it reuses the longest common prefix.
+;;; V4.1's and GLM's go back exactly (D41-REWIND, G53-REWIND), so they reuse
+;;; the longest common prefix.
 
 (defun load-ds4f-model (path threads)
   (let* ((d (load-ds4f path :threads threads)) (g (ds4f-gguf d)) (v (make-vocab-from-gguf g)))
@@ -1254,10 +1255,12 @@
 
 (defun ds4f-context-sync (ctx c tokens)
   "C at CTX's position for TOKENS: the tokens to evaluate.  A V4.1
-   context's rewind restores its state (D41-REWIND); others need only it."
-  (if (and (d41ctx-p c) (< (context-pos ctx) (d4ctx-pos c)))
-      (d41-rewind c (context-pos ctx) (context-tokens ctx) tokens)
-      (progn (setf (d4ctx-pos c) (context-pos ctx)) tokens)))
+   or GLM context's rewind restores its state (D41-REWIND, G53-REWIND);
+   others need only it."
+  (cond ((not (< (context-pos ctx) (d4ctx-pos c))) (setf (d4ctx-pos c) (context-pos ctx)) tokens)
+        ((d41ctx-p c) (d41-rewind c (context-pos ctx) (context-tokens ctx) tokens))
+        ((ds4f-glm (d4ctx-model c)) (funcall 'g53-rewind c (context-pos ctx) (context-tokens ctx) tokens))
+        (t (setf (d4ctx-pos c) (context-pos ctx)) tokens)))
 
 (defun ds4f-context-forward (ctx token logits)
   (let* ((c (ds4f-context ctx)) (tokens (ds4f-context-sync ctx c (list token))))
