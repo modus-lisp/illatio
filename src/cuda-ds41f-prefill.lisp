@@ -80,6 +80,12 @@
                 latent (pb st :p-clat (* (max nb 1) hd)) cs (pb st :p-cs2 0))
           (when (plusp nb)
             (launch dev "d41_pool2_chunk" nb hd (list hd pos0 p1 pkv psc ckv csc latent)))
+          ;; a verifying pass's, for its undo to carry a pair's first token again
+          (when *dk41-carry-rows*
+            (let ((b (pb st (intern (format nil "V-CARRY-~D" li) :keyword) (* 2 n hd))))
+              (cuda-copy-dd b 0 pkv 0 (* 4 n hd))
+              (cuda-copy-dd b (* 4 n hd) psc 0 (* 4 n hd))
+              (setf (gethash li *dk41-carry-rows*) b)))
           ;; the chunk ends on a pair's first token: it is carried
           (when (evenp e)
             (cuda-copy-dd ckv 0 pkv (* 4 (- e pos0) hd) (* 4 hd))
@@ -94,6 +100,10 @@
         (dk41-quant dev krows (* nb ixd) :fp4)
         (dk41-rope dev rows cs 1 hd nrot nb)
         (dk41-quant dev rows (* nb hd) :fp4-e4m3)))))
+
+(defvar *dk41-carry-rows* nil
+  "During a verifying pass: a table, each ratio-2 kv-source layer to a
+   buffer of its tokens' compressor projections (kv rows, then score rows).")
 
 (defvar *dk41-pick* nil
   "During a pass: whether the last index-source layer made a pick (its rows
@@ -172,18 +182,21 @@
     (dk41-round dev heads (* n nh hd))
     (dk41-rope dev heads ics nh hd nrot n)
     (dk41-round dev heads (* n nh hd))
+    (if *dk-small*
+        ;; decode's grouped product: row r against its token's group r/RANK
+        (dk-q8mm st (lname li "attn_output_a.weight") heads low n :group-rows rank)
     (let ((w (gethash (lname li "attn_output_a.weight") (dk-q8 st))))
       (dotimes (g groups)
         (dk-mm st "d4_mm_q8_0" (cons (cmat-qs w) (* g rank gdim)) (cons (cmat-d w) (* 2 g rank (floor gdim 32)))
                0 rank gdim (cons heads (* 4 g gdim)) (cons low (* 4 g rank)) n
-               :x-stride (* nh hd) :y-stride (* groups rank))))
+               :x-stride (* nh hd) :y-stride (* groups rank)))))
     (dk41-round dev low (* n groups rank))
     (dk-q8mm st (lname li "attn_output_b.weight") low aout n)
     (dk41-round dev aout (* n d))
     (dk-hc-post-chunk m st aout sa pca sb n)
     (dk41-round dev sb (* n (ds4f-n-hc m) d))))
 
-(defun dk41-ffn-chunk (m st l li n toks slots sb sa)
+(defun dk41-ffn-chunk (m st l li n toks slots sb sa &optional small)
   "Layer LI's FFN for the chunk: HC (summed by the attention's pre), norm,
    router, shared expert, then V4's routing and grouped experts on the
    device: SB into SA."
@@ -195,7 +208,9 @@
     (dk41-rms-rows dev cur (dvec st (dl-ffn-norm l)) norm2 d n (ds4f-eps m))
     (destructuring-bind (w rows cols &optional type) (gethash (lname li "ffn_gate_inp.weight") (dk-f16 st))
       (declare (ignore type))
-      (launch dev "d41_mm_f32" (list (ceiling n 64) (ceiling rows 64)) 256 (list cols rows n cols rows w norm2 logits)))
+      (if *dk-small*
+          (launch dev "d41_mv_f32n" (list (ceiling rows 4) n) 256 (list cols rows cols rows w norm2 logits))
+          (launch dev "d41_mm_f32" (list (ceiling n 64) (ceiling rows 64)) 256 (list cols rows n cols rows w norm2 logits))))
     (dk-q8mm st (lname li "ffn_gate_shexp.weight") norm2 sg n)
     (dk-q8mm st (lname li "ffn_up_shexp.weight") norm2 su n)
     (launch dev "d41_swiglu" (ceiling (* n ff) 256) 256 (list (* n ff) (svref (ds4f-clamps m) li) sg su smid nil nil))
@@ -203,7 +218,9 @@
     (dk41-round dev sout (* n d))
     ;; V4's routed half (no hash layers here); then the sum and the streams rounded
     (let ((*dk41-round-moe* t))
-      (dk-ffn-routed-chunk m st l li n toks slots sb sa))))
+      (if small
+          (dk-ffn-small m st l li n small sb sa)   ; SMALL: the tokens; the slots it holds
+          (dk-ffn-routed-chunk m st l li n toks slots sb sa)))))
 
 (defun dk41-engram-inputs (m st ctx tokens)
   "Engram's table rows for each of TOKENS (hashed in turn from CTX's tail),
@@ -240,9 +257,12 @@
     (loop for v across vs do (dvec st v)))
   (dvec st (ds4f-output-norm m)))
 
-(defun ds41f-cuda-prefill-1 (ctx tokens logits)
+(defun ds41f-cuda-prefill-1 (ctx tokens logits &key small)
   "TOKENS at CTX's next positions, layer-major on the device (at most
-   *DS41F-CUDA-CHUNK*); the last one's logits when LOGITS."
+   *DS41F-CUDA-CHUNK*); the last one's logits when LOGITS.  SMALL: a
+   verifying pass (at most +DV-NT+ tokens), decode's products and experts
+   (DK-FFN-SMALL), its scratch the device's own, its compressor projections
+   kept (*DK41-CARRY-ROWS*); every token's logits, a vector."
   (let* ((m (d41ctx-model ctx)) (v (ds4f-v41 m)) (st (ds4f-cuda-state m)) (dev (dk-dev st))
          (d (ds4f-d m)) (n-hc (ds4f-n-hc m)) (hcd (* n-hc d)) (pos0 (d41ctx-pos ctx))
          (n (length tokens)) (tokv (coerce tokens 'simple-vector)) (wf (ds4f-file m))
@@ -251,10 +271,12 @@
     (declare (type u8vec wf))
     (with-cuda
       (cuda-current dev)
-      (let* ((run (d4-borrow-slots st (+ (* n *ds41f-cuda-chunk-bytes*) (* 5 n nc-max) (* 64 1024 1024))))
-             (base (+ (dbuf-ptr (dk-pool st)) (* (car run) (dk-slot-bytes st))))
-             (*dk-scratch* (list base (+ base (* (cdr run) (dk-slot-bytes st))) (make-hash-table)))
-             (*dk-stage* (list (d4-stage-slots st (* 2 (ds4f-n-expert m)) run)))
+      (let* ((run (and (not small)
+                       (d4-borrow-slots st (+ (* n *ds41f-cuda-chunk-bytes*) (* 5 n nc-max) (* 64 1024 1024)))))
+             (base (and run (+ (dbuf-ptr (dk-pool st)) (* (car run) (dk-slot-bytes st)))))
+             (*dk-scratch* (and run (list base (+ base (* (cdr run) (dk-slot-bytes st))) (make-hash-table))))
+             (*dk-stage* (and run (list (d4-stage-slots st (* 2 (ds4f-n-expert m)) run))))
+             (*dk-small* small) (*dk41-carry-rows* (and small (or *dk41-carry-rows* (make-hash-table)))) (held '()) (rows nil)
              (*dk-mapped* (cons (or (getf (dk-bufs st) :p-mapped-sap)
                                     (setf (getf (dk-bufs st) :p-mapped-sap) (cuda-host-alloc +dk-mapped-bytes+ :mapped t)))
                                 0))
@@ -283,12 +305,12 @@
           (let ((p1 (if (oddp pos0) pos0 (1+ pos0))))
             (dk41-cs-rows m st :p-cs2 (loop for p from p1 below (+ pos0 n) by 2 collect (1- p)) li-comp))
           (multiple-value-bind (eg tail) (dk41-engram-inputs m st ctx tokens)
-            (multiple-value-bind (slots ev staged) (if routed (values nil nil nil) (d4-take-layer m st 0))
+            (multiple-value-bind (slots ev staged) (if (or routed small) (values nil nil nil) (d4-take-layer m st 0))
               (dotimes (li nl)
                 (let* ((l (svref (ds4f-layers m) li)) (tbl (position li (d41-eg-layers v)))
                        (comp (plusp (dl-ratio l))))
                   (multiple-value-bind (nslots nev nstaged)
-                      (if (and (< (1+ li) nl) (not routed)) (d4-take-layer m st (1+ li)) (values nil nil nil))
+                      (if (and (< (1+ li) nl) (not routed) (not small)) (d4-take-layer m st (1+ li)) (values nil nil nil))
                     (when tbl
                       (let ((kv (pb st :p-egkv (* n (1+ n-hc) d))))
                         (dk-f16mm st (lname li "engram_kv.weight") (nth tbl eg) kv n)
@@ -297,24 +319,43 @@
                                 (list d n-hc (ds4f-eps m) sa kv (dvec st (dl-eg-q-norm l)) (dvec st (dl-eg-k-norm l))))))
                     (dk41-attention-chunk m st l li ctx pos0 n sa sb pre pstride
                                           (if comp cs1 cs0) (if comp ics1 ics0))
-                    (if routed
+                    (cond
+                      (small
+                       ;; (it syncs: the layer before is done with its slots, and the mapped arena)
+                       (let ((now (dk41-ffn-chunk m st l li n toks nil sb sa tokv)))
+                         (dolist (s held) (decf (aref (dk-pin st) s)))
+                         (setf held now)))
+                      (routed
                         (dk41-ffn-chunk m st l li n toks
                                         (lambda (sel)
                                           (multiple-value-setq (slots ev staged) (d4-take-routed m st li sel n))
                                           slots)
-                                        sb sa)
-                        (progn (cuda-stream-wait (cudev-stream dev) ev)
-                               (dk41-ffn-chunk m st l li n toks slots sb sa)))
-                    (cuda-sync dev)
-                    (dk-arena-reset st)
+                                        sb sa))
+                      (t (cuda-stream-wait (cudev-stream dev) ev)
+                         (dk41-ffn-chunk m st l li n toks slots sb sa)))
+                    (unless small
+                      (cuda-sync dev)
+                      (dk-arena-reset st))
                     (setf (cdr *dk-mapped*) 0)
-                    (cuda-event-destroy ev)
-                    (d4-let-go st slots staged)
+                    (when ev (cuda-event-destroy ev))
+                    (when slots (d4-let-go st slots staged))
                     (setf slots nslots ev nev staged nstaged
                           pre (cons (pb st :p-pcf (* n 32)) 96) pstride 32)))))
             (setf (d41ctx-tail ctx) tail))
           (incf (d41ctx-pos ctx) n)
-          (when logits
+          (when small
+            ;; every token's logits: the output weights read once (DK-Q8MM as decode's products)
+            (let* ((nv (ds4f-n-vocab m)) (embd (pb st :v-hembd (* n d))) (norm (pb st :v-hnorm (* n d)))
+                   (out (pb st :v-out (* n nv))))
+              (launch dev "d41_hc_sum" (list (ceiling d 256) n) 256
+                      (list d n-hc 32 sa (cons (pb st :p-pcf (* n 32)) (* 4 24)) embd))
+              (dk41-rms-rows dev embd (dvec st (ds4f-output-norm m)) norm d n (ds4f-eps m))
+              (dk-q8mm st "output.weight" norm out n)
+              (setf rows (f32vec (* n nv)))
+              (sb-sys:with-pinned-objects (rows)
+                (cuda-download out (sb-sys:vector-sap rows) (* 4 n nv)))
+              (dolist (s held) (decf (aref (dk-pin st) s)))))
+          (when (and logits (not small))
             (let* ((q (dk-qbuf st :hnorm d)) (embd (dbuf-of st :hembd (* 4 d))) (norm (dbuf-of st :hnorm (* 4 d)))
                    (out (dbuf-of st :out (* 4 (ds4f-n-vocab m)))) (lv (d41ctx-logits ctx)))
               (launch dev "d41_hc_sum" (ceiling d 256) 256
@@ -323,9 +364,61 @@
               (dk-q8mv st "output.weight" norm out :q q)
               (sb-sys:with-pinned-objects (lv)
                 (cuda-download out (sb-sys:vector-sap lv) (* 4 (ds4f-n-vocab m))))))
-          (cuda-sync dev))
-        (d4-return-slots st run)))
+          (cuda-sync dev)
+          (dk-arena-reset st))
+        (when run (d4-return-slots st run))
+        (or rows ctx)))))
+
+;;; --- speculative steps ---------------------------------------------------------------
+;;; DS4F-SPECULATE's verifying pass for V4.1: the token and its guesses as a
+;;; small pass, then what the guesses past the kept ones wrote undone.  The
+;;; ring (1024 rows, the window 128) keeps the window's rows; compressed rows
+;;; past the kept tokens are never read before they are written again; so it
+;;; is the Engram tail and, when the next position is a pair's second, the
+;;; pair's first token carried again (its projections, kept by the pass).
+
+(defun ds41f-cuda-undo (ctx pos0 keep n tail0 kept)
+  "CTX after a verifying pass of N tokens from POS0, as if only its first
+   KEEP (the tokens KEPT) had gone through; TAIL0 the Engram tail before."
+  (let* ((m (d41ctx-model ctx)) (st (ds4f-cuda-state m)) (hd (ds4f-head-dim m))
+         (map (d41-token-map (ds4f-v41 m))) (tail tail0))
+    (dolist (tk kept) (setf tail (list (aref map tk) (first tail) (second tail))))
+    (when (and (< keep n) (oddp (+ pos0 keep)))
+      (maphash (lambda (li b)
+                 (let ((k (d41-owner m li)))
+                   (cuda-copy-dd (dvec st (svref (d41ctx-prev-kv ctx) k)) 0 b (* 4 (1- keep) hd) (* 4 hd))
+                   (cuda-copy-dd (dvec st (svref (d41ctx-prev-score ctx) k)) 0 b (* 4 (+ (* n hd) (* (1- keep) hd))) (* 4 hd))))
+               *dk41-carry-rows*))
+    (setf (d41ctx-tail ctx) tail
+          (d41ctx-written ctx) (max (d41ctx-written ctx) (+ pos0 n))
+          (d41ctx-pos ctx) (+ pos0 keep))
     ctx))
+
+(defun ds41f-cuda-speculate (ctx tok draft)
+  "DS4F-CUDA-SPECULATE for V4.1: TOK and its guesses DRAFT through one pass
+   at CTX's next position; how many its greedy choices confirm, CTX then
+   past them (and the token after them its logits)."
+  (when (plusp *dv-cool*)
+    (decf *dv-cool*)
+    (ds4f-forward ctx tok)
+    (return-from ds41f-cuda-speculate 0))
+  (let* ((m (d41ctx-model ctx)) (st (ds4f-cuda-state m)) (nv (ds4f-n-vocab m))
+         (draft (subseq draft 0 (min (length draft) *dv-k* (1- +dv-nt+))))
+         (pos0 (d41ctx-pos ctx)) (batch (cons tok draft)) (n (length batch)) (tail0 (d41ctx-tail ctx)))
+    (sb-int:with-float-traps-masked (:overflow :inexact :underflow :invalid)
+      (let ((*dk41-carry-rows* (make-hash-table)))
+        (let* ((rows (ds41f-cuda-prefill-1 ctx batch t :small t))
+               (a (loop for g in draft for i from 0 while (= (row-argmax rows i nv) g) count t))
+               (keep (1+ a)))
+          (with-cuda
+            (cuda-current (dk-dev st))
+            (when (< keep n) (ds41f-cuda-undo ctx pos0 keep n tail0 (subseq batch 0 keep)) (cuda-sync (dk-dev st))))
+          (replace (d41ctx-logits ctx) rows :start2 (* (1- keep) nv) :end2 (* keep nv))
+          (incf (first *dv-stats*)) (incf (second *dv-stats*) (length draft)) (incf (third *dv-stats*) a)
+          (cond ((= a (length draft)) (setf *dv-k* (min (1- +dv-nt+) (* 2 *dv-k*))))
+                ((and (zerop a) (= *dv-k* 1)) (setf *dv-cool* 4))
+                (t (setf *dv-k* (max 1 (1+ a)))))
+          a)))))
 
 (defun ds41f-cuda-chunk-max (m pos0)
   "The most tokens a pass from POS0 has room for: the pool's slots past

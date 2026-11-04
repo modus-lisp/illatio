@@ -29,8 +29,13 @@ V4.1 file is truncated.  Engram's tables want to be in memory
   the Q8_0 projections (~2 s).
 - Rewinds are exact (D41-REWIND: from an even position, the Engram tail
   from the tokens, a 1024-row ring so the window survives rewinds of up to
-  896 tokens, else from the start).  Speculative decoding and saved state
-  are still V4 only.
+  896 tokens, else from the start).  Saved state is still V4 only.
+- Speculative decoding (DS41F-CUDA-SPECULATE): a 9-token verifying pass
+  costs about two decode steps with its experts held (164 ms against
+  9 x 35), but each token's expert misses still cost what they do decoding,
+  so text that repeats goes ~1.2x as fast and other text ~3% slower.  The
+  tokens matched plain decoding's on the prompts tried (the pass is
+  decode's products, but its attention and indexer are the chunk's).
 - Long prompts are compute-bound: 20181 tokens in 52 s (6 passes), most
   of it the experts' D4_MM_ID (~17 s) and the Q8_0 projections (~11 s),
   both at 20-24 TFLOPS of the 3090's ~70.

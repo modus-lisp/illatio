@@ -476,6 +476,8 @@
   (map nil #'free-static-vector (context-static-vectors ctx))
   (setf (context-k-cache ctx) nil (context-v-cache ctx) nil)
   (remf (context-plist ctx) :q35)
+  ;; a DeepSeek context's caches (and their copies on the device)
+  (when (getf (context-plist ctx) :ds4f) (funcall 'ds4f-context-reset ctx))
   ctx)
 
 (defun greedy (model prompt n &key (ctx nil ctx-p))

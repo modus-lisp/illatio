@@ -125,7 +125,10 @@
         (let ((moe (pb st :p-moe (* n d))))
           (launch dev "d4_moe_sum_rows" (ceiling (* n d) 256) 256
                   (list d nu n down (dk-put st (coerce smap 'list)) (pb st :p-sout (* n d)) moe))
-          (dk-hc-post-chunk m st moe sb (pb st :p-pcf (* n 32)) sa n))))
+          (when *dk41-round-moe* (launch dev "d41_round" (ceiling (* n d) 256) 256 (list (* n d) moe nil nil)))
+          (dk-hc-post-chunk m st moe sb (pb st :p-pcf (* n 32)) sa n)
+          (when *dk41-round-moe*
+            (let ((k (* n (ds4f-n-hc m) d))) (launch dev "d41_round" (ceiling k 256) 256 (list k sa nil nil)))))))
     held))
 
 (defun dk-head-n (m st streams n)

@@ -95,7 +95,8 @@
   "For GENERATE: TOKEN at CTX's next position and the guesses its greedy
    choices confirm; those (:NO if there is nothing to guess with)."
   (let ((model (context-model ctx)))
-    (unless (and (typep (model-impl model) 'ds4f) (not (ds4f-v41 (model-impl model))) (plusp *ds4f-spec-k*)
+    (unless (and (typep (model-impl model) 'ds4f) (plusp *ds4f-spec-k*)
+                 (or (not (ds4f-v41 (model-impl model))) #+linux (ds4f-cuda-p))   ; V4.1: on CUDA only
                  (or #+darwin (ds4f-gpu-p :prefill) #+linux (ds4f-cuda-p)))
       (return-from ds4f-speculate :no))
     (let* ((hist (coerce (append (context-tokens ctx) (list tok)) 'simple-vector))
@@ -105,7 +106,9 @@
       (let* ((c (ds4f-context ctx)) (pos0 (context-pos ctx))
              (a (progn (setf (d4ctx-pos c) pos0)
                        (sb-int:with-float-traps-masked (:overflow :inexact :underflow)
-                         (ds4f-cuda-speculate c tok draft)))))
+                         (if (d41ctx-p c)
+                             (funcall 'ds41f-cuda-speculate c tok draft)
+                             (ds4f-cuda-speculate c tok draft))))))
         (setf (context-pos ctx) (+ pos0 a 1))
         (return-from ds4f-speculate (subseq draft 0 a)))
       #+darwin
