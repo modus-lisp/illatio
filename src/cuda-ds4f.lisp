@@ -17,8 +17,8 @@
 ;;; expert; then a wait for the logits, the routing on the CPU (D4-ROUTE),
 ;;; the slots' copies queued, and the compute stream made to wait for them.
 ;;; The caches (the context's static vectors) live on the device: a copy
-;;; of each is made when decode first uses it, and decode alone uses it
-;;; from then on (prefill here is decode, a token at a time).
+;;; of each is made when decode first uses it, and the device's alone are
+;;; used from then on (by decode, the prefill's passes, the verifying ones).
 
 (in-package #:illatio)
 
@@ -27,6 +27,19 @@
 (defvar *ds4f-cuda-reserve-gb* 1.5
   "Device memory left free when the expert pool is sized: the scratch
    buffers, the caches of a context, the driver's own.")
+
+;; (the CPUs' share of the experts: see "the CPUs' experts" below)
+(defvar *ds4f-cpu-experts* nil
+  "Whether the experts neither device holds are computed by the CPUs (else
+   they are copied into the first device's pool, then computed there).")
+
+(defvar *ds4f-cpu-max* :half
+  "At most this many of a layer's missing experts are computed by the CPUs;
+   the rest are copied in and computed on the first device, the two at once.
+   Either way a missing expert is copied into the pool for next time, in the
+   background (*DS4F-FILL-MAX* a layer at most).")
+
+(defvar *ds4f-fill-max* 4 "Background copies into the pool queued a layer, at most.")
 
 (defvar *ds4f-route-trace* nil "A stream each layer's routing is written to (layer, experts), or NIL.")
 
@@ -547,18 +560,6 @@
 ;;; A thread a physical core (the process's own: a container may have
 ;;; fewer than the machine), each held to it.
 
-(defvar *ds4f-cpu-experts* nil
-  "Whether the experts neither device holds are computed by the CPUs (else
-   they are copied into the first device's pool, then computed there).")
-
-(defvar *ds4f-cpu-max* :half
-  "At most this many of a layer's missing experts are computed by the CPUs;
-   the rest are copied in and computed on the first device, the two at once.
-   Either way a missing expert is copied into the pool for next time, in the
-   background (*DS4F-FILL-MAX* a layer at most).")
-
-(defvar *ds4f-fill-max* 4 "Background copies into the pool queued a layer, at most.")
-
 (defvar *ds4f-cpu-threads* nil "The CPUs' threads for the experts; NIL: a physical core each.")
 
 (defstruct (d4cpu (:conc-name dc-))
@@ -868,19 +869,14 @@
 (defun ds4f-cuda-forward (ctx token logits)
   "DS4F-FORWARD-1 on the GPU: TOKEN at the next position."
   (let* ((m (d4ctx-model ctx)) (st (ds4f-cuda-state m)) (dev (dk-dev st))
-         (d (ds4f-d m)) (n (ds4f-n-hc m)) (hcd (* n d)) (pos (d4ctx-pos ctx)) (wf (ds4f-file m))
+         (d (ds4f-d m)) (n (ds4f-n-hc m)) (hcd (* n d)) (pos (d4ctx-pos ctx))
          (ne (ds4f-n-expert m)) (nl (ds4f-n-layer m)) (rb (dk-rb st))
          (sa (dbuf-of st :sa (* 4 hcd))) (sb (dbuf-of st :sb (* 4 hcd)))
          (lg (f32vec ne)) (pl (f32vec ne)) (prev nil))
-    (declare (type u8vec wf))
     (with-cuda
       (cuda-current dev)
       ;; the token's embedding into each stream
-      (let ((e (f32vec hcd)) (o (+ (ds4f-embd-off m) (* token d 2))))
-        (dotimes (j d)
-          (let ((v (f16-at wf (+ o (* 2 j)))))
-            (dotimes (h n) (setf (aref e (+ (* h d) j)) v))))
-        (cuda-upload-vector sa e))
+      (cuda-upload-vector sa (ds4f-embed! m (list token) (f32vec hcd)))
       (dotimes (li nl)
         (let ((l (svref (ds4f-layers m) li)) (c (svref (d4ctx-caches ctx) li)))
           (dk-attention m st l li c pos sa sb)

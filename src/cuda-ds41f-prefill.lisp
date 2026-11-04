@@ -1,9 +1,11 @@
-;;;; cuda-ds41f-prefill.lisp — a V4.1 prefill chunk on the GPU, a layer at a time.
+;;;; cuda-ds41f-prefill.lisp — a V4.1 prefill chunk on the GPU, a layer at a
+;;;; time; and the verifying pass of its speculative steps.
 ;;;
-;;; cuda-ds4f-prefill.lisp's pass (its scratch in borrowed pool slots, a
-;;; layer's experts all taken ahead into staging slots while the layer
-;;; before computes, the routing on the device, the experts grouped by
-;;; expert into one indexed product each) with V4.1's layers: the rounding,
+;;; cuda-ds4f-prefill.lisp's pass (its scratch in borrowed pool slots, the
+;;; routing on the device, the experts grouped by expert into one indexed
+;;; product each; a long pass takes all of a layer's experts ahead into
+;;; staging slots while the layer before computes, a short one only those
+;;; its tokens route to, after its routing) with V4.1's layers: the rounding,
 ;;; HC's pre a sublayer late, Engram's rows hashed token by token on the CPU
 ;;; and gated in, the shared compressed caches written by their source
 ;;; layers (ratio-2 pairs that may start before the chunk, ratio-1 rows), the
@@ -15,8 +17,9 @@
 
 (defparameter *ds41f-cuda-chunk-from* 64
   "From this many tokens a V4.1 prompt goes through layer-major passes: a
-   pass reads nearly all of every layer's experts (about 7 s over the bus
-   when the pool holds few), against about 50 ms a token decoding.")
+   pass copies in the experts its tokens use that the pool lacks (64
+   tokens about 2.9 s, a long pass every one, about 6 s), against about
+   50-90 ms a token decoding (with the misses).")
 
 (defparameter *ds41f-cuda-chunk* nil
   "Tokens a V4.1 pass takes at most; NIL, as many as the pool leaves room
@@ -185,11 +188,11 @@
     (if *dk-small*
         ;; decode's grouped product: row r against its token's group r/RANK
         (dk-q8mm st (lname li "attn_output_a.weight") heads low n :group-rows rank)
-    (let ((w (gethash (lname li "attn_output_a.weight") (dk-q8 st))))
-      (dotimes (g groups)
-        (dk-mm st "d4_mm_q8_0" (cons (cmat-qs w) (* g rank gdim)) (cons (cmat-d w) (* 2 g rank (floor gdim 32)))
-               0 rank gdim (cons heads (* 4 g gdim)) (cons low (* 4 g rank)) n
-               :x-stride (* nh hd) :y-stride (* groups rank)))))
+        (let ((w (gethash (lname li "attn_output_a.weight") (dk-q8 st))))
+          (dotimes (g groups)
+            (dk-mm st "d4_mm_q8_0" (cons (cmat-qs w) (* g rank gdim)) (cons (cmat-d w) (* 2 g rank (floor gdim 32)))
+                   0 rank gdim (cons heads (* 4 g gdim)) (cons low (* 4 g rank)) n
+                   :x-stride (* nh hd) :y-stride (* groups rank)))))
     (dk41-round dev low (* n groups rank))
     (dk-q8mm st (lname li "attn_output_b.weight") low aout n)
     (dk41-round dev aout (* n d))
@@ -259,43 +262,25 @@
 
 (defun ds41f-cuda-prefill-1 (ctx tokens logits &key small)
   "TOKENS at CTX's next positions, layer-major on the device (at most
-   *DS41F-CUDA-CHUNK*); the last one's logits when LOGITS.  SMALL: a
+   DS41F-CUDA-CHUNK-MAX of them); the last one's logits when LOGITS.  SMALL: a
    verifying pass (at most +DV-NT+ tokens), decode's products and experts
    (DK-FFN-SMALL), its scratch the device's own, its compressor projections
    kept (*DK41-CARRY-ROWS*); every token's logits, a vector."
   (let* ((m (d41ctx-model ctx)) (v (ds4f-v41 m)) (st (ds4f-cuda-state m)) (dev (dk-dev st))
          (d (ds4f-d m)) (n-hc (ds4f-n-hc m)) (hcd (* n-hc d)) (pos0 (d41ctx-pos ctx))
-         (n (length tokens)) (tokv (coerce tokens 'simple-vector)) (wf (ds4f-file m))
+         (n (length tokens)) (tokv (coerce tokens 'simple-vector))
          (nl (ds4f-n-layer m)) (positions (loop for i below n collect (+ pos0 i)))
-         (nc-max (floor (+ pos0 n) 1)) (routed (< n *ds41f-cuda-routed-below*)))
-    (declare (type u8vec wf))
+         (routed (< n *ds41f-cuda-routed-below*)))
     (with-cuda
       (cuda-current dev)
-      (let* ((run (and (not small)
-                       (d4-borrow-slots st (+ (* n *ds41f-cuda-chunk-bytes*) (* 5 n nc-max) (* 64 1024 1024)))))
-             (base (and run (+ (dbuf-ptr (dk-pool st)) (* (car run) (dk-slot-bytes st)))))
-             (*dk-scratch* (and run (list base (+ base (* (cdr run) (dk-slot-bytes st))) (make-hash-table))))
-             (*dk-stage* (and run (list (d4-stage-slots st (* 2 (ds4f-n-expert m)) run))))
-             (*dk-small* small) (*dk41-carry-rows* (and small (or *dk41-carry-rows* (make-hash-table)))) (held '()) (rows nil)
-             (*dk-mapped* (cons (or (getf (dk-bufs st) :p-mapped-sap)
-                                    (setf (getf (dk-bufs st) :p-mapped-sap) (cuda-host-alloc +dk-mapped-bytes+ :mapped t)))
-                                0))
-             (*dk41-pick* nil)
-             (sa (pb st :p-sa (* n hcd))) (sb (pb st :p-sb (* n hcd))))
+      (with-dk-pass (st (and (not small) (ds41f-pass-bytes n pos0)) :stage (* 2 (ds4f-n-expert m)))
+       (let* ((*dk-small* small) (*dk41-carry-rows* (and small (or *dk41-carry-rows* (make-hash-table))))
+              (held '()) (rows nil) (*dk41-pick* nil)
+              (sa (pb st :p-sa (* n hcd))) (sb (pb st :p-sb (* n hcd))))
         (dk41-ready m st ctx)
         ;; the tokens' embeddings into each stream
-        (let ((e (f32vec (* n hcd))))
-          (dotimes (tk n)
-            (let ((o (+ (ds4f-embd-off m) (* (svref tokv tk) d 2))))
-              (dotimes (j d)
-                (let ((x (f16-at wf (+ o (* 2 j)))))
-                  (dotimes (h n-hc) (setf (aref e (+ (* tk hcd) (* h d) j)) x))))))
-          (cuda-upload-vector sa e))
-        (let ((ones (f32vec n))) (fill ones 1f0) (cuda-upload-vector (pb st :p-ones n) ones))
-        (let* ((toks (let ((b (pb st :p-tok n)) (u (make-array n :element-type '(unsigned-byte 32))))
-                       (dotimes (i n) (setf (aref u i) (svref tokv i)))
-                       (sb-sys:with-pinned-objects (u) (cuda-upload b (sb-sys:vector-sap u) (* 4 n)))
-                       b))
+        (cuda-upload-vector sa (ds4f-embed! m tokv (f32vec (* n hcd))))
+        (let* ((toks (dk-upload-tokens st tokv))
                (li-plain (position 0 (ds4f-ratios m))) (li-comp (position-if #'plusp (ds4f-ratios m)))
                (cs0 (dk41-cs-rows m st :p-cs0 positions li-plain)) (ics0 (dk41-cs-rows m st :p-ics0 positions li-plain t))
                (cs1 (dk41-cs-rows m st :p-cs1 positions li-comp)) (ics1 (dk41-cs-rows m st :p-ics1 positions li-comp t))
@@ -366,13 +351,12 @@
                 (cuda-download out (sb-sys:vector-sap lv) (* 4 (ds4f-n-vocab m))))))
           (cuda-sync dev)
           (dk-arena-reset st))
-        (when run (d4-return-slots st run))
-        (or rows ctx)))))
+        (or rows ctx))))))
 
 ;;; --- speculative steps ---------------------------------------------------------------
 ;;; DS4F-SPECULATE's verifying pass for V4.1: the token and its guesses as a
 ;;; small pass, then what the guesses past the kept ones wrote undone.  The
-;;; ring (1024 rows, the window 128) keeps the window's rows; compressed rows
+;;; ring (*D41-RING* rows, the window SWA) keeps the window's rows; compressed rows
 ;;; past the kept tokens are never read before they are written again; so it
 ;;; is the Engram tail and, when the next position is a pair's second, the
 ;;; pair's first token carried again (its projections, kept by the pass).
@@ -414,30 +398,36 @@
             (cuda-current (dk-dev st))
             (when (< keep n) (ds41f-cuda-undo ctx pos0 keep n tail0 (subseq batch 0 keep)) (cuda-sync (dk-dev st))))
           (replace (d41ctx-logits ctx) rows :start2 (* (1- keep) nv) :end2 (* keep nv))
-          (incf (first *dv-stats*)) (incf (second *dv-stats*) (length draft)) (incf (third *dv-stats*) a)
-          (cond ((= a (length draft)) (setf *dv-k* (min (1- +dv-nt+) (* 2 *dv-k*))))
-                ((and (zerop a) (= *dv-k* 1)) (setf *dv-cool* 4))
-                (t (setf *dv-k* (max 1 (1+ a)))))
+          (dv-adapt a (length draft))
           a)))))
+
+(defun ds41f-pass-bytes (n pos0)
+  "The scratch a pass of N tokens from POS0 takes: the tokens' activations,
+   and per (token, compressed row) the indexer's score, a block maximum and
+   a mask byte (5 bytes, generously)."
+  (+ (* n *ds41f-cuda-chunk-bytes*) (* 5 n (+ pos0 n)) (* 64 1024 1024)))
 
 (defun ds41f-cuda-chunk-max (m pos0)
   "The most tokens a pass from POS0 has room for: the pool's slots past
    the staging ones (two layers' experts, and a few spare) hold its scratch."
   (let* ((st (ds4f-cuda-state m))
          (room (* (- (dk-n-slots st) (* 2 (ds4f-n-expert m)) 8) (dk-slot-bytes st))))
-    (flet ((bytes (n) (+ (* n *ds41f-cuda-chunk-bytes*) (* 5 n (+ pos0 n)) (* 64 1024 1024))))
+    (flet ((bytes (n) (ds41f-pass-bytes n pos0)))
       (let ((n (floor room *ds41f-cuda-chunk-bytes*)))
         (loop while (and (> n 1) (> (bytes n) room)) do (setf n (floor (* n 15) 16)))
         (max n 1)))))
 
 (defun ds41f-cuda-prefill (ctx tokens &key (logits t))
-  "TOKENS into V4.1 context CTX on the device, a pass's most at a time
-   (a short last piece decoded a token at a time)."
-  (sb-int:with-float-traps-masked (:overflow :inexact :underflow :invalid)
-    (if (>= (length tokens) *ds41f-cuda-chunk-from*)
-        (let ((m (d41ctx-model ctx)))
-          (d4-call-keeping-pool m (ds4f-cuda-state m) (lambda () (ds41f-cuda-prefill-chunks ctx tokens logits))))
-        (ds41f-cuda-prefill-chunks ctx tokens logits)))
+  "TOKENS into V4.1 context CTX on the device, a pass's most at a time (a
+   short last piece, or all of them on a device without the passes'
+   products, decoded a token at a time); decode's pool as it was after."
+  (let ((m (d41ctx-model ctx)))
+    (sb-int:with-float-traps-masked (:overflow :inexact :underflow :invalid)
+      (cond ((not (dk-passes-p (ds4f-cuda-state m)))
+             (loop for (tk . more) on tokens do (ds41f-forward-1 ctx tk (and logits (null more)))))
+            ((>= (length tokens) *ds41f-cuda-chunk-from*)
+             (d4-call-keeping-pool m (ds4f-cuda-state m) (lambda () (ds41f-cuda-prefill-chunks ctx tokens logits))))
+            (t (ds41f-cuda-prefill-chunks ctx tokens logits)))))
   ctx)
 
 (defun ds41f-cuda-prefill-chunks (ctx tokens logits)

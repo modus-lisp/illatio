@@ -104,7 +104,9 @@
       (unless (or draft *ds4f-spec-always*) (return-from ds4f-speculate :no))
       #+linux
       (let* ((c (ds4f-context ctx)) (pos0 (context-pos ctx))
-             (a (progn (setf (d4ctx-pos c) pos0)
+             (a (progn (if (d41ctx-p c)
+                           (assert (= (d4ctx-pos c) pos0) () "a V4.1 context speculates only where it is")
+                           (setf (d4ctx-pos c) pos0))
                        (sb-int:with-float-traps-masked (:overflow :inexact :underflow)
                          (if (d41ctx-p c)
                              (funcall 'ds41f-cuda-speculate c tok draft)

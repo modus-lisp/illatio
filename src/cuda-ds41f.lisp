@@ -161,7 +161,7 @@
    pre), the norm, the router's logits, the shared expert into :SOUT."
   (let* ((dev (dk-dev st)) (d (ds4f-d m)) (ff (ds4f-ff-exp m)) (ne (ds4f-n-expert m))
          (cur (dbuf-of st :cur (* 4 d))) (norm2 (dbuf-of st :norm2 (* 4 d)))
-         (pca (dbuf-of st :pca (* 4 32))) (pcf (dbuf-of st :pcf (* 4 32))) (logits (dbuf-of st :logits (* 4 2 ne)))
+         (pca (dbuf-of st :pca (* 4 32))) (pcf (dbuf-of st :pcf (* 4 32))) (logits (dbuf-of st :logits (* 4 ne)))
          (sg (dbuf-of st :sg (* 4 ff))) (su (dbuf-of st :su (* 4 ff)))
          (smid (dbuf-of st :smid (* 4 ff))) (sout (dbuf-of st :sout (* 4 d)))
          (qn2 (dk-qbuf st :norm2 d)) (qmid (dk-qbuf st :smid ff)))
@@ -178,17 +178,13 @@
 (defun ds41f-cuda-forward (ctx token logits)
   "DS41F-FORWARD-1 on the GPU: TOKEN at the next position."
   (let* ((m (d41ctx-model ctx)) (v (ds4f-v41 m)) (st (ds4f-cuda-state m)) (dev (dk-dev st))
-         (d (ds4f-d m)) (n (ds4f-n-hc m)) (hcd (* n d)) (pos (d41ctx-pos ctx)) (wf (ds4f-file m))
+         (d (ds4f-d m)) (n (ds4f-n-hc m)) (hcd (* n d)) (pos (d41ctx-pos ctx))
          (ne (ds4f-n-expert m)) (nl (ds4f-n-layer m)) (rb (dk-rb st))
          (sa (dbuf-of st :sa (* 4 hcd))) (sb (dbuf-of st :sb (* 4 hcd)))
          (lg (f32vec ne)) (prev nil))
-    (declare (type u8vec wf))
     (with-cuda
       (cuda-current dev)
-      (let ((e (f32vec hcd)) (o (+ (ds4f-embd-off m) (* token d 2))))
-        (dotimes (j d)
-          (let ((x (f16-at wf (+ o (* 2 j))))) (dotimes (h n) (setf (aref e (+ (* h d) j)) x))))
-        (cuda-upload-vector sa e))
+      (cuda-upload-vector sa (ds4f-embed! m (list token) (f32vec hcd)))
       (multiple-value-bind (rows tail) (d41-engram-hash m (d41ctx-tail ctx) token)
         (let ((pre (dk-put st '(1f0 0f0 0f0 0f0) :type :f32)))
           (dotimes (li nl)

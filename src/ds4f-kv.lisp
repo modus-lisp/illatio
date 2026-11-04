@@ -173,6 +173,7 @@
   (when (and *kv-dir* (typep (model-impl (context-model ctx)) 'ds4f) (zerop (context-pos ctx))
              (not (ds4f-v41 (model-impl (context-model ctx)))))  ; V4.1's state isn't saved yet
     (multiple-value-bind (path tokens) (ds4f-longest-saved (model-impl (context-model ctx)) ids)
+      (declare (ignore tokens))
       (when path
         (let ((got (ds4f-load-state (ds4f-context ctx) path)))
           (when got

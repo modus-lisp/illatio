@@ -153,23 +153,14 @@
    layer at once, decode's products: each token's logits (DK-HEAD-N's)."
   (let* ((m (d4ctx-model ctx)) (st (ds4f-cuda-state m)) (dev (dk-dev st))
          (d (ds4f-d m)) (n-hc (ds4f-n-hc m)) (hcd (* n-hc d)) (pos0 (d4ctx-pos ctx))
-         (n (length tokens)) (tokv (coerce tokens 'simple-vector)) (wf (ds4f-file m))
+         (n (length tokens)) (tokv (coerce tokens 'simple-vector))
          (positions (loop for i below n collect (+ pos0 i)))
          (*dk-small* t)
-         (*dk-mapped* (cons (or (getf (dk-bufs st) :p-mapped-sap)
-                                (setf (getf (dk-bufs st) :p-mapped-sap) (cuda-host-alloc +dk-mapped-bytes+ :mapped t)))
-                            0)))
-    (declare (type u8vec wf))
+         (*dk-mapped* (dk-mapped-arena st)))
     (assert (<= n +dv-nt+))
     (dk-ready m st ctx)
     (let ((sa (pb st :p-sa (* n hcd))) (sb (pb st :p-sb (* n hcd))) (held '()))
-      (let ((e (f32vec (* n hcd))))
-        (dotimes (tk n)
-          (let ((o (+ (ds4f-embd-off m) (* (svref tokv tk) d 2))))
-            (dotimes (j d)
-              (let ((v (f16-at wf (+ o (* 2 j)))))
-                (dotimes (h n-hc) (setf (aref e (+ (* tk hcd) (* h d) j)) v))))))
-        (cuda-upload-vector sa e))
+      (cuda-upload-vector sa (ds4f-embed! m tokv (f32vec (* n hcd))))
       (let ((ones (f32vec n))) (fill ones 1f0) (cuda-upload-vector (pb st :p-ones n) ones))
       (let* ((li-plain (position 0 (ds4f-ratios m))) (li-comp (position-if #'plusp (ds4f-ratios m)))
              (tables (loop for li in (list li-plain li-comp) for k from 0
@@ -238,7 +229,15 @@
    about a decode step and a third of one more a token (38 ms, then 10 ms a
    token, against 31 ms), so guesses that miss lose.")
 (defvar *dv-cool* 0 "Steps to go a token at a time, after guesses missed at one guess a step.")
-(defvar *dv-stats* (list 0 0 0) "Speculative steps, guesses, guesses confirmed.")
+(defvar *dv-stats* (list 0 0 0) "Speculative steps, guesses, guesses confirmed (for the REPL: reset it to measure).")
+
+(defun dv-adapt (a guesses)
+  "After a step whose GUESSES had A confirmed: the counts, and the next
+   step's guesses (*DV-K*) or a cooling off."
+  (incf (first *dv-stats*)) (incf (second *dv-stats*) guesses) (incf (third *dv-stats*) a)
+  (cond ((= a guesses) (setf *dv-k* (min (1- +dv-nt+) (* 2 *dv-k*))))
+        ((and (zerop a) (= *dv-k* 1)) (setf *dv-cool* 4))
+        (t (setf *dv-k* (max 1 (1+ a))))))
 
 (defun ds4f-cuda-speculate (ctx tok draft)
   "TOK and its guesses DRAFT through one pass at CTX's next position; how
@@ -259,8 +258,5 @@
              (keep (1+ a)))
         (when (< keep n) (ds4f-cuda-undo ctx rec pos0 keep n) (cuda-sync (dk-dev st)))
         (replace (d4ctx-logits ctx) rows :start2 (* (1- keep) nv) :end2 (* keep nv))
-        (incf (first *dv-stats*)) (incf (second *dv-stats*) (length draft)) (incf (third *dv-stats*) a)
-        (cond ((= a (length draft)) (setf *dv-k* (min (1- +dv-nt+) (* 2 *dv-k*))))
-              ((and (zerop a) (= *dv-k* 1)) (setf *dv-cool* 4))
-              (t (setf *dv-k* (max 1 (1+ a)))))
+        (dv-adapt a (length draft))
         a))))

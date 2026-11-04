@@ -31,6 +31,7 @@ comments sit beside the mechanics they explain.
 | Qwen3-4B-Instruct-2507 | `qwen3` (and `llama`) | Q8_0, Q4_K_M | llama.cpp |
 | a 27B Qwen3.5 | `qwen35`: gated delta net and gated attention | Q6_K | llama.cpp, CPU and Metal |
 | DeepSeek V4 Flash | `deepseek4`: 43 layers, 256 experts, compressed attention | ds4's IQ2_XXS/Q2_K build (86.7 GB) | ds4's CPU reference |
+| DeepSeek V4.1 Flash | `deepseek41`: 40 layers, 384 experts, shared compressed caches, Engram | IQ2_XXS/Q2_K (153 GB of experts) | its CPU reference (from ds4's) |
 
 ## DeepSeek V4 Flash, from the SSD
 
@@ -88,6 +89,32 @@ moves experts.
 Decode is now mostly expert reads (about 70 ms of a 100 ms token); the GPU
 is no longer the bottleneck.  The CPU reference path, a port of ds4's op
 for op, runs it too (decode 3.5 tok/s, prefill 7).
+
+
+## DeepSeek V4 and V4.1 Flash on CUDA
+
+On Linux the DeepSeek models run on NVIDIA GPUs (tested: an RTX 3090 and a
+Tesla P40 on a two-socket EPYC with 1 TB).  The routed experts are read
+once into pinned host memory on the GPUs' own NUMA node; the 3090 keeps a
+pool of them by least recent use, the P40 a fixed tier of the most used
+(computed there), and the rest are read through PCIe as they are wanted.
+V4.1's Engram tables want to be in memory (`/dev/shm`, `*ds41f-engram-file*`).
+
+| DeepSeek V4.1 Flash | |
+|---|---|
+| decode | ~20 tok/s (17-21: the experts it misses) |
+| prefill, 245 / 1,904 / 3,800 tokens | 4.2 s / 7.2 s / 8.4 s |
+| prefill, 20,181 tokens | 52 s (387 tok/s) |
+| decode at 20K tokens of context | 13 tok/s |
+
+A prompt goes through layer-major passes (`src/cuda-ds41f-prefill.lisp`):
+each layer's dense weights read once for thousands of tokens, its experts
+grouped into one product each, attention and the indexer on the tensor
+cores.  A short pass copies in only the experts its tokens route to; a long
+one copies a layer's experts while the one before computes, and is bound
+by PCIe below about 3,500 tokens.  A context goes back exactly (the server
+reuses the longest common prefix), and speculative decoding from the
+context is on: text that repeats goes about 1.2x as fast.
 
 ## The other models
 
@@ -179,7 +206,7 @@ It answers `POST /v1/chat/completions` (streamed with `"stream": true`),
 is no authentication in front of it.
 
 `--gpu` runs a `qwen35` model on the GPU; DeepSeek V4 Flash always uses it
-on a Mac.  Raw text ends with llama-simple's speed line, so a quick
+on a Mac, and the DeepSeek models always use CUDA where it is.  Raw text ends with llama-simple's speed line, so a quick
 comparison is
 
 ```
@@ -307,8 +334,10 @@ inspect/collect-vectors.py http://localhost:18931 inspect/vectors/qwen2.5-0.5b-q
 
 SBCL 2.5, tested on macOS on Apple silicon (the NEON kernels need arm64
 with FEAT_DotProd; without them the portable kernels run, which are plain
-Common Lisp).  The GPU paths need macOS on Apple silicon; DeepSeek V4 Flash
-wants a 48 GB machine and a fast SSD.  The core system has no dependencies;
+Common Lisp).  The Metal paths need macOS on Apple silicon; DeepSeek V4 Flash
+wants a 48 GB machine and a fast SSD there.  The CUDA paths need an NVIDIA
+driver (kernels compiled by NVRTC at load; the passes' products sm_80 or
+newer) and host memory for the experts (78 GB for V4, 153 GB for V4.1).  The core system has no dependencies;
 the OpenAI layer and the server use `json-simple` and `cl-transport`, from
 modus-lisp.
 
@@ -317,10 +346,10 @@ modus-lisp.
 - **DeepSeek V4 Flash's decode** is mostly expert reads now: fewer misses
   (a better guess at the next layer's experts, a pool policy that keeps
   what decode reuses) or reads overlapped with more of the GPU's work.
-  Speculative decoding from the context is in and exact
-  (`src/ds4f-spec.lisp`, `*ds4f-spec-k*`) but off: a guessed token's
-  experts are read all the same, so it can save at most the dense weights'
-  second reading, and a verifying pass costs more than that yet.
+  Speculative decoding from the context is in (`src/ds4f-spec.lisp`,
+  `*ds4f-spec-k*`), off on Metal (a guessed token's experts are read all
+  the same) and on with CUDA.  On CUDA, the P40 could compute more of the
+  experts it holds and read through its own link.
 - **modus.**  The kernels have `#+modus` arms with the portable kernels'
   bits; what is left is modus's thread scaling.
 - **More formats and models.**  Q5_K, Q8_0-with-K-quant mixes, and

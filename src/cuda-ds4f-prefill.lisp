@@ -296,8 +296,9 @@
             (setf (getf (dk-bufs st) key) b))))))
 
 (defvar *dk41-round-moe* nil
-  "During a V4.1 pass (cuda-ds41f-prefill.lisp): DK-FFN-ROUTED-CHUNK rounds
-   the experts' sum and the streams to BF16.")
+  "During a V4.1 pass (cuda-ds41f-prefill.lisp): DK-FFN-ROUTED-CHUNK and
+   DK-FFN-SMALL round the experts' sum and the streams to BF16.  (Here, for
+   the load order: V4.1's files come after V4's.)")
 
 (defun dk-ffn-routed-chunk (m st l li n toks slots sb sa)
   "The chunk's FFN past its router, routing included, on the device: each
@@ -368,18 +369,18 @@
     (declare (type (simple-array fixnum (*)) slot-of pin used owner))
     (dotimes (e ne)
       (when (or (null needed) (= 1 (sbit needed e)))
-      (let ((key (+ (* li ne) e)))
-        (let ((s (aref slot-of key)))
-          (if (>= s 0)
-              (progn (incf (aref pin s)) (setf (aref used s) tick) (incf (dk-hits st)))
-              (progn
-                (setf s (or (pop (car *dk-stage*)) (error "a pass is out of staging slots")))
-                (when (>= (aref owner s) 0) (setf (aref slot-of (aref owner s)) -1))
-                ;; low priority once let go: decode's misses take these first
-                (setf (aref owner s) key (aref slot-of key) s (aref used s) 0)
-                (incf (aref pin s)) (incf (dk-misses st)) (push s staged)
-                (d4-copy-expert m st li e s)))
-          (setf (aref slots e) s)))))
+        (let ((key (+ (* li ne) e)))
+          (let ((s (aref slot-of key)))
+            (if (>= s 0)
+                (progn (incf (aref pin s)) (setf (aref used s) tick) (incf (dk-hits st)))
+                (progn
+                  (setf s (or (pop (car *dk-stage*)) (error "a pass is out of staging slots")))
+                  (when (>= (aref owner s) 0) (setf (aref slot-of (aref owner s)) -1))
+                  ;; low priority once let go: decode's misses take these first
+                  (setf (aref owner s) key (aref slot-of key) s (aref used s) 0)
+                  (incf (aref pin s)) (incf (dk-misses st)) (push s staged)
+                  (d4-copy-expert m st li e s)))
+            (setf (aref slots e) s)))))
     (let ((ev (cuda-event-create (dk-dev st))))
       (cuda-event-record ev (dk-copy-stream st))
       (values slots ev staged))))
@@ -418,6 +419,42 @@
                 (d4-copy-expert m st (floor o ne) (mod o ne) s))))
           (cuda-stream-sync (dk-copy-stream st)))))))
 
+(defun dk-mapped-arena (st)
+  "A pass's *DK-MAPPED*: ST's mapped host arena (made the first time), from its start."
+  (cons (or (getf (dk-bufs st) :p-mapped-sap)
+            (setf (getf (dk-bufs st) :p-mapped-sap) (cuda-host-alloc +dk-mapped-bytes+ :mapped t)))
+        0))
+
+(defun d4-abandon-pass (st run)
+  "After a pass that did not finish: the device idle, every slot let go,
+   the borrowed RUN (or NIL) handed back."
+  (ignore-errors (cuda-sync (dk-dev st)) (cuda-stream-sync (dk-copy-stream st)))
+  (fill (dk-pin st) 0)
+  (when run (loop for s from (car run) below (+ (car run) (cdr run)) do (setf (aref (dk-used st) s) 0))))
+
+(defmacro with-dk-pass ((st bytes &key (stage 0)) &body body)
+  "BODY as a pass over ST: its scratch the pool's last slots, enough for
+   BYTES (NIL: none, ST's own buffers), STAGE least recently used slots to
+   stage copies in, the mapped arena; the slots handed back after, and if
+   BODY does not finish, every slot let go."
+  (let ((run (gensym "RUN")) (ok (gensym "OK")) (s (gensym "ST")))
+    `(let* ((,s ,st) (,run (and ,bytes (d4-borrow-slots ,s ,bytes))) (,ok nil)
+            (*dk-scratch* (and ,run (let ((base (+ (dbuf-ptr (dk-pool ,s)) (* (car ,run) (dk-slot-bytes ,s)))))
+                                      (list base (+ base (* (cdr ,run) (dk-slot-bytes ,s))) (make-hash-table)))))
+            (*dk-stage* (and ,run (list (d4-stage-slots ,s ,stage ,run))))
+            (*dk-mapped* (dk-mapped-arena ,s)))
+       (unwind-protect (multiple-value-prog1 (progn ,@body) (setf ,ok t))
+         (if ,ok
+             (when ,run (d4-return-slots ,s ,run))
+             (d4-abandon-pass ,s ,run))))))
+
+(defun dk-upload-tokens (st tokv)
+  "The token ids TOKV on the device (scratch :P-TOK)."
+  (let* ((n (length tokv)) (b (pb st :p-tok n)) (u (make-array n :element-type '(unsigned-byte 32))))
+    (dotimes (i n) (setf (aref u i) (svref tokv i)))
+    (sb-sys:with-pinned-objects (u) (cuda-upload b (sb-sys:vector-sap u) (* 4 n)))
+    b))
+
 (defun dk-ready (m st ctx)
   "What is copied in once (the hash tables, the layers' vectors, a fresh
    context's caches), before a pass queues anything: behind its copies a
@@ -440,32 +477,16 @@
    layer-major (at most *DS4F-CUDA-CHUNK* of them)."
   (let* ((m (d4ctx-model ctx)) (st (ds4f-cuda-state m)) (dev (dk-dev st))
          (d (ds4f-d m)) (n-hc (ds4f-n-hc m)) (hcd (* n-hc d)) (pos0 (d4ctx-pos ctx))
-         (n (length tokens)) (tokv (coerce tokens 'simple-vector)) (wf (ds4f-file m))
+         (n (length tokens)) (tokv (coerce tokens 'simple-vector))
          (nl (ds4f-n-layer m)) (positions (loop for i below n collect (+ pos0 i))))
-    (declare (type u8vec wf))
     (with-cuda
       (cuda-current dev)
-      (let* ((run (d4-borrow-slots st (+ (* n *ds4f-cuda-chunk-bytes*) (* 64 1024 1024))))
-             (base (+ (dbuf-ptr (dk-pool st)) (* (car run) (dk-slot-bytes st))))
-             (*dk-scratch* (list base (+ base (* (cdr run) (dk-slot-bytes st))) (make-hash-table)))
-             (*dk-stage* (list (d4-stage-slots st (* 2 (ds4f-n-expert m)) run)))
-             (*dk-mapped* (cons (or (getf (dk-bufs st) :p-mapped-sap)
-                                    (setf (getf (dk-bufs st) :p-mapped-sap) (cuda-host-alloc +dk-mapped-bytes+ :mapped t)))
-                                0))
-             (sa (pb st :p-sa (* n hcd))) (sb (pb st :p-sb (* n hcd))))
+      (with-dk-pass (st (+ (* n *ds4f-cuda-chunk-bytes*) (* 64 1024 1024)) :stage (* 2 (ds4f-n-expert m)))
+       (let ((sa (pb st :p-sa (* n hcd))) (sb (pb st :p-sb (* n hcd))))
         ;; the tokens' embeddings into each stream
-        (let ((e (f32vec (* n hcd))))
-          (dotimes (tk n)
-            (let ((o (+ (ds4f-embd-off m) (* (svref tokv tk) d 2))))
-              (dotimes (j d)
-                (let ((v (f16-at wf (+ o (* 2 j)))))
-                  (dotimes (h n-hc) (setf (aref e (+ (* tk hcd) (* h d) j)) v))))))
-          (cuda-upload-vector sa e))
+        (cuda-upload-vector sa (ds4f-embed! m tokv (f32vec (* n hcd))))
         (let ((ones (f32vec n))) (fill ones 1f0) (cuda-upload-vector (pb st :p-ones n) ones))
-        (let* ((toks (let ((b (pb st :p-tok n)) (u (make-array n :element-type '(unsigned-byte 32))))
-                       (dotimes (i n) (setf (aref u i) (svref tokv i)))
-                       (sb-sys:with-pinned-objects (u) (cuda-upload b (sb-sys:vector-sap u) (* 4 n)))
-                       b))
+        (let* ((toks (dk-upload-tokens st tokv))
                ;; the RoPE tables: a layer's depend only on whether it is compressed
                (li-plain (position 0 (ds4f-ratios m))) (li-comp (position-if #'plusp (ds4f-ratios m)))
                (tables (loop for li in (list li-plain li-comp) for k from 0
@@ -494,6 +515,30 @@
             (let ((out (dk-head m st (cons sa (* 4 (1- n) hcd)))) (v (d4ctx-logits ctx)))
               (sb-sys:with-pinned-objects (v)
                 (cuda-download out (sb-sys:vector-sap v) (* 4 (ds4f-n-vocab m)))))
-            (cuda-sync dev)))
-        (d4-return-slots st run)))
+            (cuda-sync dev))))))
+    ctx))
+
+(defun dk-passes-p (st)
+  "Whether ST's device takes layer-major passes: their products are the
+   tensor cores' (DS4F_MM's, sm_80 and up)."
+  (>= (cudev-arch (dk-dev st)) 80))
+
+(defun ds4f-cuda-prefill (ctx tokens logits)
+  "TOKENS into d4ctx CTX on the device, layer-major *DS4F-CUDA-CHUNK* at a
+   time (a piece shorter than *DS4F-CUDA-CHUNK-FROM* a token at a time, as
+   on a device without the passes' products); the last one's logits when
+   LOGITS.  Decode's pool as it was after."
+  (let* ((m (d4ctx-model ctx)) (st (ds4f-cuda-state m)))
+    (flet ((decode (toks last) (loop for (tk . more) on toks do (ds4f-cuda-forward ctx tk (and last (null more))))))
+      (if (or (< (length tokens) *ds4f-cuda-chunk-from*) (not (dk-passes-p st)))
+          (decode tokens logits)
+          (d4-call-keeping-pool
+           m st (lambda ()
+                  (loop for rest = tokens then (nthcdr k rest)
+                        for k = (min *ds4f-cuda-chunk* (length rest))
+                        while rest
+                        do (let ((piece (subseq rest 0 k)) (last (and logits (= k (length rest)))))
+                             (if (>= k *ds4f-cuda-chunk-from*)
+                                 (ds4f-cuda-prefill-1 ctx piece last)
+                                 (decode piece last))))))))
     ctx))

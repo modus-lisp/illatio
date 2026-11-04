@@ -7,8 +7,8 @@
 
 ## DS41F (DeepSeek V4.1 Flash) on CUDA
 
-Decode runs (ds41f.lisp, cuda-ds41f.lisp): 13.0 t/s on the 3090 + P40,
-experts found on a device 81% of the time.  The GGUF is audreyt's
+Decode runs (ds41f.lisp, cuda-ds41f.lisp): ~20 t/s on the 3090 + P40
+(17-21 by the misses: ~70% of experts found on a device).  The GGUF is audreyt's
 (`/mnt/ollama/huggingface/hub/blobs/38/38e0...`); the `/mnt/ollama`
 V4.1 file is truncated.  Engram's tables want to be in memory
 (`/dev/shm/ds41f-engram.bin`, *ds41f-engram-file*).
@@ -32,7 +32,8 @@ V4.1 file is truncated.  Engram's tables want to be in memory
   896 tokens, else from the start).  Saved state is still V4 only.
 - Speculative decoding (DS41F-CUDA-SPECULATE): a 9-token verifying pass
   costs about two decode steps with its experts held (164 ms against
-  9 x 35), but each token's expert misses still cost what they do decoding,
+  9 x 35 ms, decode steps whose experts are all held), but each token's
+  expert misses still cost what they do decoding,
   so text that repeats goes ~1.2x as fast and other text ~3% slower.  The
   tokens matched plain decoding's on the prompts tried (the pass is
   decode's products, but its attention and indexer are the chunk's).

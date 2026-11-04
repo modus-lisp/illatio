@@ -1,5 +1,8 @@
-// ds4f_v41.cu — DeepSeek V4.1 Flash's decode (cuda-ds41f.lisp): what differs
-// from V4 (ds4f.cu, whose products, attention and experts it uses).  BF16
+// ds4f_v41.cu — DeepSeek V4.1 Flash on the GPU (cuda-ds41f.lisp's decode,
+// cuda-ds41f-prefill.lisp's passes): what differs from V4 (ds4f.cu,
+// ds4f_chunk.cu, ds4f_mm.cu, whose products, attention and experts it uses),
+// and the passes' own (the chunk kernels, the tensor cores' attention and
+// indexer scores, the router's tiled product, Engram's decode).  BF16
 // rounding (nearest, ties even, kept as f32) at the boundaries ds4 rounds
 // at; the FP8/FP4 round trips of the raw and compressed rows and of the
 // indexer; RoPE with every turned element rounded; HC's split kept apart

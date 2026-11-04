@@ -809,7 +809,7 @@
 
 (defun d4-shared-chunk! (m l norms n clamp)
   "D4-SHARED! for N tokens at once (MATMUL!: each (row, token) its bits)."
-  (let* ((pool (ds4f-pool m)) (ff (ds4f-ff-exp m)) (d (ds4f-d m))
+  (let* ((ff (ds4f-ff-exp m)) (d (ds4f-d m))
          (g (d4-chunk-q8mm m l (d4-layer-index m l) "ffn_gate_shexp.weight" (dl-sh-gate l) norms n (f32vec (* n ff))))
          (u (d4-chunk-q8mm m l (d4-layer-index m l) "ffn_up_shexp.weight" (dl-sh-up l) norms n (f32vec (* n ff)))))
     (declare (type f32vec g u))
@@ -827,7 +827,7 @@
          (norms (f32vec (* n d))) (posts (make-array n)) (combs (make-array n))
          (qr (f32vec (* n lq))) (qr-norm (f32vec (* n lq))) (q (f32vec (* n nh hd)))
          (kv0 (f32vec (* n hd))) (heads (f32vec (* n nh hd)))
-         (streams (f32vec hcd)) (cur1 (f32vec d)) (flat (f32vec hcd)) (norm (f32vec d)))
+         (streams (f32vec hcd)) (norm (f32vec d)))
     (d4-hc-pre-chunk m (dl-hc-attn-fn l) (dl-hc-attn-scale l) (dl-hc-attn-base l) (dl-attn-norm l)
                      cur n norms posts combs)
     (d4-chunk-q8mm m l li "attn_q_a.weight" (dl-q-a l) norms n qr)
@@ -942,6 +942,7 @@
   "(values experts weights): the hash table's experts in the first layers,
    else the top N-USED of sqrt(softplus(router)) + bias; weights from the
    unbiased probabilities, renormalized and scaled."
+  (declare (ignore li))
   (let* ((ne (ds4f-n-expert m)) (nu (ds4f-n-used m))
          (logits (f32vec ne)) (probs (f32vec ne)) (sel (make-array nu)) (w (f32vec nu)))
     (if logits-in (replace logits logits-in) (f32mv! (ds4f-pool m) (dl-gate-inp l) x logits))
@@ -1044,6 +1045,18 @@
   #+sbcl (sb-int:with-float-traps-masked (:overflow :inexact :underflow) (ds4f-forward-1 ctx token logits))
   #-sbcl (ds4f-forward-1 ctx token logits))
 
+(defun ds4f-embed! (m tokens out)
+  "Each of TOKENS' embeddings (F16 rows) into each of its N-HC streams:
+   OUT, a token's N-HC x D after another's."
+  (let* ((d (ds4f-d m)) (n (ds4f-n-hc m)) (hcd (* n d)) (wf (ds4f-file m)))
+    (declare (type u8vec wf) (type f32vec out))
+    (loop for tk in (coerce tokens 'list) for at from 0 by hcd
+          do (let ((o (+ (ds4f-embd-off m) (* tk d 2))))
+               (dotimes (j d)
+                 (let ((v (f16-at wf (+ o (* 2 j)))))
+                   (dotimes (h n) (setf (aref out (+ at (* h d) j)) v))))))
+    out))
+
 (defun ds4f-forward-1 (ctx token logits)
   (when (d41ctx-p ctx)
     (return-from ds4f-forward-1 (ds41f-forward-1 ctx token logits)))
@@ -1056,12 +1069,8 @@
   (ds4f-cpu-q8! (d4ctx-model ctx))
   (let* ((*q8-f16-scale* *ds4f-q8-f16-scale*)
          (m (d4ctx-model ctx)) (d (ds4f-d m)) (n (ds4f-n-hc m)) (pos (d4ctx-pos ctx))
-         (streams (f32vec (* n d))) (next (f32vec (* n d))) (wf (ds4f-file m)))
-    (declare (type u8vec wf))
-    (let ((o (+ (ds4f-embd-off m) (* token d 2))))
-      (dotimes (j d)
-        (let ((v (f16-at wf (+ o (* 2 j)))))
-          (dotimes (h n) (setf (aref streams (+ (* h d) j)) v)))))
+         (streams (f32vec (* n d))) (next (f32vec (* n d))))
+    (ds4f-embed! m (list token) streams)
     (dotimes (li (ds4f-n-layer m))
       (let ((l (svref (ds4f-layers m) li)) (c (svref (d4ctx-caches ctx) li)))
         (multiple-value-bind (out post comb) (d4-attention m l li c streams pos)
@@ -1116,17 +1125,8 @@
 (defun ds4f-prefill-1 (ctx tokens logits)
   #+(and sbcl linux)
   (when (ds4f-cuda-p)
-    ;; decode's caches are the device's: a long chunk layer-major on it
-    ;; (cuda-ds4f-prefill.lisp), *DS4F-CUDA-CHUNK* at a time, else a token at a time
-    (if (>= (length tokens) (symbol-value '*ds4f-cuda-chunk-from*))
-        (funcall 'd4-call-keeping-pool (d4ctx-model ctx) (funcall 'ds4f-cuda-state (d4ctx-model ctx))
-                 (lambda ()
-                   (loop for rest = tokens then (nthcdr (symbol-value '*ds4f-cuda-chunk*) rest)
-                         while rest
-                         do (let ((k (min (symbol-value '*ds4f-cuda-chunk*) (length rest))))
-                              (funcall 'ds4f-cuda-prefill-1 ctx (subseq rest 0 k) (and logits (= k (length rest))))))))
-        (loop for (tk . rest) on tokens do (ds4f-cuda-forward ctx tk (and logits (null rest)))))
-    (return-from ds4f-prefill-1 ctx))
+    ;; decode's caches are the device's (cuda-ds4f-prefill.lisp)
+    (return-from ds4f-prefill-1 (funcall 'ds4f-cuda-prefill ctx tokens logits)))
   #+(and sbcl darwin)
   (when (ds4f-gpu-p :prefill)
     (return-from ds4f-prefill-1 (ds4f-gpu-prefill-1 ctx tokens logits)))
@@ -1134,15 +1134,10 @@
   (let* ((*q8-f16-scale* *ds4f-q8-f16-scale*)
          (m (d4ctx-model ctx)) (d (ds4f-d m)) (n-hc (ds4f-n-hc m)) (hcd (* n-hc d))
          (pos0 (d4ctx-pos ctx)) (n (length tokens)) (tokv (coerce tokens 'simple-vector))
-         (pool (ds4f-pool m)) (wf (ds4f-file m)) (eps (ds4f-eps m))
-         (nu (ds4f-n-used m)) (ff (ds4f-ff-exp m))
+         (pool (ds4f-pool m)) (wf (ds4f-file m)) (nu (ds4f-n-used m)) (ff (ds4f-ff-exp m))
          (cur (f32vec (* n hcd))) (next (f32vec (* n hcd))))
     (declare (type u8vec wf) (type f32vec cur next))
-    (dotimes (tk n)
-      (let ((o (+ (ds4f-embd-off m) (* (svref tokv tk) d 2))))
-        (dotimes (j d)
-          (let ((v (f16-at wf (+ o (* 2 j)))))
-            (dotimes (h n-hc) (setf (aref cur (+ (* tk hcd) (* h d) j)) v))))))
+    (ds4f-embed! m tokv cur)
     (dotimes (li (ds4f-n-layer m))
       (let* ((l (svref (ds4f-layers m) li)) (c (svref (d4ctx-caches ctx) li))
              (streams (f32vec hcd)) (out-s (f32vec hcd)))

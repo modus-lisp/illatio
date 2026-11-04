@@ -242,21 +242,20 @@
 
 (defstruct (d41ctx (:include d4ctx (caches #())) (:constructor %make-d41ctx))
   raw                                   ; per layer: RING x HEAD-DIM, position p at row p mod RING
-  (ring 128)
+  (ring *d41-ring*)
   comp ix-comp prev-kv prev-score       ; per owner
   selected (n-sel 0) block-mask
   (tail (list -1 -1 -1))                ; Engram: the last 3 tokens' compressed ids, newest first
   (written 0))                          ; past the last position the ring has been written for
 
 (defun make-d41ctx (m &key (n-ctx 4096))
-  (let* ((v (ds4f-v41 m)) (hd (ds4f-head-dim m)) (ixd (ds4f-ix-dim m)))
+  (let* ((v (ds4f-v41 m)) (hd (ds4f-head-dim m)) (ixd (ds4f-ix-dim m)) (ring (max *d41-ring* (ds4f-swa m))))
     (flet ((per-owner (fn) (map 'simple-vector fn (d41-kv-src v)))
            (cap (src) (1+ (floor n-ctx (max 1 (svref (ds4f-ratios m) src))))))
       (%make-d41ctx
        :model m :n-ctx n-ctx :logits (f32vec (ds4f-n-vocab m))
-       :ring (max *d41-ring* (ds4f-swa m))
-       :raw (map 'simple-vector (lambda (l) (declare (ignore l)) (f32vec (* (max *d41-ring* (ds4f-swa m)) hd)))
-                 (ds4f-layers m))
+       :ring ring
+       :raw (map 'simple-vector (lambda (l) (declare (ignore l)) (f32vec (* ring hd))) (ds4f-layers m))
        :comp (per-owner (lambda (src) (f32vec (* (cap src) hd))))
        :ix-comp (per-owner (lambda (src) (f32vec (* (cap src) ixd))))
        :prev-kv (per-owner (lambda (src) (declare (ignore src)) (f32vec hd)))
@@ -550,13 +549,10 @@
   (when (ds4f-cuda-p)
     (return-from ds41f-forward-1 (ds41f-cuda-forward ctx token logits)))
   (let* ((m (d41ctx-model ctx)) (v (ds4f-v41 m)) (d (ds4f-d m)) (n (ds4f-n-hc m)) (pos (d41ctx-pos ctx))
-         (streams (f32vec (* n d))) (next (f32vec (* n d))) (x (f32vec d)) (wf (ds4f-file m))
+         (streams (f32vec (* n d))) (next (f32vec (* n d))) (x (f32vec d))
          (pre (let ((p (f32vec n))) (setf (aref p 0) 1f0) p)))
-    (declare (type u8vec wf))
     (assert (ds4f-output m) () "V4.1 on the CPU wants its weights loaded: bind *DS4F-CPU-Q8* to T")
-    (let ((o (+ (ds4f-embd-off m) (* token d 2))))
-      (dotimes (j d)
-        (let ((e (f16-at wf (+ o (* 2 j))))) (dotimes (h n) (setf (aref streams (+ (* h d) j)) e)))))
+    (ds4f-embed! m (list token) streams)
     (multiple-value-bind (rows tail) (d41-engram-hash m (d41ctx-tail ctx) token)
       (dotimes (li (ds4f-n-layer m))
         (let ((l (svref (ds4f-layers m) li)) (tbl (position li (d41-eg-layers v))))
