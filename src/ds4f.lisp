@@ -1231,6 +1231,7 @@
 ;;; logits shared), FORWARD and EVAL-TOKENS come here, and the model counts as
 ;;; recurrent -- its compressors and window can't go back -- so SYNC-PROMPT
 ;;; continues a context only past what it has seen and otherwise starts over.
+;;; V4.1's go back exactly (D41-REWIND), so it reuses the longest common prefix.
 
 (defun load-ds4f-model (path threads)
   (let* ((d (load-ds4f path :threads threads)) (g (ds4f-gguf d)) (v (make-vocab-from-gguf g)))

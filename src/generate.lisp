@@ -81,8 +81,9 @@
     ;; per position.
     (setf common (min common (1- (length ids))))
     ;; A recurrent model's state can't go back: it continues only when IDS
-    ;; extends exactly what it has seen, and otherwise starts over.
-    (when (model-recurrent-p (context-model ctx))
+    ;; extends exactly what it has seen, and otherwise starts over (one that
+    ;; rewinds itself exactly, V4.1, is told the position it goes back to).
+    (when (and (model-recurrent-p (context-model ctx)) (not (model-rewinds-p (context-model ctx))))
       (if (and (= common (length have)) (< common (length ids)))
           nil
           (progn (setf common 0) (reset-recurrent! ctx)))

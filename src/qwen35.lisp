@@ -30,6 +30,13 @@
   (or (model-impl m)
       (some (lambda (l) (eq (layer-kind l) :linear)) (model-layers m))))
 
+(defgeneric impl-rewinds-p (impl)
+  (:documentation "Whether a model implementation's context goes back to an
+   earlier position exactly, recurrent state and all (its own eval does it).")
+  (:method (impl) (declare (ignore impl)) nil))
+
+(defun model-rewinds-p (m) (impl-rewinds-p (model-impl m)))
+
 ;;; --- per-context state and scratch ----------------------------------------------
 
 (defstruct (q35 (:constructor %make-q35))

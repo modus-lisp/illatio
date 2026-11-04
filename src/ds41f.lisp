@@ -288,6 +288,8 @@
             (d41ctx-pos ctx) p))
     (append (coerce (subseq hist p pos) 'list) tokens)))
 
+(defmethod impl-rewinds-p ((impl ds4f)) (and (ds4f-v41 impl) t))   ; D41-REWIND
+
 (defun d41-owner (m li)
   "The index of the kv-source layer whose caches layer LI reads."
   (position-if (lambda (s) (<= s li)) (d41-kv-src (ds4f-v41 m)) :from-end t))
