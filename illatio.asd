@@ -35,6 +35,7 @@
      (:file "generate")    ; sampling, prompt reuse, streaming text
      (:file "ds4f")        ; DeepSeek V4 Flash (deepseek4), ported from ds4.c
      (:file "ds41f")       ; DeepSeek V4.1 Flash (deepseek41): V4's pieces, ds4's V4.1 graph
+     (:file "glm53")       ; GLM-5.3 Flash (glm5-next): V4's HC and experts, KDA and DSA layers
      (:file "ds4f-kv")      ; its state saved: a long prompt prefilled once
      (:file "ds4f-hotlist") ; its most used experts (ds4's profile)
      (:file "ds41f-hotlist") ; V4.1's (illatio's own profile)
@@ -44,6 +45,7 @@
      (:file "cuda-ds4f-spec" :if-feature (:and :sbcl :linux)) ; its speculative steps there
      (:file "cuda-ds41f" :if-feature (:and :sbcl :linux)) ; V4.1's decode there
      (:file "cuda-ds41f-prefill" :if-feature (:and :sbcl :linux)) ; and its prefill, layer-major
+     (:file "cuda-glm53" :if-feature (:and :sbcl :linux)) ; GLM-5.3's decode there
      (:file "metal-ds4f" :if-feature (:and :sbcl :darwin)) ; it on the GPU: prefill, decode's experts
      (:file "metal-ds4f-decode" :if-feature (:and :sbcl :darwin)) ; a token's every layer on it
      (:file "metal-ds4f-prefill" :if-feature (:and :sbcl :darwin)) ; a prefill chunk's

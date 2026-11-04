@@ -41,8 +41,6 @@
 
 (defvar *ds4f-fill-max* 4 "Background copies into the pool queued a layer, at most.")
 
-(defvar *ds4f-route-trace* nil "A stream each layer's routing is written to (layer, experts), or NIL.")
-
 (defvar *ds4f-cuda-pool-gb* nil "The expert pool's size in GB; NIL: what the device has left.")
 
 (defstruct (d4cuda (:conc-name dk-))
@@ -141,13 +139,16 @@
          (parallel-for (k (* 3 keys) (ds4f-pool m))
            (multiple-value-bind (key part) (floor k 3)
              (multiple-value-bind (li e) (floor key ne)
-               (destructuring-bind (off rb rows cols) (ecase part
-                                                        (0 (dl-gate-exps (svref (ds4f-layers m) li)))
-                                                        (1 (dl-up-exps (svref (ds4f-layers m) li)))
-                                                        (2 (dl-down-exps (svref (ds4f-layers m) li))))
-                 (declare (ignore cols))
-                 (d4-pread fd (sb-sys:sap+ sap (+ (* key slot-bytes) (* part gate-bytes)))
-                           (+ off (* e rows rb)) (* rows rb))))))
+               (let ((tensor (ecase part
+                               (0 (dl-gate-exps (svref (ds4f-layers m) li)))
+                               (1 (dl-up-exps (svref (ds4f-layers m) li)))
+                               (2 (dl-down-exps (svref (ds4f-layers m) li))))))
+                 ;; (GLM's dense layers have none: their slots stay empty)
+                 (when tensor
+                   (destructuring-bind (off rb rows cols) tensor
+                     (declare (ignore cols))
+                     (d4-pread fd (sb-sys:sap+ sap (+ (* key slot-bytes) (* part gate-bytes)))
+                               (+ off (* e rows rb)) (* rows rb))))))))
       (sb-unix:unix-close fd))
     (let ((t1 (get-internal-real-time)))
       (cuda-host-register sap span)
@@ -327,6 +328,7 @@
                        (coerce (loop for k in keys append (multiple-value-list (floor k ne))) 'simple-vector))))
                   ((and (= (ds4f-n-layer m) 43) (= (ds4f-n-expert m) 256)) +ds4f-hotlist+)
                   ((and (ds4f-v41 m) (= (ds4f-n-layer m) 40) (= (ds4f-n-expert m) 384)) +ds41f-hotlist+)
+                  ((ds4f-glm m) (funcall 'g53-hotlist m))
                   (t #())))))
 
 (defun d4-make-pool (m st)
@@ -547,7 +549,8 @@
         (let* ((ne (ds4f-n-expert m)) (logits (f32vec ne)) (b (dl-probs-b l)))
           (declare (type f32vec logits))
           (replace logits router-logits)
-          (dotimes (i ne) (setf (aref logits i) (+ (sqrt (d4-softplus (aref logits i))) (if b (aref b i) 0f0))))
+          (dotimes (i ne) (setf (aref logits i) (+ (if (ds4f-glm m) (d4-sigmoid (aref logits i)) (sqrt (d4-softplus (aref logits i))))
+                                                   (if b (aref b i) 0f0))))
           (loop repeat k
                 collect (let ((best (let ((bi 0)) (dotimes (i ne bi) (when (> (aref logits i) (aref logits bi)) (setf bi i))))))
                           (setf (aref logits best) most-negative-single-float)
@@ -669,7 +672,8 @@
 
 (defun dk-mv16 (st name x y)
   (destructuring-bind (w rows cols &optional (type :f16)) (or (gethash name (dk-f16 st)) (error "no F16 tensor ~A" name))
-    (launch (dk-dev st) (if (eq type :f32) "d41_mv_f32" "d4_mv_f16") (ceiling rows 4) 256 (list cols rows w x y))))
+    (launch (dk-dev st) (ecase type (:f32 "d41_mv_f32") (:f16 "d4_mv_f16") (:bf16 "g53_mv_bf16"))
+            (ceiling rows 4) 256 (list cols rows w x y))))
 
 (defun dk-q8mv (st name x y &key group-rows q)
   "Y = W X for Q8_0 tensor NAME, X quantized (ds4's Q8_0 activations):

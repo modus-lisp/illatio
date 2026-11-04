@@ -93,11 +93,16 @@
           (apply #'dk-mm st "d4_mm_q8_0" (cmat-qs w) (cmat-d w) 0 (cmat-rows w) (cmat-cols w) x y n keys)))))
 
 (defun dk-f16mm (st name x y n &rest keys &key y-stride &allow-other-keys)
+  "Y = W X over N tokens for F16 tensor NAME (or a BF16 or F32 one: GLM's,
+   their products exact, f32)."
   (destructuring-bind (w rows cols &optional type) (or (gethash name (dk-f16 st)) (error "no F16 tensor ~A" name))
-    (declare (ignore type))
-    (if *dk-small*
-        (launch (dk-dev st) "d4_mv_f16n" (ceiling rows 4) 256 (list cols rows n (or y-stride rows) w x y))
-        (apply #'dk-mm st "d4_mm_f16" w nil (* 2 cols) rows cols x y n keys))))
+    (cond ((member type '(:bf16 :f32))
+           (assert (not *dk-small*))
+           (launch (dk-dev st) (if (eq type :bf16) "g53_mm_bf16" "d41_mm_f32") (list (ceiling n 64) (ceiling rows 64)) 256
+                   (list cols rows n (getf keys :x-stride cols) (or y-stride rows) w x y)))
+          (*dk-small*
+           (launch (dk-dev st) "d4_mv_f16n" (ceiling rows 4) 256 (list cols rows n (or y-stride rows) w x y)))
+          (t (apply #'dk-mm st "d4_mm_f16" w nil (* 2 cols) rows cols x y n keys)))))
 
 (defun dk-cs-rows (m st key pos-list il &optional inverse)
   "D4-ROPE-CS!'s table for each position of POS-LIST, a row each: in scratch
@@ -318,7 +323,7 @@
          (g (pb st :p-g (* rows ff))) (u (pb st :p-u (* rows ff))) (mid (pb st :p-mid (* rows ff)))
          (down (pb st :p-down (* rows d))) (moe (pb st :p-moe (* n d))) (ptrs nil))
     (launch dev "d4_route" n ne
-            (list ne nu (if (dl-tid2eid l) 1 0) (ds4f-expert-scale m) (if (dl-probs-b l) 1 0)
+            (list ne nu (cond ((dl-tid2eid l) 1) ((ds4f-glm m) 2) (t 0)) (ds4f-expert-scale m) (if (dl-probs-b l) 1 0)
                   (pb st :p-logits (* n ne)) (and (dl-probs-b l) (dvec st (dl-probs-b l)))
                   (and (dl-tid2eid l) (dk-tid2eid st li l)) toks sel w)
             :shared (* 4 (+ (* 2 ne) 64 nu)))

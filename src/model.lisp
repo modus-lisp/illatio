@@ -60,6 +60,7 @@
   (let ((arch (meta (read-gguf path) "general.architecture")))
     (cond ((equal arch "deepseek4") (load-ds4f-model path threads))
           ((equal arch "deepseek41") (load-ds41f-model path threads))
+          ((equal arch "glm5-next") (load-g53-model path threads))
           (t (finish-model (load-model-1 path threads))))))
 
 (defun load-model-1 (path threads)

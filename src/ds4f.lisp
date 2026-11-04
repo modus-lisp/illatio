@@ -50,6 +50,7 @@
   embd-off output output-norm out-hc-fn out-hc-scale out-hc-base
   (layers #() :type simple-vector)
   (v41 nil)                             ; V4.1's own (a D41, ds41f.lisp), or NIL for V4
+  (glm nil)                             ; true for GLM-5.3 Flash (a G53, glm53.lisp)
   (gpu-plist '()))                      ; the GPU's state, when it runs (metal-ds4f.lisp)
 
 (defvar *ds4f-gpu* #+(and sbcl darwin) '(:decode :prefill) #+(and sbcl linux) '(:decode) #-sbcl nil
@@ -57,6 +58,8 @@
    (metal-ds4f-decode.lisp), :PREFILL, a prompt chunk's
    (metal-ds4f-prefill.lisp); T is both, NIL neither -- the CPU's reference
    path, ds4's op for op.")
+
+(defvar *ds4f-route-trace* nil "A stream each layer's routing is written to (layer, experts), or NIL.")
 
 (defparameter *ds4f-prefetch-k* 8
   "How many of the next layer's experts decode reads ahead (0: none).")
@@ -1058,6 +1061,8 @@
     out))
 
 (defun ds4f-forward-1 (ctx token logits)
+  (when (ds4f-glm (d4ctx-model ctx))
+    (return-from ds4f-forward-1 (funcall 'g53-forward-1 ctx token logits)))
   (when (d41ctx-p ctx)
     (return-from ds4f-forward-1 (ds41f-forward-1 ctx token logits)))
   #+(and sbcl linux)
@@ -1241,9 +1246,9 @@
   (or (getf (context-plist ctx) :ds4f)
       (setf (getf (context-plist ctx) :ds4f)
             (let* ((m (model-impl (context-model ctx)))
-                   (c (if (ds4f-v41 m)
-                          (make-d41ctx m :n-ctx (context-n-ctx ctx))
-                          (make-d4ctx m :n-ctx (context-n-ctx ctx)))))
+                   (c (cond ((ds4f-glm m) (funcall 'make-g53ctx m :n-ctx (context-n-ctx ctx)))
+                            ((ds4f-v41 m) (make-d41ctx m :n-ctx (context-n-ctx ctx)))
+                            (t (make-d4ctx m :n-ctx (context-n-ctx ctx))))))
               (setf (d4ctx-logits c) (context-logits ctx))
               c))))
 
@@ -1271,7 +1276,8 @@
 (defun ds4f-context-eval-tokens (c tokens &optional history)
   "TOKENS into C from its position, the last one's logits; HISTORY, the
    tokens before (a V4 context's saved states key on it)."
-  (cond ((and (rest tokens) (not (d41ctx-p c))) (ds4f-eval-saving c history tokens))
+  (cond ((ds4f-glm (d4ctx-model c)) (funcall 'g53-eval-tokens c tokens))
+        ((and (rest tokens) (not (d41ctx-p c))) (ds4f-eval-saving c history tokens))
         #+(and sbcl linux)
         ((and (rest tokens) (ds4f-cuda-p))   ; V4.1 on CUDA: layer-major passes
          (ds41f-cuda-prefill c tokens))
@@ -1282,7 +1288,10 @@
 
 (defun ds4f-context-reset (ctx)
   "Start CTX over: fresh caches and compressor windows."
-  (let ((c (getf (context-plist ctx) :ds4f))) (when c (if (d41ctx-p c) (free-d41ctx c) (free-d4ctx c))))
+  (let ((c (getf (context-plist ctx) :ds4f)))
+    (when c (cond ((ds4f-glm (d4ctx-model c)) (when (fboundp 'free-g53ctx) (funcall 'free-g53ctx c)))
+                  ((d41ctx-p c) (free-d41ctx c))
+                  (t (free-d4ctx c)))))
   (remf (context-plist ctx) :ds4f)
   (setf (context-pos ctx) 0)
   ctx)

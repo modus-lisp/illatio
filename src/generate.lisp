@@ -120,7 +120,11 @@
      (remove nil (list* (vocab-eos v) (vocab-eot v)
                         (loop for name in '("<|im_end|>" "<|endoftext|>" "<|eot_id|>" "<|end_of_text|>"
                                             "<｜end▁of▁sentence｜>")
-                              collect (gethash name (vocab-ids v))))))))
+                              collect (gethash name (vocab-ids v)))
+                        ;; GLM's turns end at the next turn's role
+                        (and (equal (model-arch model) "glm5-next")
+                             (loop for name in '("<|system|>" "<|user|>" "<|assistant|>" "<|observation|>")
+                                   collect (gethash name (vocab-ids v)))))))))
 
 (defvar *speculate-hooks* '()
   "Functions (CTX TOKEN MORE) by which a model may speculate when decoding is

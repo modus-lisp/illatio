@@ -273,7 +273,7 @@
 
 (defun pre-tokenizer-digits (pre)
   (cond ((member pre '("qwen2" "qwen35" "deepseek-r1-qwen") :test #'equal) 1)
-        ((member pre '("llama3" "llama-bpe" "smaug-bpe") :test #'equal) 3)
+        ((member pre '("llama3" "llama-bpe" "smaug-bpe" "glm4") :test #'equal) 3)
         (t (error "pre-tokenizer ~S is not supported yet" pre))))
 
 ;;; --- stage 3: merges --------------------------------------------------------

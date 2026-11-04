@@ -231,6 +231,7 @@
   (let ((template (meta (model-gguf model) "tokenizer.chat_template" "")))
     (cond ((member (model-arch model) '("deepseek4" "deepseek41") :test #'equal)
            (render-ds4f-chat messages tools :thinking thinking :v41 (equal (model-arch model) "deepseek41")))
+          ((equal (model-arch model) "glm5-next") (render-glm53-chat messages tools :thinking thinking))
           ((and (search "<|im_start|>" template) (search "<tool_call>" template)
                 (search "</think>" template))
            (render-qwen3-chat messages tools))
@@ -328,6 +329,7 @@
            (ctx (engine-context engine))
            (thinking (request-thinking req))
            (ds4f (member (model-arch m) '("deepseek4" "deepseek41") :test #'equal))
+           (glm (equal (model-arch m) "glm5-next"))
            (prompt (render-chat m (jget req "messages") (jget req "tools") :thinking thinking))
            (ids (tokenize m prompt))
            (max (or (jget req "max_completion_tokens") (jget req "max_tokens") (engine-max-tokens engine)))
@@ -342,7 +344,9 @@
         (let ((t2 (get-internal-real-time)))
           (unless t1 (setf t1 t2))
           (multiple-value-bind (content calls reasoning)
-              (if ds4f (ds4f-parse-reply text thinking) (parse-tool-calls text))
+              (cond (ds4f (ds4f-parse-reply text thinking))
+                    (glm (glm53-parse-reply text thinking))
+                    (t (parse-tool-calls text)))
             (flet ((ms (a b) (/ (* 1000d0 (- b a)) internal-time-units-per-second)))
               (hobj "id" (fresh-id "chatcmpl-")
                     "object" "chat.completion"
@@ -423,6 +427,9 @@
          (resp (chat-completion engine req
                                 :on-text (cond ((member (model-arch (engine-model engine)) '("deepseek4" "deepseek41") :test #'equal)
                                                 (make-ds4f-stream-filter emit emit-reasoning (request-thinking req)))
+                                               ((equal (model-arch (engine-model engine)) "glm5-next")
+                                                (make-ds4f-stream-filter emit emit-reasoning (request-thinking req)
+                                                                         :call-tag "<tool_call>"))
                                                ((jget req "tools") (make-tool-call-filter emit))
                                                (t emit))))
          (choice (aref (jget resp "choices") 0))
@@ -669,13 +676,13 @@
                                       (progn (write-char (char out i) o) (incf i)))))))
     out))
 
-(defun make-ds4f-stream-filter (emit-content emit-reasoning thinking)
-  "A text sink for a DeepSeek reply: reasoning (when THINKING, up to
-   </think>) to EMIT-REASONING, then content to EMIT-CONTENT until a DSML
-   tool-call block starts (the calls are sent whole once the reply is done).
-   A tail that might begin the next tag is held back."
+(defun make-ds4f-stream-filter (emit-content emit-reasoning thinking &key (call-tag "<｜DSML｜tool_calls>"))
+  "A text sink for a DeepSeek (or GLM) reply: reasoning (when THINKING, up
+   to </think>) to EMIT-REASONING, then content to EMIT-CONTENT until a
+   tool-call block (CALL-TAG) starts (the calls are sent whole once the
+   reply is done).  A tail that might begin the next tag is held back."
   (let ((pending "") (state (if thinking :reasoning :content)))
-    (labels ((tag () (if (eq state :reasoning) "</think>" "<｜DSML｜tool_calls>"))
+    (labels ((tag () (if (eq state :reasoning) "</think>" call-tag))
              (feed (text)
                (unless (eq state :done)
                  (let* ((tag (tag)) (at (search tag text)))
@@ -695,3 +702,105 @@
                                     (subseq text 0 (- (length text) keep))))
                          (setf pending (subseq text (- (length text) keep)))))))))
       (lambda (piece) (feed (concatenate 'string pending piece))))))
+
+;;; --- GLM-5.3 Flash -------------------------------------------------------------
+
+(defun glm53-tools-system (tools)
+  (with-output-to-string (o)
+    (format o "<|system|>~%# Tools~%~%You may call one or more functions to assist with the user query.~%~%~
+               You are provided with function signatures within <tools></tools> XML tags:~%<tools>~%")
+    (dolist (tool tools)
+      (write-string (json-simple:stringify (or (jget tool "function") tool)) o)
+      (terpri o))
+    (format o "</tools>~%~%For each function call, output the function name and arguments within the following XML format:~%~
+               <tool_call>{function-name}<arg_key>{arg-key-1}</arg_key><arg_value>{arg-value-1}</arg_value>~
+               <arg_key>{arg-key-2}</arg_key><arg_value>{arg-value-2}</arg_value>...</tool_call>")))
+
+(defun glm53-xml-escape (s)
+  "ds4's tool-result escaping: & and < as entities."
+  (with-output-to-string (o)
+    (loop for c across s
+          do (case c (#\& (write-string "&amp;" o)) (#\< (write-string "&lt;" o)) (t (write-char c o))))))
+
+(defun render-glm53-chat (messages tools &key (thinking t))
+  "GLM-5.3's prompt as ds4 renders it: [gMASK]<sop>, the reasoning effort's
+   system turn when thinking, the tools', the conversation, then
+   <|assistant|><think> (thinking) or <|assistant|><think></think>."
+  (let* ((msgs (coerce messages 'list))
+         (tools (and tools (plusp (length tools)) (coerce tools 'list)))
+         (last-user (loop for m in msgs for i from 0 when (equal (jget m "role") "user") maximize i)))
+    (with-output-to-string (o)
+      (write-string "[gMASK]<sop>" o)
+      (when thinking (write-string "<|system|>Reasoning Effort: High" o))
+      (when tools (write-string (glm53-tools-system tools) o))
+      (loop for m in msgs for i from 0 for prev = nil then role
+            for role = (jget m "role")
+            do (cond ((equal role "system")
+                      (write-string "<|system|>" o) (write-string (content-string (jget m "content")) o))
+                     ((equal role "user")
+                      (write-string "<|user|>" o) (write-string (content-string (jget m "content")) o))
+                     ((member role '("tool" "function") :test #'equal)
+                      (unless (member prev '("tool" "function") :test #'equal) (write-string "<|observation|>" o))
+                      (format o "<tool_response>~A</tool_response>"
+                              (glm53-xml-escape (content-string (jget m "content")))))
+                     ((equal role "assistant")
+                      (let* ((content (content-string (jget m "content")))
+                             (close (search "</think>" content))
+                             (reasoning (or (jget m "reasoning_content")
+                                            (and close (let ((open (search "<think>" content :end2 close :from-end t)))
+                                                         (subseq content (if open (+ open 7) 0) close)))))
+                             (content (if close (subseq content (+ close 8)) content))
+                             (calls (jget m "tool_calls")))
+                        (write-string "<|assistant|>" o)
+                        (if (and thinking reasoning (> i last-user))
+                            (format o "<think>~A</think>" reasoning)
+                            (write-string "<think></think>" o))
+                        (write-string (string-trim '(#\Space #\Newline #\Tab #\Return) content) o)
+                        (when (and calls (plusp (length calls)))
+                          (loop for tc across (coerce calls 'vector)
+                                for f = (or (jget tc "function") tc)
+                                for args = (let ((a (jget f "arguments")))
+                                             (if (stringp a) (or (ignore-errors (json-simple:parse a)) (make-hash-table)) a))
+                                do (format o "~%<tool_call>~A" (jget f "name"))
+                                   (when (hash-table-p args)
+                                     (maphash (lambda (k v)
+                                                (format o "<arg_key>~A</arg_key><arg_value>~A</arg_value>"
+                                                        k (if (stringp v) v (json-simple:stringify v))))
+                                              args))
+                                   (write-string "</tool_call>" o)))))))
+      (write-string (if thinking "<|assistant|><think>" "<|assistant|><think></think>") o))))
+
+(defun glm53-parse-reply (text thinking)
+  "(values content tool-calls reasoning) from GLM's reply: the reasoning
+   before </think> (when THINKING); each <tool_call>name<arg_key>..</tool_call>
+   a call, an argument JSON when it parses as JSON, else the string."
+  (let* ((close (and thinking (search "</think>" text)))
+         (reasoning (cond (close (subseq text 0 close)) (thinking text) (t nil)))
+         (rest (cond (close (subseq text (+ close 8))) (thinking "") (t text)))
+         (start (search "<tool_call>" rest))
+         (content (string-trim '(#\Space #\Newline #\Tab #\Return) (subseq rest 0 (or start (length rest)))))
+         (calls '()))
+    (loop with pos = start
+          while pos
+          do (let* ((s (+ pos (length "<tool_call>")))
+                    (e (or (search "</tool_call>" rest :start2 s) (length rest)))
+                    (k1 (or (search "<arg_key>" rest :start2 s :end2 e) e))
+                    (name (string-trim '(#\Space #\Newline) (subseq rest s k1)))
+                    (args (make-hash-table :test 'equal)))
+               (loop with p = k1
+                     for ks = (search "<arg_key>" rest :start2 p :end2 e)
+                     while ks
+                     do (let* ((ke (or (search "</arg_key>" rest :start2 ks :end2 e) e))
+                               (vs (search "<arg_value>" rest :start2 ke :end2 e))
+                               (ve (and vs (or (search "</arg_value>" rest :start2 vs :end2 e) e)))
+                               (raw (if vs (subseq rest (+ vs (length "<arg_value>")) ve) "")))
+                          (setf (gethash (subseq rest (+ ks (length "<arg_key>")) ke) args)
+                                (let ((v (and (plusp (length raw)) (find (char raw 0) "{[-0123456789tfn\"")
+                                              (ignore-errors (json-simple:parse raw)))))
+                                  (if v v raw)))
+                          (setf p (if ve (+ ve (length "</arg_value>")) e))))
+               (push (hobj "id" (fresh-id "call_" 8) "type" "function"
+                           "function" (hobj "name" name "arguments" (json-simple:stringify args)))
+                     calls)
+               (setf pos (search "<tool_call>" rest :start2 (min (length rest) (+ e 1))))))
+    (values content (nreverse calls) reasoning)))

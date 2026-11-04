@@ -428,12 +428,13 @@ extern "C" __global__ void d4_route(int ne, int nu, int hash, float scale, int h
   unsigned* picked = (unsigned*)(sh + 2 * ne + 64); // NU
   const int t = blockIdx.x, e = threadIdx.x;
   const float l = logits[(long long)t * ne + e];
+  // HASH 2 (GLM-5.3): sigmoid scores, no table
   const float sp = l > 20.f ? l : (l < -20.f ? expf(l) : logf(1.f + expf(l)));
-  const float p = sqrtf(sp);
+  const float p = hash == 2 ? d4_sigmoid(l) : sqrtf(sp);
   probs[e] = p;
   sv[e] = p + (has_bias ? bias[e] : 0.f);
   __syncthreads();
-  if (hash) {
+  if (hash == 1) {
     if (e < nu) picked[e] = (unsigned)tid2eid[(long long)tokens[t] * nu + e];
   } else {
     for (int k = 0; k < nu; ++k) {
