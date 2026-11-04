@@ -53,9 +53,9 @@
 
 (defun make-vocab-from-gguf (g)
   (let* ((pieces (coerce (meta g "tokenizer.ggml.tokens") 'simple-vector))
-         (types (coerce (or (meta g "tokenizer.ggml.token_type")
-                            (make-array (length pieces) :initial-element 1))
-                        'simple-vector))
+         (types (copy-seq (coerce (or (meta g "tokenizer.ggml.token_type")
+                                      (make-array (length pieces) :initial-element 1))
+                                  'simple-vector)))
          (v (%make-vocab :pieces pieces :types types
                          :pre (meta g "tokenizer.ggml.pre" "default")
                          :bos (meta g "tokenizer.ggml.bos_token_id")
@@ -65,6 +65,13 @@
     (unless (equal (meta g "tokenizer.ggml.model") "gpt2")
       (error "tokenizer ~S is not supported (only gpt2 byte-level BPE)"
              (meta g "tokenizer.ggml.model")))
+    ;; DeepSeek's markers (<｜User｜>, <think>, ...) are typed normal in
+    ;; some conversions (V4.1's): they are specials all the same
+    (loop for p across pieces for id from 0
+          when (and (= (svref types id) +tok-normal+)
+                    (or (and (> (length p) 4) (string= "<｜" p :end2 2) (string= "｜>" p :start2 (- (length p) 2)))
+                        (member p '("<think>" "</think>") :test #'string=)))
+            do (setf (svref types id) +tok-control+))
     (loop for p across pieces for id from 0
           do (setf (gethash p (vocab-ids v)) id))
     (loop for m across (meta g "tokenizer.ggml.merges") for rank from 0
@@ -266,7 +273,7 @@
 
 (defun pre-tokenizer-digits (pre)
   (cond ((member pre '("qwen2" "qwen35" "deepseek-r1-qwen") :test #'equal) 1)
-        ((member pre '("llama3" "llama-bpe" "smaug-bpe") :test #'equal) 3)
+        ((member pre '("llama3" "llama-bpe" "smaug-bpe" "glm4") :test #'equal) 3)
         (t (error "pre-tokenizer ~S is not supported yet" pre))))
 
 ;;; --- stage 3: merges --------------------------------------------------------

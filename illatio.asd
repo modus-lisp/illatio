@@ -29,14 +29,28 @@
      (:file "qwen35")      ; Qwen3.5's hybrid layers: gated delta net, gated attention
      (:file "metal" :if-feature (:and :sbcl :darwin))        ; the GPU, through the Objective-C runtime
      (:file "metal-qwen35" :if-feature (:and :sbcl :darwin)) ; qwen35 on it (kernels: src/metal/)
+     (:file "cuda" :if-feature (:and :sbcl :linux))       ; NVIDIA GPUs: the driver API and NVRTC
+     (:file "cuda-dense" :if-feature (:and :sbcl :linux)) ; qwen2/qwen3/llama on them (kernels: src/cuda/)
+     (:file "cuda-qwen35" :if-feature (:and :sbcl :linux)) ; qwen35 on them
      (:file "generate")    ; sampling, prompt reuse, streaming text
      (:file "ds4f")        ; DeepSeek V4 Flash (deepseek4), ported from ds4.c
+     (:file "ds41f")       ; DeepSeek V4.1 Flash (deepseek41): V4's pieces, ds4's V4.1 graph
+     (:file "glm53")       ; GLM-5.3 Flash (glm5-next): V4's HC and experts, KDA and DSA layers
      (:file "ds4f-kv")      ; its state saved: a long prompt prefilled once
      (:file "ds4f-hotlist") ; its most used experts (ds4's profile)
+     (:file "ds41f-hotlist") ; V4.1's (illatio's own profile)
+     (:file "glm53-hotlist") ; GLM-5.3's (illatio's own profile)
+     (:file "avx2" :if-feature (:and :sbcl :x86-64)) ; its experts' row dots as AVX2
+     (:file "cuda-ds4f" :if-feature (:and :sbcl :linux)) ; its decode on an NVIDIA GPU, experts in host memory
+     (:file "cuda-ds4f-prefill" :if-feature (:and :sbcl :linux)) ; its prefill there, layer-major
+     (:file "cuda-ds4f-spec" :if-feature (:and :sbcl :linux)) ; its speculative steps there
+     (:file "cuda-ds41f" :if-feature (:and :sbcl :linux)) ; V4.1's decode there
+     (:file "cuda-ds41f-prefill" :if-feature (:and :sbcl :linux)) ; and its prefill, layer-major
+     (:file "cuda-glm53" :if-feature (:and :sbcl :linux)) ; GLM-5.3's decode there
      (:file "metal-ds4f" :if-feature (:and :sbcl :darwin)) ; it on the GPU: prefill, decode's experts
      (:file "metal-ds4f-decode" :if-feature (:and :sbcl :darwin)) ; a token's every layer on it
      (:file "metal-ds4f-prefill" :if-feature (:and :sbcl :darwin)) ; a prefill chunk's
-     (:file "ds4f-spec" :if-feature (:and :sbcl :darwin)))))) ; a few tokens a step, guessed from the context
+     (:file "ds4f-spec" :if-feature (:and :sbcl (:or :darwin :linux))))))) ; a few tokens a step, guessed from the context
 
 (defsystem "illatio/train"
   :description "Training: GPT-2's forward, backward and AdamW in f32, ported

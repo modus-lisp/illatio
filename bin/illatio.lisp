@@ -5,6 +5,10 @@
 ;;;   illatio [FLAGS] --serve [[HOST]:PORT]
 ;;;                              OpenAI-compatible API (default 127.0.0.1:9931)
 ;;;
+;;;   illatio-server [FLAGS] [--host HOST] [--port PORT]
+;;;                              the server as a command of its own (llama-server's
+;;;                              way): bin/illatio-server, the same core
+;;;
 ;;; Modes are flags; a bare word is always text.  bin/illatio is the
 ;;; launcher (it keeps a core image so startup is instant).
 
@@ -23,7 +27,8 @@ usage:
   illatio [flags] \"text\"          continue the text, streamed (raw, no template)
   illatio [flags] --chat [\"text\"] chat; each line you type is a user turn
   illatio [flags] --serve [ADDR]  OpenAI-compatible server; ADDR is [HOST]:PORT
-                                  (default 127.0.0.1:9931)
+                                  (default 127.0.0.1:9931; or --host, --port); as a
+                                  command of its own: bin/illatio-server
   illatio [flags] --bench         llama-bench's tests, in its table: -p prompt
                                   tokens, -n generated, -d context depth (each a
                                   comma list), -r repetitions; e.g.
@@ -38,9 +43,35 @@ flags:
   --seed S            sampling seed
   -c, --ctx N         context size in tokens (default 8192)
   -t, --threads N     worker threads (default: the performance cores)
-  --gpu               run a qwen35 model on the GPU (Metal); DeepSeek V4
-                      Flash always uses it on a Mac
+  --gpu               run the model on the GPU: a qwen35 model on Metal (DeepSeek
+                      V4 Flash always uses it on a Mac); qwen2, qwen3 and llama
+                      on CUDA
+  --device N          the CUDA device to run on (implies --gpu; default 0)
   -s, --system TEXT   system prompt for --chat
+  -h, --help          this
+")
+
+(defparameter +server-usage+
+  "illatio-server — illatio's OpenAI-compatible HTTP server
+
+usage:
+  illatio-server [flags]
+
+  POST /v1/chat/completions   (\"stream\": true for server-sent events)
+  GET  /v1/models
+  GET  /health
+
+flags:
+  -m, --model PATH    GGUF file (default $ILLATIO_MODEL)
+  --host HOST         address to listen on (default 127.0.0.1: there is no
+                      authentication; listen wider only behind something that has it)
+  --port PORT         port (default 9931)
+  -c, --ctx N         context size in tokens (default 8192)
+  -n, --predict N     max_tokens for a request that gives none (default 2048)
+  -t, --threads N     worker threads (default: the performance cores)
+  --gpu               run the model on the GPU (DeepSeek V4/V4.1 Flash use CUDA
+                      or Metal by themselves)
+  --device N          the CUDA device to run on (implies --gpu; default 0)
   -h, --help          this
 ")
 
@@ -62,7 +93,8 @@ flags:
                    ((member a '("-m" "--model") :test #'string=) (setf (getf opts :model) (val)))
                    ((member a '("-n" "--predict") :test #'string=)
                     (let ((v (val)))           ; --bench takes a list, as llama-bench does
-                      (setf (getf opts :predict) (int v) (getf opts :bench-n) (int-list v))))
+                      (setf (getf opts :predict) (int v) (getf opts :predict-given) t
+                            (getf opts :bench-n) (int-list v))))
                    ((string= a "--temp") (setf (getf opts :temp) (let ((*read-default-float-format* 'single-float))
                                                                     (coerce (read-from-string (val)) 'single-float))))
                    ((string= a "--seed") (setf (getf opts :seed) (int (val))))
@@ -71,10 +103,13 @@ flags:
                    ((member a '("-s" "--system") :test #'string=) (setf (getf opts :system) (val)))
                    ((string= a "--chat") (setf (getf opts :mode) :chat))
                    ((string= a "--gpu") (setf (getf opts :gpu) t))
+                   ((string= a "--device") (setf (getf opts :gpu) t (getf opts :device) (int (val))))
                    ((string= a "--bench") (setf (getf opts :mode) :bench))
                    ((string= a "-p") (setf (getf opts :bench-p) (int-list (val))))
                    ((string= a "-d") (setf (getf opts :bench-d) (int-list (val))))
                    ((string= a "-r") (setf (getf opts :bench-r) (int (val))))
+                   ((string= a "--host") (setf (getf opts :host) (val)))
+                   ((string= a "--port") (setf (getf opts :port) (int (val))))
                    ((string= a "--serve")
                     (setf (getf opts :mode) :serve)
                     (when (and args (find #\: (first args)) (not (eql 0 (search "-" (first args)))))
@@ -92,13 +127,14 @@ flags:
       (die "no model at ~A~%  pass -m PATH, or set ILLATIO_MODEL; the README says where to get one" p))
     p))
 
-(defun parse-addr (addr)
-  "[HOST]:PORT -> (values host port)."
+(defun parse-addr (addr &optional host port)
+  "[HOST]:PORT -> (values host port); HOST and PORT (--host, --port) over it."
   (if (null addr)
-      (values "127.0.0.1" 9931)
+      (values (or host "127.0.0.1") (or port 9931))
       (let ((c (position #\: addr :from-end t)))
-        (values (if (and c (plusp c)) (subseq addr 0 c) "127.0.0.1")
-                (or (parse-integer addr :start (if c (1+ c) 0) :junk-allowed t)
+        (values (or host (if (and c (plusp c)) (subseq addr 0 c) "127.0.0.1"))
+                (or port
+                    (parse-integer addr :start (if c (1+ c) 0) :junk-allowed t)
                     (die "bad address ~A: want [HOST]:PORT" addr))))))
 
 (defun load-it (opts)
@@ -107,14 +143,19 @@ flags:
     (format *error-output* "~&illatio: loading ~A~%" (file-namestring path))
     (let ((m (if (getf opts :gpu)
                  #+(and sbcl darwin) (illatio::load-model-gpu path)
-                 #-(and sbcl darwin) (die "--gpu needs Metal (SBCL on macOS)")
+                 #+(and sbcl linux) (illatio::load-model-cuda path :device (or (getf opts :device) 0))
+                 #-(or (and sbcl darwin) (and sbcl linux)) (die "--gpu needs Metal (macOS) or CUDA (Linux)")
                  (load-model path :threads (or (getf opts :threads) (default-thread-count))))))
       (format *error-output* "illatio: ~A, ~D layers, ~:[~D threads~*~;~*~A~], ~,1Fs~%"
               (model-name m) (illatio::model-n-layer m)
               (getf opts :gpu) (illatio::pool-size (illatio::model-pool m))
               #+(and sbcl darwin) (and (getf opts :gpu)
                                        (illatio::gpu-name (illatio::gmodel-gpu (illatio::model-gpu m))))
-              #-(and sbcl darwin) nil
+              #+(and sbcl linux) (and (getf opts :gpu)
+                                      (if (illatio::model-cuda m)
+                                          (illatio::cudev-name (illatio::cmodel-dev (illatio::model-cuda m)))
+                                          "CUDA, its experts in host memory"))
+              #-(or (and sbcl darwin) (and sbcl linux)) nil
               (/ (- (get-internal-real-time) t0) internal-time-units-per-second))
       m)))
 
@@ -161,9 +202,10 @@ flags:
             (setf messages (append messages (list msg)))))))))
 
 (defun run-serve (opts)
-  (multiple-value-bind (host port) (parse-addr (getf opts :addr))
+  (multiple-value-bind (host port) (parse-addr (getf opts :addr) (getf opts :host) (getf opts :port))
     (let* ((m (load-it opts))
-           (engine (make-engine m :n-ctx (getf opts :ctx))))
+           (engine (apply #'make-engine m :n-ctx (getf opts :ctx)
+                          (and (getf opts :predict-given) (list :max-tokens (getf opts :predict))))))
       (serve engine :host host :port port)
       (format *error-output* "illatio: serving http://~A:~D/v1 (context ~D)~%" host port (getf opts :ctx))
       (loop (sleep 3600)))))
@@ -207,12 +249,19 @@ flags:
               (format t "| ~A | ~,2F GiB | ~A | ~A | ~(~A~)~D~@[ @ d~D~] | ~,2F ± ~,2F |~%"
                       (illatio::model-name m)
                       (/ (with-open-file (s path :element-type '(unsigned-byte 8)) (file-length s)) (expt 2d0 30))
-                      (if (getf opts :gpu) "Metal" "CPU")
+                      (if (getf opts :gpu) #+darwin "Metal" #-darwin "CUDA" "CPU")
                       (if (getf opts :gpu) "-" (illatio::pool-size (illatio::model-pool m)))
                       kind k (and (plusp d) d) mean sd)
               (force-output))))))))
 
 (defun main (args)
+  ;; bin/illatio-server: the server, its flags, its usage
+  (when (equal (first args) "--server-command")
+    (multiple-value-bind (opts text) (parse-args (rest args))
+      (cond ((getf opts :help) (write-string +server-usage+))
+            ((plusp (length text)) (die "illatio-server takes no text (~A); see --help" text))
+            (t (run-serve opts))))
+    (return-from main))
   (multiple-value-bind (opts text) (parse-args args)
     (cond ((getf opts :help) (write-string +usage+))
           ((eq (getf opts :mode) :serve) (run-serve opts))

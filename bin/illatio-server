@@ -1,0 +1,12 @@
+#!/usr/bin/env bash
+# bin/illatio-server — illatio's OpenAI-compatible server as a command of its
+# own, as llama-server is to llama-cli: bin/illatio's core and launcher, its
+# flags plus --host and --port.  `illatio-server --help` for them.
+set -euo pipefail
+
+SELF="$0"
+while [ -L "$SELF" ]; do
+  TARGET="$(readlink "$SELF")"
+  case "$TARGET" in /*) SELF="$TARGET" ;; *) SELF="$(dirname "$SELF")/$TARGET" ;; esac
+done
+exec "$(cd "$(dirname "$SELF")" && pwd -P)/illatio" --server-command "$@"

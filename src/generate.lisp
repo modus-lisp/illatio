@@ -81,8 +81,9 @@
     ;; per position.
     (setf common (min common (1- (length ids))))
     ;; A recurrent model's state can't go back: it continues only when IDS
-    ;; extends exactly what it has seen, and otherwise starts over.
-    (when (model-recurrent-p (context-model ctx))
+    ;; extends exactly what it has seen, and otherwise starts over (one that
+    ;; rewinds itself exactly, V4.1, is told the position it goes back to).
+    (when (and (model-recurrent-p (context-model ctx)) (not (model-rewinds-p (context-model ctx))))
       (if (and (= common (length have)) (< common (length ids)))
           nil
           (progn (setf common 0) (reset-recurrent! ctx)))
@@ -119,7 +120,11 @@
      (remove nil (list* (vocab-eos v) (vocab-eot v)
                         (loop for name in '("<|im_end|>" "<|endoftext|>" "<|eot_id|>" "<|end_of_text|>"
                                             "<｜end▁of▁sentence｜>")
-                              collect (gethash name (vocab-ids v))))))))
+                              collect (gethash name (vocab-ids v)))
+                        ;; GLM's turns end at the next turn's role
+                        (and (equal (model-arch model) "glm5-next")
+                             (loop for name in '("<|system|>" "<|user|>" "<|assistant|>" "<|observation|>")
+                                   collect (gethash name (vocab-ids v)))))))))
 
 (defvar *speculate-hooks* '()
   "Functions (CTX TOKEN MORE) by which a model may speculate when decoding is

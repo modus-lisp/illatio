@@ -49,6 +49,7 @@
   (layers #() :type simple-vector)
   pool
   gpu                                   ; a GMODEL when the GPU runs it (metal-qwen35.lisp)
+  cuda                                  ; a CMODEL when an NVIDIA GPU runs it (cuda-dense.lisp)
   impl                                  ; a DS4F when the model is DeepSeek V4 Flash (ds4f.lisp)
   (notes '()))                          ; a plist: things said once (warnings)
 
@@ -56,9 +57,11 @@
 
 (defun load-model (path &key (threads (default-thread-count)))
   "Read the GGUF model at PATH: weights, tokenizer, and a pool of THREADS."
-  (if (equal (meta (read-gguf path) "general.architecture") "deepseek4")
-      (load-ds4f-model path threads)
-      (finish-model (load-model-1 path threads))))
+  (let ((arch (meta (read-gguf path) "general.architecture")))
+    (cond ((equal arch "deepseek4") (load-ds4f-model path threads))
+          ((equal arch "deepseek41") (load-ds41f-model path threads))
+          ((equal arch "glm5-next") (load-g53-model path threads))
+          (t (finish-model (load-model-1 path threads))))))
 
 (defun load-model-1 (path threads)
   (let* ((g (read-gguf path))
@@ -162,7 +165,8 @@
          (qd (model-q-dim model))
          (kv (* (model-n-kv-head model) (model-head-dim model)))
          (f (model-ffn model)))
-    (own-context-caches
+    (prepare-context
+     (own-context-caches
      (%make-context
      :model model :n-ctx n-ctx
      ;; static on modus: a 4B model's cache at 4096 tokens is 1.2 GB, more
@@ -176,7 +180,12 @@
      :x (f32vec d) :h (f32vec d) :q (f32vec qd) :k (f32vec kv) :v (f32vec kv)
      :att (f32vec qd) :ffn-a (f32vec f) :ffn-b (f32vec f)
      :xq (make-qact (max d qd) (model-act-kinds model)) :hq (make-qact f (model-act-kinds model))
-     :logits (f32vec (model-n-vocab model))))))
+     :logits (f32vec (model-n-vocab model)))))))
+
+(defun prepare-context (ctx)
+  "Whatever a context's device needs made before it runs (its CUDA buffers)."
+  #+(and sbcl linux) (when (model-cuda (context-model ctx)) (cuda-state ctx))
+  ctx)
 
 (defun context-static-vectors (ctx)
   "The vectors of CTX outside the heap: its KV cache and recurrent state."
@@ -387,6 +396,9 @@
   #+(and sbcl darwin)
   (when (model-gpu (context-model ctx))
     (return-from forward-1 (gpu-forward ctx token logits)))
+  #+(and sbcl linux)
+  (when (model-cuda (context-model ctx))
+    (return-from forward-1 (cuda-forward ctx token logits)))
   (when (model-recurrent-p (context-model ctx))
     (return-from forward-1 (forward-qwen35 ctx token :logits logits)))
   (let* ((m (context-model ctx))
@@ -461,9 +473,12 @@
    collected (and on modus, which has no finalizers, rather than never);
    CTX is unusable afterwards.  Harmless to call twice."
   (disown-static-vectors ctx)
+  #+(and sbcl linux) (free-cuda-state ctx)
   (map nil #'free-static-vector (context-static-vectors ctx))
   (setf (context-k-cache ctx) nil (context-v-cache ctx) nil)
   (remf (context-plist ctx) :q35)
+  ;; a DeepSeek context's caches (and their copies on the device)
+  (when (getf (context-plist ctx) :ds4f) (funcall 'ds4f-context-reset ctx))
   ctx)
 
 (defun greedy (model prompt n &key (ctx nil ctx-p))

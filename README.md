@@ -14,7 +14,7 @@ laptop**, at the speed of the C engine it was ported from.
 ```
 bin/illatio "The capital of France is"
 bin/illatio --chat
-bin/illatio --serve :9931             # then: operandi --local :9931
+bin/illatio-server --port 9931        # then: operandi --local :9931
 operandi --illatio "task"             # or no server at all: the model in operandi's image
 ```
 
@@ -31,6 +31,8 @@ comments sit beside the mechanics they explain.
 | Qwen3-4B-Instruct-2507 | `qwen3` (and `llama`) | Q8_0, Q4_K_M | llama.cpp |
 | a 27B Qwen3.5 | `qwen35`: gated delta net and gated attention | Q6_K | llama.cpp, CPU and Metal |
 | DeepSeek V4 Flash | `deepseek4`: 43 layers, 256 experts, compressed attention | ds4's IQ2_XXS/Q2_K build (86.7 GB) | ds4's CPU reference |
+| DeepSeek V4.1 Flash | `deepseek41`: 40 layers, 384 experts, shared compressed caches, Engram | IQ2_XXS/Q2_K (153 GB of experts) | its CPU reference (from ds4's) |
+| GLM-5.3 Flash | `glm5-next`: 45 layers (KDA and DSA), 288 experts | antirez's Q2 build (96.5 GB) | its CPU reference (from ds4's graph); Z.AI's replies |
 
 ## DeepSeek V4 Flash, from the SSD
 
@@ -88,6 +90,60 @@ moves experts.
 Decode is now mostly expert reads (about 70 ms of a 100 ms token); the GPU
 is no longer the bottleneck.  The CPU reference path, a port of ds4's op
 for op, runs it too (decode 3.5 tok/s, prefill 7).
+
+
+## DeepSeek V4 and V4.1 Flash on CUDA
+
+On Linux the DeepSeek models run on NVIDIA GPUs (tested: an RTX 3090 and a
+Tesla P40 on a two-socket EPYC with 1 TB).  The routed experts are read
+once into pinned host memory on the GPUs' own NUMA node; the 3090 keeps a
+pool of them by least recent use, the P40 a fixed tier of the most used
+(computed there), and the rest are read through PCIe as they are wanted.
+V4.1's Engram tables want to be in memory (`/dev/shm`, `*ds41f-engram-file*`).
+
+| DeepSeek V4.1 Flash | |
+|---|---|
+| decode | ~20 tok/s (17-21: the experts it misses) |
+| prefill, 245 / 1,904 / 3,800 tokens | 4.2 s / 7.2 s / 8.4 s |
+| prefill, 20,181 tokens | 52 s (387 tok/s) |
+| decode at 20K tokens of context | 13 tok/s |
+
+A prompt goes through layer-major passes (`src/cuda-ds41f-prefill.lisp`):
+each layer's dense weights read once for thousands of tokens, its experts
+grouped into one product each, attention and the indexer on the tensor
+cores.  A short pass copies in only the experts its tokens route to; a long
+one copies a layer's experts while the one before computes, and is bound
+by PCIe below about 3,500 tokens.  A context goes back exactly (the server
+reuses the longest common prefix), and speculative decoding from the
+context is on: text that repeats goes about 1.2x as fast.
+
+## GLM-5.3 Flash on CUDA
+
+GLM-5.3 Flash runs the same way, on the same machinery: DeepSeek V4's
+hyper-connections, expert pool, second-device tier and expert kernels (its
+experts have V4's shape), with its own attention.  Three layers in four are
+KDA, Kimi's delta attention (a 128 x 128 state a head, no cache); every
+fourth is DSA, attention through a 512-wide latent cached in F16, past
+2,051 tokens over only the 512 pools of 4 tokens an indexer picks
+(`src/glm53.lisp`, `src/cuda-glm53.lisp`, `src/cuda/glm53.cu`).  The pools
+start from illatio's own profile of its routing (`src/glm53-hotlist.lisp`):
+about 81% of the experts a token wants are on a device.
+
+| GLM-5.3 Flash (3090 + P40) | |
+|---|---|
+| decode | ~21 tok/s |
+| prefill, 267 / 1,917 / 3,817 tokens | 3.8 s / 5.2 s / 11.3 s |
+| prefill, 12,017 tokens | 38 s (315 tok/s) |
+| decode at 12K tokens of context | 18 tok/s |
+| a chat's next turn, at 4.4K tokens | first token in 0.8-2.7 s (a fresh prompt: 17-20 s) |
+
+Greedy replies to ds4's GLM-5.3 quality prompts read as Z.AI's do (the
+same structure, often their first lines word for word).  KDA's state goes
+forward only, so a context saves it (in pinned host memory) before a
+prompt's last token and every 512 tokens decoded, and goes back to the
+latest save before where its history changes: a chat's next turn evaluates
+only what is new since the last prompt (its reply, as rendered, and the
+next message).  The MTP layer (a drafted token ahead) is not run yet.
 
 ## The other models
 
@@ -166,8 +222,20 @@ bin/illatio --serve [[HOST]:PORT]                           # default 127.0.0.1:
 bin/illatio --bench [-p 512] [-n 128] [-d 0,4096] [-r 3]     # llama-bench's tests and table
 ```
 
+The server is also a command of its own, as llama-server is to llama-cli
+(the same core and flags, plus `--host` and `--port`; `-n` is the
+`max_tokens` of a request that gives none, 2048 by default):
+
+```
+bin/illatio-server -m PATH [--host 127.0.0.1] [--port 9931] [-c 8192] [-n 2048]
+```
+
+It answers `POST /v1/chat/completions` (streamed with `"stream": true`),
+`GET /v1/models` and `GET /health`, on loopback unless told otherwise: there
+is no authentication in front of it.
+
 `--gpu` runs a `qwen35` model on the GPU; DeepSeek V4 Flash always uses it
-on a Mac.  Raw text ends with llama-simple's speed line, so a quick
+on a Mac, and the DeepSeek models always use CUDA where it is.  Raw text ends with llama-simple's speed line, so a quick
 comparison is
 
 ```
@@ -295,8 +363,10 @@ inspect/collect-vectors.py http://localhost:18931 inspect/vectors/qwen2.5-0.5b-q
 
 SBCL 2.5, tested on macOS on Apple silicon (the NEON kernels need arm64
 with FEAT_DotProd; without them the portable kernels run, which are plain
-Common Lisp).  The GPU paths need macOS on Apple silicon; DeepSeek V4 Flash
-wants a 48 GB machine and a fast SSD.  The core system has no dependencies;
+Common Lisp).  The Metal paths need macOS on Apple silicon; DeepSeek V4 Flash
+wants a 48 GB machine and a fast SSD there.  The CUDA paths need an NVIDIA
+driver (kernels compiled by NVRTC at load; the passes' products sm_80 or
+newer) and host memory for the experts (78 GB for V4, 153 GB for V4.1, 92 GB for GLM-5.3).  The core system has no dependencies;
 the OpenAI layer and the server use `json-simple` and `cl-transport`, from
 modus-lisp.
 
@@ -305,10 +375,10 @@ modus-lisp.
 - **DeepSeek V4 Flash's decode** is mostly expert reads now: fewer misses
   (a better guess at the next layer's experts, a pool policy that keeps
   what decode reuses) or reads overlapped with more of the GPU's work.
-  Speculative decoding from the context is in and exact
-  (`src/ds4f-spec.lisp`, `*ds4f-spec-k*`) but off: a guessed token's
-  experts are read all the same, so it can save at most the dense weights'
-  second reading, and a verifying pass costs more than that yet.
+  Speculative decoding from the context is in (`src/ds4f-spec.lisp`,
+  `*ds4f-spec-k*`), off on Metal (a guessed token's experts are read all
+  the same) and on with CUDA.  On CUDA, the P40 could compute more of the
+  experts it holds and read through its own link.
 - **modus.**  The kernels have `#+modus` arms with the portable kernels'
   bits; what is left is modus's thread scaling.
 - **More formats and models.**  Q5_K, Q8_0-with-K-quant mixes, and

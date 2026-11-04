@@ -52,8 +52,11 @@
   (let ((p (%make-pool :size (max 1 size))))
     (setf (pool-threads p)
           (loop for i from 1 below (pool-size p)
-                collect (let ((index i))
-                          (sb-thread:make-thread (lambda () (pool-worker p index))
+                ;; the generation a worker starts from is read here, not when
+                ;; it first runs: a job posted before then would be taken for
+                ;; one it had seen, and never done
+                collect (let ((index i) (gen (pool-generation p)))
+                          (sb-thread:make-thread (lambda () (pool-worker p index gen))
                                                  :name (format nil "illatio worker ~D" i)))))
     p))
 
@@ -66,16 +69,16 @@
         (unless (pool-failure p) (setf (pool-failure p) err))))))
 
 #+sbcl
-(defun pool-worker (p index)
+(defun pool-worker (p index seen)
   ;; C's float semantics, not SBCL's traps: an exp that overflows is
   ;; infinity, and a sigmoid or silu of it the 0 or 1 ggml computes.  The
   ;; mode is per thread, so each worker sets its own (FORWARD the caller's).
   (sb-int:with-float-traps-masked (:overflow :inexact)
-    (pool-worker-1 p index)))
+    (pool-worker-1 p index seen)))
 
 #+sbcl
-(defun pool-worker-1 (p index)
-  (let ((seen (pool-generation p)))
+(defun pool-worker-1 (p index seen)
+  (progn
     (loop
       ;; spin for the next generation; park if it is long in coming
       (let ((n 0))
@@ -99,8 +102,8 @@
       (sb-ext:atomic-decf (pool-pending p)))))
 
 #-sbcl
-(defun pool-worker (p index)
-  (let ((seen 0))
+(defun pool-worker (p index &optional (seen 0))
+  (progn
     (loop
       (let (job)
         (sb-thread:with-mutex ((pool-lock p))
