@@ -109,7 +109,7 @@
          (kv0 (pb st :p-kv0 (* n hd))) (heads (pb st :p-heads (* n nh hd)))
          (low (pb st :p-low (* n groups rank))) (aout (pb st :p-aout (* n d)))
          (prev (min pos0 swa)) (kr (pb st :p-kr (* (+ prev n) hd)))
-         (raw (dvec st (svref (d41ctx-raw ctx) li))) (idx (pb st :p-idx (* n top-k)))
+         (raw (dvec st (svref (d41ctx-raw ctx) li))) (ring (d41ctx-ring ctx)) (idx (pb st :p-idx (* n top-k)))
          (k nil) (ident 1) (ncomp (make-array n :initial-element 0)))
     (dk41-hc-chunk m st li :attn sa n pre pstride cur pca)
     (dk41-rms-rows dev cur (dvec st (dl-attn-norm l)) norm d n eps)
@@ -124,14 +124,14 @@
     ;; the KV rows: the window's, oldest first, then the chunk's own (normed,
     ;; turned, through FP8); the last ones into the window
     (when (plusp prev)
-      (launch dev "d4_ring_gather" (ceiling (* prev hd) 256) 256 (list hd swa (mod (- pos0 prev) swa) 0 prev raw kr)))
+      (launch dev "d4_ring_gather" (ceiling (* prev hd) 256) 256 (list hd ring (mod (- pos0 prev) ring) 0 prev raw kr)))
     (let ((rows (cons kr (* 4 prev hd))))
       (dk41-rms-rows dev kv0 (dvec st (dl-kv-norm l)) rows hd n eps)
       (dk41-rope dev rows cs 1 hd nrot n)
       (dk41-quant dev rows (* n hd) :fp8))
-    (let ((keep (min swa (+ prev n))))
+    (let ((keep (min ring (+ prev n))))
       (launch dev "d4_ring_store" (ceiling (* keep hd) 256) 256
-              (list hd swa (mod (- (+ pos0 n) keep) swa) (- (+ prev n) keep) keep raw kr)))
+              (list hd ring (mod (- (+ pos0 n) keep) ring) (- (+ prev n) keep) keep raw kr)))
     (when (plusp ratio)
       (setf k (d41-owner m li))
       (when (member li (d41-kv-src v)) (dk41-publish-chunk m st l li ctx norm pos0 n k))

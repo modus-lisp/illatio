@@ -236,11 +236,17 @@
 ;;; layers up to the next owner.  A compressed layer attends to the rows the
 ;;; latest index-source layer picked for this token (SELECTED).
 
+(defparameter *d41-ring* 1024
+  "Rows of a V4.1 context's raw ring, the attended window (SWA) and room
+   past it: a rewind of up to the difference keeps the window's rows.")
+
 (defstruct (d41ctx (:include d4ctx (caches #())) (:constructor %make-d41ctx))
-  raw                                   ; per layer: SWA x HEAD-DIM, position p at row p mod SWA
+  raw                                   ; per layer: RING x HEAD-DIM, position p at row p mod RING
+  (ring 128)
   comp ix-comp prev-kv prev-score       ; per owner
   selected (n-sel 0) block-mask
-  (tail (list -1 -1 -1)))               ; Engram: the last 3 tokens' compressed ids, newest first
+  (tail (list -1 -1 -1))                ; Engram: the last 3 tokens' compressed ids, newest first
+  (written 0))                          ; past the last position the ring has been written for
 
 (defun make-d41ctx (m &key (n-ctx 4096))
   (let* ((v (ds4f-v41 m)) (hd (ds4f-head-dim m)) (ixd (ds4f-ix-dim m)))
@@ -248,7 +254,9 @@
            (cap (src) (1+ (floor n-ctx (max 1 (svref (ds4f-ratios m) src))))))
       (%make-d41ctx
        :model m :n-ctx n-ctx :logits (f32vec (ds4f-n-vocab m))
-       :raw (map 'simple-vector (lambda (l) (declare (ignore l)) (f32vec (* (ds4f-swa m) hd))) (ds4f-layers m))
+       :ring (max *d41-ring* (ds4f-swa m))
+       :raw (map 'simple-vector (lambda (l) (declare (ignore l)) (f32vec (* (max *d41-ring* (ds4f-swa m)) hd)))
+                 (ds4f-layers m))
        :comp (per-owner (lambda (src) (f32vec (* (cap src) hd))))
        :ix-comp (per-owner (lambda (src) (f32vec (* (cap src) ixd))))
        :prev-kv (per-owner (lambda (src) (declare (ignore src)) (f32vec hd)))
@@ -261,6 +269,24 @@
   (when (fboundp 'forget-gpu-vector)
     (dolist (vs (list (d41ctx-raw ctx) (d41ctx-comp ctx) (d41ctx-ix-comp ctx) (d41ctx-prev-kv ctx) (d41ctx-prev-score ctx)))
       (loop for v across vs do (funcall 'forget-gpu-vector (d41ctx-model ctx) v)))))
+
+(defun d41-rewind (ctx pos history tokens)
+  "CTX to continue at POS (back from where it is) with TOKENS, HISTORY the
+   tokens before POS: the tokens to evaluate from its new position.  A rewind
+   starts at an even position (the ratio-2 pairs' carry is the even token's
+   own), its Engram tail rebuilt from HISTORY; past the ring's room beyond
+   the window (rows a later position wrote over), from the start."
+  (let* ((m (d41ctx-model ctx)) (p (if (oddp pos) (1- pos) pos)) (hist (coerce history 'simple-vector)))
+    (assert (>= (length hist) pos) () "a V4.1 rewind needs the ~D tokens before it" pos)
+    (setf (d41ctx-written ctx) (max (d41ctx-written ctx) (d41ctx-pos ctx)))
+    ;; from the start every row is written again before it is read
+    (when (> (- (d41ctx-written ctx) p) (- (d41ctx-ring ctx) (ds4f-swa m)))
+      (setf p 0 (d41ctx-written ctx) 0))
+    (let ((map (d41-token-map (ds4f-v41 m))))
+      (setf (d41ctx-tail ctx) (loop for i from (1- p) downto (- p 3)
+                                    collect (if (minusp i) -1 (aref map (svref hist i))))
+            (d41ctx-pos ctx) p))
+    (append (coerce (subseq hist p pos) 'list) tokens)))
 
 (defun d41-owner (m li)
   "The index of the kv-source layer whose caches layer LI reads."
@@ -436,8 +462,8 @@
 (defun d41-attend! (m l li ctx q k attended pos heads)
   "Each head over the raw window (oldest first) then the ATTENDED selected
    compressed rows of owner K, the sink in the denominator."
-  (let* ((hd (ds4f-head-dim m)) (nh (ds4f-n-head m)) (cap (ds4f-swa m)) (sinks (dl-sinks l))
-         (raw (svref (d41ctx-raw ctx) li)) (n-raw (min (1+ pos) cap)) (first-raw (- (1+ pos) n-raw))
+  (let* ((hd (ds4f-head-dim m)) (nh (ds4f-n-head m)) (cap (d41ctx-ring ctx)) (sinks (dl-sinks l))
+         (raw (svref (d41ctx-raw ctx) li)) (n-raw (min (1+ pos) (ds4f-swa m))) (first-raw (- (1+ pos) n-raw))
          (comp (if k (svref (d41ctx-comp ctx) k) raw)) (sel (d41ctx-selected ctx))
          (scale (/ 1f0 (sqrt (float hd 1f0)))))
     (declare (type f32vec q heads sinks raw comp) (type fixnum n-raw first-raw attended))
@@ -478,7 +504,7 @@
       (d41-rope! m q nh hd pos li)
       (d41-rope! m kv 1 hd pos li)
       (d41-quant! kv 0 hd :fp8)
-      (replace (svref (d41ctx-raw ctx) li) kv :start1 (* (mod pos (ds4f-swa m)) hd))
+      (replace (svref (d41ctx-raw ctx) li) kv :start1 (* (mod pos (d41ctx-ring ctx)) hd))
       (when (plusp ratio)
         (setf k (d41-owner m li))
         (when (member li (d41-kv-src v)) (d41-publish! m l li ctx norm pos k))

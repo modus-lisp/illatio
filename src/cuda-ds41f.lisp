@@ -98,7 +98,7 @@
          (kv0 (dbuf-of st :kv0 (* 4 hd))) (heads (dbuf-of st :heads (* 4 nh hd)))
          (nlow (* (ds4f-out-groups m) (ds4f-lora-o m)))
          (low (dbuf-of st :low (* 4 nlow))) (aout (dbuf-of st :aout (* 4 d)))
-         (raw (dvec st (svref (d41ctx-raw ctx) li))) (kvrow (cons raw (* 4 (mod pos swa) hd)))
+         (raw (dvec st (svref (d41ctx-raw ctx) li))) (ring (d41ctx-ring ctx)) (kvrow (cons raw (* 4 (mod pos ring) hd)))
          (cs (dk41-cs m st pos li)) (ics (dk41-cs m st pos li t))
          (qnorm (dk-qbuf st :norm d)) (qqrn (dk-qbuf st :qrn lq)) (qheads (dk-qbuf st :heads (* nh hd)))
          (qlow (dk-qbuf st :low nlow))
@@ -142,7 +142,7 @@
               (launch dev "d4_topk" 1 1024 (list nc top-k scores idx)))))
         (setf attended (min nc top-k))))
     (launch dev "d4_attend1" (floor nh 4) 128
-            (list hd (/ 1f0 (sqrt (float hd 1f0))) swa (mod (- (1+ pos) (min (1+ pos) swa)) swa)
+            (list hd (/ 1f0 (sqrt (float hd 1f0))) ring (mod (- (1+ pos) (min (1+ pos) swa)) ring)
                   (min (1+ pos) swa) attended ident
                   q raw (if k (dvec st (svref (d41ctx-comp ctx) k)) raw) idx (dvec st (dl-sinks l)) heads)
             :shared (* 4 (+ (* 4 hd) (* 4 (+ (min (1+ pos) swa) attended)) 8)))

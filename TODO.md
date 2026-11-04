@@ -27,8 +27,10 @@ V4.1 file is truncated.  Engram's tables want to be in memory
   compute: the copy stream could fetch likely experts during attention.
   Past that, compute: the experts' D4_MM_ID (~3 s on 3800 tokens) and
   the Q8_0 projections (~2 s).
-- Speculative decoding and saved state: V4.1 is kept out of both (its
-  shared caches, selection and Engram tail need undo/saving).
+- Rewinds are exact (D41-REWIND: from an even position, the Engram tail
+  from the tokens, a 1024-row ring so the window survives rewinds of up to
+  896 tokens, else from the start).  Speculative decoding and saved state
+  are still V4 only.
 - Long prompts are compute-bound: 20181 tokens in 52 s (6 passes), most
   of it the experts' D4_MM_ID (~17 s) and the Q8_0 projections (~11 s),
   both at 20-24 TFLOPS of the 3090's ~70.

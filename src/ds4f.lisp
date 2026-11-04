@@ -1251,26 +1251,38 @@
               (setf (d4ctx-logits c) (context-logits ctx))
               c))))
 
+(defun ds4f-context-sync (ctx c tokens)
+  "C at CTX's position for TOKENS: the tokens to evaluate.  A V4.1
+   context's rewind restores its state (D41-REWIND); others need only it."
+  (if (and (d41ctx-p c) (< (context-pos ctx) (d4ctx-pos c)))
+      (d41-rewind c (context-pos ctx) (context-tokens ctx) tokens)
+      (progn (setf (d4ctx-pos c) (context-pos ctx)) tokens)))
+
 (defun ds4f-context-forward (ctx token logits)
-  (let ((c (ds4f-context ctx)))
-    (setf (d4ctx-pos c) (context-pos ctx))
-    (ds4f-forward c token :logits logits)
+  (let* ((c (ds4f-context ctx)) (tokens (ds4f-context-sync ctx c (list token))))
+    (if (rest tokens)
+        (ds4f-context-eval-tokens c tokens)
+        (ds4f-forward c token :logits logits))
     (setf (context-pos ctx) (d4ctx-pos c))
     ctx))
 
 (defun ds4f-context-eval (ctx tokens)
-  (let ((c (ds4f-context ctx)))
-    (setf (d4ctx-pos c) (context-pos ctx))
-    (cond ((and (rest tokens) (not (d41ctx-p c))) (ds4f-eval-saving c (context-tokens ctx) tokens))
-          #+(and sbcl linux)
-          ((and (rest tokens) (ds4f-cuda-p))   ; V4.1 on CUDA: layer-major passes
-           (ds41f-cuda-prefill c tokens))
-          ((rest tokens)                ; V4.1 elsewhere: a token at a time
-           (dolist (tk (butlast tokens)) (ds4f-forward c tk :logits nil))
-           (ds4f-forward c (car (last tokens))))
-          (tokens (ds4f-forward c (first tokens))))
+  (let* ((c (ds4f-context ctx)) (tokens (ds4f-context-sync ctx c tokens)))
+    (ds4f-context-eval-tokens c tokens (context-tokens ctx))
     (setf (context-pos ctx) (d4ctx-pos c))
     (context-logits ctx)))
+
+(defun ds4f-context-eval-tokens (c tokens &optional history)
+  "TOKENS into C from its position, the last one's logits; HISTORY, the
+   tokens before (a V4 context's saved states key on it)."
+  (cond ((and (rest tokens) (not (d41ctx-p c))) (ds4f-eval-saving c history tokens))
+        #+(and sbcl linux)
+        ((and (rest tokens) (ds4f-cuda-p))   ; V4.1 on CUDA: layer-major passes
+         (ds41f-cuda-prefill c tokens))
+        ((rest tokens)                ; V4.1 elsewhere: a token at a time
+         (dolist (tk (butlast tokens)) (ds4f-forward c tk :logits nil))
+         (ds4f-forward c (car (last tokens))))
+        (tokens (ds4f-forward c (first tokens)))))
 
 (defun ds4f-context-reset (ctx)
   "Start CTX over: fresh caches and compressor windows."
