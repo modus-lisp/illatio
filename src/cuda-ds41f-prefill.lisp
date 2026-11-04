@@ -58,6 +58,10 @@
 (defun dk41-rms-rows (dev x w out width n eps)
   (launch dev "d41_rms" n (min 1024 width) (list width eps x w out nil nil)))
 
+(defvar *dk41-carry-rows* nil
+  "During a verifying pass: a table, each ratio-2 kv-source layer to a
+   buffer of its tokens' compressor projections (kv rows, then score rows).")
+
 (defun dk41-publish-chunk (m st l li ctx norm pos0 n k)
   "A kv-source layer's compressor over the chunk: the rows that finish in
    it (ratio 1: every token's; ratio 2: each pair ending at an odd
@@ -100,10 +104,6 @@
         (dk41-quant dev krows (* nb ixd) :fp4)
         (dk41-rope dev rows cs 1 hd nrot nb)
         (dk41-quant dev rows (* nb hd) :fp4-e4m3)))))
-
-(defvar *dk41-carry-rows* nil
-  "During a verifying pass: a table, each ratio-2 kv-source layer to a
-   buffer of its tokens' compressor projections (kv rows, then score rows).")
 
 (defvar *dk41-pick* nil
   "During a pass: whether the last index-source layer made a pick (its rows
