@@ -396,6 +396,9 @@
             (dotimes (h (ds4f-n-hc m)) (setf (aref streams (+ (* h d) (* b 32) j)) v))))))
     streams))
 
+(defparameter *g53-save-every* 512 "Decoded positions between saved states (a multiple of 4).")
+(defparameter *g53-saves* 6 "Saved states a context keeps (~150 MB each for GLM-5.3 Flash).")
+
 (defun g53-forward-1 (ctx token logits)
   (prog1 (if (and (fboundp 'ds4f-cuda-p) (funcall 'ds4f-cuda-p))
              (funcall 'g53-cuda-forward ctx token logits)
@@ -465,9 +468,6 @@
 ;;; tokens from there again.  Saved: before a prompt's last token (a repeat
 ;;; of the prompt re-runs it; the next turn's prompt extends it) and every
 ;;; *G53-SAVE-EVERY* positions decoded; *G53-SAVES* at most, the oldest dropped.
-
-(defparameter *g53-save-every* 512 "Decoded positions between saved states (a multiple of 4).")
-(defparameter *g53-saves* 6 "Saved states a context keeps (~150 MB each for GLM-5.3 Flash).")
 
 (defun g53-kda-layers (m)
   (loop for l across (ds4f-layers m) for li from 0 when (eq (gl-kind l) :kda) collect li))
