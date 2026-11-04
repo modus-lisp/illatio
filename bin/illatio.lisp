@@ -66,6 +66,11 @@ flags:
   --host HOST         address to listen on (default 127.0.0.1: there is no
                       authentication; listen wider only behind something that has it)
   --port PORT         port (default 9931)
+  --path DIR          serve DIR's files too, at / (a web UI: e.g. llama.cpp's
+                      tools/server/public_simplechat, or public for its full one)
+  --reasoning-format F  deepseek: a reply's thinking in reasoning_content
+                      (default); none: in its content, as <think>...</think>
+                      (for a client that shows only content, as SimpleChat)
   -c, --ctx N         context size in tokens (default 8192)
   -n, --predict N     max_tokens for a request that gives none (default 2048)
   -t, --threads N     worker threads (default: the performance cores)
@@ -110,6 +115,11 @@ flags:
                    ((string= a "-r") (setf (getf opts :bench-r) (int (val))))
                    ((string= a "--host") (setf (getf opts :host) (val)))
                    ((string= a "--port") (setf (getf opts :port) (int (val))))
+                   ((string= a "--path") (setf (getf opts :static) (val)))
+                   ((string= a "--reasoning-format")
+                    (let ((v (val)))
+                      (unless (member v '("none" "deepseek") :test #'string=) (die "--reasoning-format is none or deepseek"))
+                      (setf (getf opts :reasoning-inline) (string= v "none"))))
                    ((string= a "--serve")
                     (setf (getf opts :mode) :serve)
                     (when (and args (find #\: (first args)) (not (eql 0 (search "-" (first args)))))
@@ -206,8 +216,13 @@ flags:
     (let* ((m (load-it opts))
            (engine (apply #'make-engine m :n-ctx (getf opts :ctx)
                           (and (getf opts :predict-given) (list :max-tokens (getf opts :predict))))))
-      (serve engine :host host :port port)
+      (when (and (getf opts :static) (not (uiop:directory-exists-p (getf opts :static))))
+        (die "--path: no directory ~A" (getf opts :static)))
+      (setf illatio::*reasoning-inline* (getf opts :reasoning-inline))
+      (serve engine :host host :port port :static (getf opts :static))
       (format *error-output* "illatio: serving http://~A:~D/v1 (context ~D)~%" host port (getf opts :ctx))
+      (when (getf opts :static)
+        (format *error-output* "illatio: and ~A at http://~A:~D/~%" (getf opts :static) host port))
       (loop (sleep 3600)))))
 
 (defun run-bench (opts)

@@ -234,6 +234,16 @@ It answers `POST /v1/chat/completions` (streamed with `"stream": true`),
 `GET /v1/models` and `GET /health`, on loopback unless told otherwise: there
 is no authentication in front of it.
 
+A web UI comes from wherever its files are: `--path DIR` serves DIR at `/`
+(a missing `FILE` from `FILE.gz`, gzip-encoded).  llama.cpp's SimpleChat,
+say, with the thinking left in the text it shows (its settings' BaseURL set
+to the server's):
+
+```
+bin/illatio-server --gpu -m M --port 8081 \
+  --path llama.cpp/tools/server/public_simplechat --reasoning-format none
+```
+
 `--gpu` runs a `qwen35` model on the GPU; DeepSeek V4 Flash always uses it
 on a Mac, and the DeepSeek models always use CUDA where it is.  Raw text ends with llama-simple's speed line, so a quick
 comparison is
