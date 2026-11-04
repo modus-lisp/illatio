@@ -7,8 +7,25 @@
 
 ## GLM-5.3 Flash on CUDA
 
-Decode ~21 tok/s, prefill ~340 tok/s at 2-4K tokens (glm53.lisp,
+Decode ~22 tok/s, prefill ~340 tok/s at 2-4K tokens (glm53.lisp,
 cuda-glm53.lisp): DS4F's pool and tier, KDA and DSA of its own.
+
+- Where a token's ~45 ms goes (3090 + P40): the misses ~20 ms (~64
+  experts read through at the link's ~21 GB/s, 22 from memory node 0 and
+  20 from node 1, where ~14% of the experts landed), the dense weights ~11
+  ms (7.6 GB at 600-880 GB/s), the held experts ~2.5 ms, the rest ~10 ms:
+  ~1,700 launches, most of them small kernels, and ~4 ms idle while the
+  CPU routes each layer (45 syncs).  Routing on the device, no syncs (a
+  device-side slot table, misses read through into scratch, the LRU
+  updated after), and fused small kernels would take most of that last 10.
+- Prefetch (*G53-PREFETCH-MAX*): one guessed expert a layer, copied under
+  the next layer's attention, ~60% used (21.3 -> 22.2 tok/s).  More a
+  layer spills into the layers' own reads; a better guess is what pays.
+- The pool is LRU over a profile's seed; simulated on the profile's
+  traces, LRU misses 15% where the profile alone would miss 19%, decayed
+  frequencies do no better, and an oracle (Belady) would miss 6%.
+- The P40's x8 link (~6 GB/s) could read some misses through itself, but
+  an expert takes it ~1.1 ms: only layers with four or more misses gain.
 
 - MTP (G53-SPECULATE, *G53-MTP*, off): the MTP layer's guesses are kept
   75-90% of the time (greedy, code and prose), but a 2-token pass costs

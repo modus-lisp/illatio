@@ -44,6 +44,10 @@
   "The longest prefix a DSA layer attends whole: top-k + pool - 1 tokens."
   (+ (ds4f-ix-top-k m) (g53-ix-pool m) -1))
 
+(defvar *g53-load-mtp* nil
+  "Whether LOAD-G53 loads the MTP layer too (its weights, its experts in host
+   memory): for drafting (*G53-MTP*, cuda-glm53.lisp), off as yet.")
+
 (defvar *g53-trunk-limit* nil
   "When set, LOAD-G53 loads only this many trunk layers, and the embedding
    as the head (a test of a partial file's first layers against each
@@ -58,7 +62,7 @@
            (fm (name) (load-f32mat g name)))
       (let* ((n-trunk (min (k "trunk_block_count") (or *g53-trunk-limit* 1000)))
              ;; the MTP layer after the trunk, with the whole file
-             (n-layer (if (or *g53-trunk-limit* (zerop (k "nextn_predict_layers" 0))) n-trunk (1+ n-trunk)))
+             (n-layer (if (or *g53-trunk-limit* (not *g53-load-mtp*) (zerop (k "nextn_predict_layers" 0))) n-trunk (1+ n-trunk)))
              (m (%make-g53
                  :gguf g :file (map-file-vector path) :pool (make-pool threads)
                  :n-layer n-layer :n-trunk n-trunk :d (k "embedding_length")

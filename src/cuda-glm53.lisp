@@ -338,13 +338,35 @@
 
 ;;; --- a token -------------------------------------------------------------------------
 
+(defvar *g53-prefetch-max* 1
+  "Experts a layer, at most, copied ahead for the next: the likeliest of the
+   next layer's router's top *DS4F-PREFETCH-K* on this layer's FFN input
+   that neither device holds, the copy held back until this layer's experts
+   are done with the bus -- it runs under the next layer's attention, when
+   the bus is idle (more than one spills into that layer's own reads).
+   ~60% of them are used: 21.3 -> 22.4 tok/s.")
+
+(defun g53-prefetch (m st li experts)
+  "Background copies (D4-FILL) of the first *G53-PREFETCH-MAX* of layer LI's
+   guessed EXPERTS that neither device holds nor is filling, once the work
+   queued so far is done."
+  (let ((ne (ds4f-n-expert m)) (tr (dk-tier st)) (budget *g53-prefetch-max*)
+        (ev (or (getf (dk-bufs st) :pf-event) (setf (getf (dk-bufs st) :pf-event) (cuda-event-create (dk-dev st))))))
+    (cuda-event-record ev (cudev-stream (dk-dev st)))
+    (cuda-stream-wait (dk-fill-stream st) ev)
+    (dolist (e experts)
+      (let ((key (+ (* li ne) e)))
+        (when (and (plusp budget) (minusp (aref (dk-slot-of st) key))
+                   (not (and tr (>= (aref (dt-slot-of tr) key) 0))) (not (d4-filling-p st key)))
+          (decf budget) (incf (dk-prefetched st)) (d4-fill m st li e))))))
+
 (defun g53-cuda-forward (ctx token logits)
   "G53-FORWARD-1 on the GPU: TOKEN at the next position."
   (let* ((m (d4ctx-model ctx)) (st (g53-cuda-state m)) (dev (dk-dev st))
          (d (ds4f-d m)) (n (ds4f-n-hc m)) (hcd (* n d)) (pos (d4ctx-pos ctx))
          (ne (ds4f-n-expert m)) (rb (dk-rb st))
          (sa (dbuf-of st :sa (* 4 hcd))) (sb (dbuf-of st :sb (* 4 hcd)))
-         (lg (f32vec ne)) (prev nil))
+         (lg (f32vec ne)) (pl (f32vec ne)) (prev nil))
     (assert (< pos (d4ctx-n-ctx ctx)) () "GLM context full (~D tokens)" (d4ctx-n-ctx ctx))
     (with-cuda
       (cuda-current dev)
@@ -359,15 +381,18 @@
                 (g53k-dense-ffn m st l li sb sa)
                 (progn
                   (dk-ffn-head m st l li sb)
-                  (cuda-copy-out rb (dbuf-of st :logits 0) 0 (* 4 ne))
+                  (cuda-copy-out rb (dbuf-of st :logits 0) 0 (* 4 2 ne))
                   (when (or (dk-tier st) (dk-cpu st)) (cuda-copy-out (sb-sys:sap+ rb 4096) (dbuf-of st :norm2 0) 0 (* 4 d)))
                   (cuda-sync dev)
                   (dk-arena-reset st)
-                  (dotimes (i ne) (setf (aref lg i) (sb-sys:sap-ref-single rb (* 4 i))))
+                  (dotimes (i ne) (setf (aref lg i) (sb-sys:sap-ref-single rb (* 4 i)) (aref pl i) (sb-sys:sap-ref-single rb (* 4 (+ ne i)))))
                   (multiple-value-bind (sel w) (g53-route m l nil lg)
                     (when *ds4f-route-trace* (format *ds4f-route-trace* "~D~{ ~D~}~%" li (coerce sel 'list)))
+                    (d4-fills-done st)
                     (let ((plan (d4-plan m st li sel prev)))
                       (dk-ffn-tail m st l li plan w sb sa)
+                      (when (and (plusp *g53-prefetch-max*) (< (1+ li) (g53-n-trunk m)))
+                        (g53-prefetch m st (1+ li) (d4-predict m (1+ li) token *ds4f-prefetch-k* pl)))
                       (setf prev plan))))))))
       (when logits
         (let ((out (g53k-head m st sa)) (v (d4ctx-logits ctx)))
@@ -607,7 +632,8 @@
 ;;; then guesses again from the last kept token's streams.
 
 (defvar *g53-mtp* nil
-  "Whether greedy decoding drafts with the MTP layer (G53-SPECULATE).  Off:
+  "Whether greedy decoding drafts with the MTP layer (G53-SPECULATE), when
+   it was loaded (*G53-LOAD-MTP*).  Off:
    its guesses are kept 75-90% of the time, but a pass costs about two
    decode steps (88 ms against 48), most of it the experts, read through
    from host memory for both tokens' (61 ms against 27 a token) -- a

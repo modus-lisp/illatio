@@ -131,7 +131,7 @@ about 81% of the experts a token wants are on a device.
 
 | GLM-5.3 Flash (3090 + P40) | |
 |---|---|
-| decode | ~21 tok/s |
+| decode | ~22 tok/s |
 | prefill, 267 / 1,917 / 3,817 tokens | 3.8 s / 5.2 s / 11.3 s |
 | prefill, 12,017 tokens | 38 s (315 tok/s) |
 | decode at 12K tokens of context | 18 tok/s |
