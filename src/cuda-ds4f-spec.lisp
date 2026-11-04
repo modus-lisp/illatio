@@ -50,7 +50,7 @@
     (dotimes (tk n)
       (let ((lg (f32vec ne)))
         (dotimes (i ne) (setf (aref lg i) (sb-sys:sap-ref-single h (* 4 (+ (* tk ne) i)))))
-        (multiple-value-bind (sel w) (d4-route m l li nil (svref tokv tk) lg)
+        (multiple-value-bind (sel w) (if (ds4f-glm m) (g53-route m l nil lg) (d4-route m l li nil (svref tokv tk) lg))
           (setf (svref ws tk) w)
           (dotimes (j nu) (push (cons tk j) (gethash (aref sel j) groups))))))
     ;; where each expert is computed: read through first, then held, then the second device's

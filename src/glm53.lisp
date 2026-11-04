@@ -34,7 +34,8 @@
   (clamp 10f0 :type single-float))
 
 (defstruct (g53layer (:include d4layer) (:conc-name gl-))
-  kind                                  ; :KDA or :DSA
+  kind                                  ; :KDA, :DSA, or :MTP (the nextn layer: DSA's attention, no HC)
+  enorm hnorm head-norm                 ; the MTP layer's
   k-b v-b attn-out ix-k-bias ix-gate ix-ape
   kda-q kda-k kda-v q-conv k-conv v-conv conv3 f-a f-b dt-bias a-log beta g-a g-b o-norm kda-out
   ffn-gate ffn-up ffn-down)
@@ -55,11 +56,12 @@
            (q (name) (load-qmat g name))
            (f32 (name) (load-f32 g name))
            (fm (name) (load-f32mat g name)))
-      (let* ((n-layer (k "block_count"))
+      (let* ((n-trunk (min (k "trunk_block_count") (or *g53-trunk-limit* 1000)))
+             ;; the MTP layer after the trunk, with the whole file
+             (n-layer (if (or *g53-trunk-limit* (zerop (k "nextn_predict_layers" 0))) n-trunk (1+ n-trunk)))
              (m (%make-g53
                  :gguf g :file (map-file-vector path) :pool (make-pool threads)
-                 :n-layer (min (k "trunk_block_count") (or *g53-trunk-limit* 1000))
-                 :n-trunk (min (k "trunk_block_count") (or *g53-trunk-limit* 1000)) :d (k "embedding_length")
+                 :n-layer n-layer :n-trunk n-trunk :d (k "embedding_length")
                  :n-head (k "attention.head_count") :head-dim (k "attention.key_length")
                  :v-dim (k "attention.value_length") :n-rot 0
                  :lora-q (k "attention.q_lora_rank") :kv-lora (k "attention.kv_lora_rank")
@@ -83,16 +85,19 @@
         (setf (ds4f-clamps m) (make-array n-layer :initial-element (g53-clamp m)))
         (setf (ds4f-layers m)
               (coerce
-               (loop for i below (g53-n-trunk m)
+               (loop for i below n-layer
                      collect (flet ((n (s) (format nil "blk.~D.~A" i s)))
-                               (let* ((kda (/= (mod i 4) 3))
+                               (let* ((mtp (>= i n-trunk)) (kda (and (not mtp) (/= (mod i 4) 3)))
                                       (l (make-g53layer
-                                          :kind (if kda :kda :dsa)
-                                          :attn-norm (f32 (n "attn_norm.weight")) :ffn-norm (f32 (n "ffn_norm.weight"))
-                                          :hc-attn-fn (fm (n "hc_attn_fn.weight")) :hc-attn-scale (f32 (n "hc_attn_scale.weight"))
-                                          :hc-attn-base (f32 (n "hc_attn_base.weight"))
-                                          :hc-ffn-fn (fm (n "hc_ffn_fn.weight")) :hc-ffn-scale (f32 (n "hc_ffn_scale.weight"))
-                                          :hc-ffn-base (f32 (n "hc_ffn_base.weight")))))
+                                          :kind (cond (mtp :mtp) (kda :kda) (t :dsa))
+                                          :attn-norm (f32 (n "attn_norm.weight")) :ffn-norm (f32 (n "ffn_norm.weight")))))
+                                 (if mtp
+                                     (setf (gl-enorm l) (f32 (n "nextn.enorm.weight")) (gl-hnorm l) (f32 (n "nextn.hnorm.weight"))
+                                           (gl-head-norm l) (f32 (n "nextn.shared_head_norm.weight")))
+                                     (setf (gl-hc-attn-fn l) (fm (n "hc_attn_fn.weight")) (gl-hc-attn-scale l) (f32 (n "hc_attn_scale.weight"))
+                                           (gl-hc-attn-base l) (f32 (n "hc_attn_base.weight"))
+                                           (gl-hc-ffn-fn l) (fm (n "hc_ffn_fn.weight")) (gl-hc-ffn-scale l) (f32 (n "hc_ffn_scale.weight"))
+                                           (gl-hc-ffn-base l) (f32 (n "hc_ffn_base.weight"))))
                                  (if kda
                                      (setf (gl-kda-q l) (q (n "kda_q.weight")) (gl-kda-k l) (q (n "kda_k.weight"))
                                            (gl-kda-v l) (q (n "kda_v.weight"))
@@ -104,15 +109,17 @@
                                            (gl-g-a l) (q (n "kda_g_a.weight")) (gl-g-b l) (q (n "kda_g_b.weight"))
                                            (gl-o-norm l) (f32 (n "kda_o_norm.weight")) (gl-kda-out l) (q (n "kda_output.weight"))
                                            (gl-conv3 l) (concatenate 'f32vec (gl-q-conv l) (gl-k-conv l) (gl-v-conv l)))
-                                     (setf (gl-q-a l) (q (n "attn_q_a.weight")) (gl-q-a-norm l) (f32 (n "attn_q_a_norm.weight"))
+                                     (progn
+                                      (setf (gl-q-a l) (q (n "attn_q_a.weight")) (gl-q-a-norm l) (f32 (n "attn_q_a_norm.weight"))
                                            (gl-q-b l) (q (n "attn_q_b.weight"))
                                            (gl-kv l) (q (n "attn_kv_a_mqa.weight")) (gl-kv-norm l) (f32 (n "attn_kv_a_norm.weight"))
                                            (gl-k-b l) (fm (n "attn_k_b.weight")) (gl-v-b l) (fm (n "attn_v_b.weight"))
-                                           (gl-attn-out l) (q (n "attn_output.weight"))
-                                           (gl-ix-q-b l) (fm (n "indexer.attn_q_b.weight")) (gl-ix-k l) (fm (n "indexer.attn_k.weight"))
+                                           (gl-attn-out l) (q (n "attn_output.weight")))
+                                     (unless mtp
+                                       (setf (gl-ix-q-b l) (fm (n "indexer.attn_q_b.weight")) (gl-ix-k l) (fm (n "indexer.attn_k.weight"))
                                            (gl-ix-k-norm l) (f32 (n "indexer.k_norm.weight")) (gl-ix-k-bias l) (f32 (n "indexer.k_norm.bias"))
                                            (gl-ix-proj l) (fm (n "indexer.proj.weight"))
-                                           (gl-ix-ape l) (f32 (n "indexer.pool_ape.weight")) (gl-ix-gate l) (fm (n "indexer.pool_gate.weight"))))
+                                           (gl-ix-ape l) (f32 (n "indexer.pool_ape.weight")) (gl-ix-gate l) (fm (n "indexer.pool_gate.weight"))))))
                                  (if (< i (g53-n-dense m))
                                      (setf (gl-ffn-gate l) (q (n "ffn_gate.weight")) (gl-ffn-up l) (q (n "ffn_up.weight"))
                                            (gl-ffn-down l) (q (n "ffn_down.weight")))
@@ -139,7 +146,9 @@
   conv state                            ; per KDA layer: 3 x 3 x P raw history; heads x V x K
   kv ixk tail                           ; per DSA layer: positions x latent (F16's values); pools x key; 2 x 4 x key raw
   dev                                   ; on CUDA, all of it on the device instead (G53-CTX-DEV)
-  saves)                                ; (pos . KDA's state there), the latest first (G53-SAVE!)
+  saves                                 ; (pos . KDA's state there), the latest first (G53-SAVE!)
+  mtp-from                              ; the first position the MTP layer has a latent for
+  guess)                                ; (pos token guess): the MTP layer's, at the token after TOKEN at POS
 
 (defun make-g53ctx (m &key (n-ctx 4096))
   (if (and (fboundp 'ds4f-cuda-p) (funcall 'ds4f-cuda-p))
@@ -403,7 +412,15 @@
   (prog1 (if (and (fboundp 'ds4f-cuda-p) (funcall 'ds4f-cuda-p))
              (funcall 'g53-cuda-forward ctx token logits)
              (g53-cpu-forward ctx token logits))
-    (when (zerop (mod (d4ctx-pos ctx) *g53-save-every*)) (g53-save! ctx))))
+    (g53-maybe-save ctx)))
+
+(defun g53-maybe-save (ctx)
+  "G53-SAVE! at CTX's position when it is a multiple of 4 near the start of
+   a block of *G53-SAVE-EVERY* the latest save is before (a step may take two)."
+  (let* ((pos (d4ctx-pos ctx)) (block (* *g53-save-every* (floor pos *g53-save-every*))))
+    (when (and (plusp block) (zerop (mod pos 4)) (< (- pos block) 16)
+               (let ((s (first (g53ctx-saves ctx)))) (or (null s) (< (car s) block))))
+      (g53-save! ctx))))
 
 (defun g53-cpu-forward (ctx token logits)
   (let* ((m (d4ctx-model ctx)) (d (ds4f-d m)) (n (ds4f-n-hc m)) (eps (ds4f-eps m)) (pos (d4ctx-pos ctx))
@@ -445,6 +462,8 @@
    at the last multiple of 4 before the last token (where a prompt that
    repeats these goes back to)."
   (let* ((pos (d4ctx-pos c)) (s (* 4 (floor (+ pos (length tokens) -1) 4))))
+    ;; the MTP layer attends only what it has seen decoded since
+    (setf (g53ctx-mtp-from c) nil (g53ctx-guess c) nil)
     (when (> s pos)
       (g53-eval-1 c (subseq tokens 0 (- s pos)) nil)
       (g53-save! c)
@@ -511,7 +530,7 @@
          (p (if keep (car (first keep)) 0)))
     (assert (>= (length hist) pos) () "a GLM rewind needs the ~D tokens before it" pos)
     (when (fboundp 'g53-cuda-drop-saves) (funcall 'g53-cuda-drop-saves ctx (ldiff (g53ctx-saves ctx) keep)))
-    (setf (g53ctx-saves ctx) keep)
+    (setf (g53ctx-saves ctx) keep (g53ctx-mtp-from ctx) nil (g53ctx-guess ctx) nil)
     (g53-restore! ctx (cdr (first keep)))
     (setf (d4ctx-pos ctx) p)
     (append (coerce (subseq hist p pos) 'list) tokens)))

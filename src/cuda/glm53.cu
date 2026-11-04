@@ -213,6 +213,11 @@ extern "C" __global__ void g53_attend(int lat, int ns, float scale, const float*
 }
 
 // The streams' mean (N of D) into OUT.
+extern "C" __global__ void g53_add(int n, const float* a, const float* b, float* out) {
+  int j = blockIdx.x * blockDim.x + threadIdx.x;
+  if (j < n) out[j] = a[j] + b[j];
+}
+
 extern "C" __global__ void g53_mean(int d, int n, const float* s, float* out) {
   int j = blockIdx.x * blockDim.x + threadIdx.x;
   if (j >= d) return;
@@ -273,7 +278,10 @@ g53_mm_bf16(int ncols, int nrows, int n, int x_stride, int y_stride, const u16* 
 
 // G53_KDA_CONV over N tokens: a thread a channel of Q, K or V (each N x P,
 // in place), its taps over the history then the chunk, in token order.
-extern "C" __global__ void g53_kda_conv_chunk(int p, int n, float* q, float* k, float* v, const float* w, float* hist) {
+// SAVE_T >= 0: the history after token SAVE_T into HSAVE too (a verifying
+// pass's, should only the first tokens be kept).
+extern "C" __global__ void g53_kda_conv_chunk(int p, int n, float* q, float* k, float* v, const float* w, float* hist,
+                                             int save_t, float* hsave) {
   int i = blockIdx.x * blockDim.x + threadIdx.x;
   if (i >= 3 * p) return;
   int a = i / p, c = i - a * p;
@@ -289,6 +297,10 @@ extern "C" __global__ void g53_kda_conv_chunk(int p, int n, float* q, float* k, 
     acc = fmaf(raw, wc[3], acc);
     h0 = h1; h1 = h2; h2 = raw;
     x[(long long)t * p + c] = acc / (1.f + expf(-acc));
+    if (t == save_t) {
+      float* hs = hsave + (long long)a * 3 * p + c;
+      hs[0] = h0; hs[p] = h1; hs[2 * p] = h2;
+    }
   }
   h[0] = h0; h[p] = h1; h[2 * p] = h2;
 }
@@ -312,9 +324,11 @@ extern "C" __global__ void g53_kda_prep(int p, float lb, float* q, float* k, flo
 
 // The delta rule over N tokens: head blockIdx.x, value rows 4 blockIdx.y ..
 // (a warp each, its state row in registers, 4 keys a lane), G53_KDA_STEP's
-// arithmetic a token at a time.  O: N x P.
+// arithmetic a token at a time.  O: N x P.  SAVE_T >= 0: the state after
+// token SAVE_T into SSAVE too.
 extern "C" __global__ void g53_kda_rec(int p, int n, const float* q, const float* k, const float* v,
-                                       const float* dec, const float* beta, float* S, float* o) {
+                                       const float* dec, const float* beta, float* S, float* o,
+                                       int save_t, float* ssave) {
   int h = blockIdx.x, lane = threadIdx.x & 31, row = blockIdx.y * 4 + (threadIdx.x >> 5);
   float4* sp = (float4*)(S + ((long long)h * 128 + row) * 128) + lane;
   float4 s = *sp;
@@ -329,6 +343,7 @@ extern "C" __global__ void g53_kda_rec(int p, int n, const float* q, const float
     s.z = fmaf(k4.z, delta, s.z); s.w = fmaf(k4.w, delta, s.w);
     float ov = warp_sum(s.x * q4.x + s.y * q4.y + s.z * q4.z + s.w * q4.w);
     if (lane == 0) o[base + row] = ov;
+    if (t == save_t) ((float4*)(ssave + ((long long)h * 128 + row) * 128))[lane] = s;
   }
   *sp = s;
 }

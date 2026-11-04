@@ -12,26 +12,32 @@
 (in-package #:illatio)
 
 (defun g53-layer-tensors (m li)
-  "The device's tensors of trunk layer LI (short names)."
+  "The device's tensors of layer LI (short names)."
   (let ((l (svref (ds4f-layers m) li)))
-    (append '("hc_attn_fn.weight" "hc_ffn_fn.weight")
-            (if (eq (gl-kind l) :kda)
-                '("kda_q.weight" "kda_k.weight" "kda_v.weight" "kda_f_a.weight" "kda_f_b.weight"
-                  "kda_beta.weight" "kda_g_a.weight" "kda_g_b.weight" "kda_output.weight")
+    (append (if (eq (gl-kind l) :mtp)
+                '("nextn.eh_proj.weight" "attn_q_a.weight" "attn_q_b.weight" "attn_kv_a_mqa.weight"
+                  "attn_k_b.weight" "attn_v_b.weight" "attn_output.weight")
+                '("hc_attn_fn.weight" "hc_ffn_fn.weight"))
+            (case (gl-kind l)
+              (:mtp nil)
+              (:kda
+               '("kda_q.weight" "kda_k.weight" "kda_v.weight" "kda_f_a.weight" "kda_f_b.weight"
+                 "kda_beta.weight" "kda_g_a.weight" "kda_g_b.weight" "kda_output.weight"))
+              (t
                 '("attn_q_a.weight" "attn_q_b.weight" "attn_kv_a_mqa.weight" "attn_k_b.weight" "attn_v_b.weight"
                   "attn_output.weight" "indexer.attn_q_b.weight" "indexer.attn_k.weight" "indexer.proj.weight"
-                  "indexer.pool_gate.weight"))
+                  "indexer.pool_gate.weight")))
             (if (< li (g53-n-dense m))
                 '("ffn_gate.weight" "ffn_up.weight" "ffn_down.weight")
                 '("ffn_gate_inp.weight" "ffn_gate_shexp.weight" "ffn_up_shexp.weight" "ffn_down_shexp.weight")))))
 
 (defun g53-upload-weights (m st)
-  "The trunk's non-routed tensors to the device: Q8_0 repacked (DK-Q8), a
+  "The layers' non-routed tensors to the device: Q8_0 repacked (DK-Q8), a
    K-quant's blocks as they are (DK-Q8 too, its CMAT's type says), BF16,
    F16 and F32 as they are (DK-F16)."
   (let* ((g (ds4f-gguf m)) (dev (dk-dev st)) (fd (d4-open m)) (raw nil)
          (names (cons (if *g53-trunk-limit* "token_embd.weight" "output.weight")
-                      (loop for li below (g53-n-trunk m)
+                      (loop for li below (length (ds4f-layers m))
                             append (mapcar (lambda (s) (lname li s)) (g53-layer-tensors m li)))))
          (stage (cuda-host-alloc (loop for name in names maximize (tensor-bytes (gguf-tensor g name))))))
     (unwind-protect
@@ -94,17 +100,19 @@
 
 (defun g53-ctx-dev (ctx st)
   "CTX's per-layer device state, made (zeroed) the first time: a KDA
-   layer's (hist . S), a DSA layer's (latents ixkeys tail)."
+   layer's (hist S), a DSA layer's (latents ixkeys tail), the MTP layer's
+   (latents)."
   (or (g53ctx-dev ctx)
       (let* ((m (d4ctx-model ctx)) (dev (dk-dev st)) (p (* (g53-kda-heads m) (g53-kda-dim m)))
              (n (d4ctx-n-ctx ctx)) (ixd (ds4f-ix-dim m)))
         (setf (g53ctx-dev ctx)
               (map 'simple-vector
                    (lambda (l)
-                     (if (eq (gl-kind l) :kda)
-                         (list (cuda-alloc dev (* 4 9 p)) (cuda-alloc dev (* 4 p (g53-kda-dim m))))
-                         (list (cuda-alloc dev (* 2 n (g53-kv-lora m))) (cuda-alloc dev (* 2 (ceiling n 4) ixd))
-                               (cuda-alloc dev (* 4 8 ixd)))))
+                     (case (gl-kind l)
+                       (:kda (list (cuda-alloc dev (* 4 9 p)) (cuda-alloc dev (* 4 p (g53-kda-dim m)))))
+                       (:mtp (list (cuda-alloc dev (* 2 n (g53-kv-lora m)))))
+                       (t (list (cuda-alloc dev (* 2 n (g53-kv-lora m))) (cuda-alloc dev (* 2 (ceiling n 4) ixd))
+                               (cuda-alloc dev (* 4 8 ixd))))))
                    (ds4f-layers m))))))
 
 (defun free-g53ctx (ctx)
@@ -260,6 +268,74 @@
     (dk-q8mv st (if *g53-trunk-limit* "token_embd.weight" "output.weight") norm out :q q)
     out))
 
+;;; --- the MTP layer --------------------------------------------------------------------
+;;; Layer 45 (nextn) guesses the token after next: a layer of one stream on
+;;; eh_proj(enorm(the next token's embedding), hnorm(the trunk's streams'
+;;; mean)), DSA's attention without its indexer over the positions it has
+;;; seen itself (its own latents, from where drafting began), its own
+;;; experts, and the shared head behind its own norm.
+
+(defun g53k-mtp (m st ctx streams token pos from)
+  "The MTP layer at POS: STREAMS (the trunk's, after POS) and TOKEN (the one
+   at POS+1) to the logits for POS+2 (:OUT); its latent cached at POS, its
+   attention over FROM..POS."
+  (let* ((dev (dk-dev st)) (li (g53-n-trunk m)) (l (svref (ds4f-layers m) li))
+         (d (ds4f-d m)) (eps (ds4f-eps m)) (ff (ds4f-ff-exp m)) (ne (ds4f-n-expert m))
+         (nh (ds4f-n-head m)) (kd (ds4f-head-dim m)) (vd (g53-v-dim m)) (lat (g53-kv-lora m)) (lq (ds4f-lora-q m))
+         (cache (first (svref (g53-ctx-dev ctx st) li))) (rb (dk-rb st)) (ns (1+ (- pos from)))
+         (h (dbuf-of st :m-h (* 4 d))) (e (dbuf-of st :m-e (* 4 d))) (cat (dbuf-of st :m-cat (* 4 2 d)))
+         (x (dbuf-of st :m-x (* 4 d))) (norm (dbuf-of st :norm (* 4 d))) (qnorm (dk-qbuf st :norm d))
+         (qr (dbuf-of st :qr (* 4 lq))) (qrn (dbuf-of st :qrn (* 4 lq))) (qqrn (dk-qbuf st :qrn lq))
+         (q (dbuf-of st :q (* 4 nh kd))) (kvr (dbuf-of st :kvr (* 4 lat)))
+         (qk (dbuf-of st :qk (* 4 nh lat))) (lv (dbuf-of st :lv (* 4 nh lat)))
+         (heads (dbuf-of st :heads (* 4 nh vd))) (aout (dbuf-of st :aout (* 4 d)))
+         (norm2 (dbuf-of st :norm2 (* 4 d))) (qn2 (dk-qbuf st :norm2 d)) (logits (dbuf-of st :logits (* 4 2 ne)))
+         (sg (dbuf-of st :sg (* 4 ff))) (su (dbuf-of st :su (* 4 ff))) (smid (dbuf-of st :smid (* 4 ff)))
+         (sout (dbuf-of st :sout (* 4 d))) (qmid (dk-qbuf st :smid ff))
+         (hn (dbuf-of st :hnorm (* 4 d))) (qh (dk-qbuf st :hnorm d)) (out (dbuf-of st :out (* 4 (ds4f-n-vocab m))))
+         (lg (f32vec ne)) (row (f32vec (* (ds4f-n-hc m) d))))
+    (assert (<= ns 12288) () "the MTP layer attends 12288 positions at most")
+    ;; its input
+    (launch dev "g53_mean" (ceiling d 256) 256 (list d (ds4f-n-hc m) streams h))
+    (cuda-upload-vector e (subseq (g53-embed! m token row) 0 d))
+    (dk-rms dev e (dvec st (gl-enorm l)) cat d 1 eps)
+    (dk-rms dev h (dvec st (gl-hnorm l)) (cons cat (* 4 d)) d 1 eps)
+    (dk-mv st (lname li "nextn.eh_proj.weight") cat x)
+    ;; attention
+    (dk-rms dev x (dvec st (gl-attn-norm l)) norm d 1 eps qnorm)
+    (dk-mv st (lname li "attn_q_a.weight") norm qr :q qnorm)
+    (dk-mv st (lname li "attn_kv_a_mqa.weight") norm kvr :q qnorm)
+    (dk-rms dev qr (dvec st (gl-q-a-norm l)) qrn lq 1 eps qqrn)
+    (dk-mv st (lname li "attn_q_b.weight") qrn q :q qqrn)
+    (launch dev "g53_kv_store" 1 lat (list lat eps pos kvr (dvec st (gl-kv-norm l)) cache))
+    (dk-q8mv st (lname li "attn_k_b.weight") q qk :group-rows lat)
+    (launch dev "g53_attend" nh 256 (list lat ns (/ 1f0 (sqrt (float kd 1f0))) qk (cons cache (* 2 from lat)) nil lv)
+            :shared (* 4 ns))
+    (dk-q8mv st (lname li "attn_v_b.weight") lv heads :group-rows vd)
+    (dk-mv st (lname li "attn_output.weight") heads aout)
+    (launch dev "g53_add" (ceiling d 256) 256 (list d x aout x))
+    ;; the FFN: the router, the shared expert, then the routed ones
+    (dk-rms dev x (dvec st (gl-ffn-norm l)) norm2 d 1 eps qn2)
+    (dk-mv16 st (lname li "ffn_gate_inp.weight") norm2 logits)
+    (dk-q8mv st (lname li "ffn_gate_shexp.weight") norm2 sg :q qn2)
+    (dk-q8mv st (lname li "ffn_up_shexp.weight") norm2 su :q qn2)
+    (launch dev "d4_swiglu_w" (ceiling ff 256) 256
+            (list 1 ff (svref (ds4f-clamps m) li) sg su (dk-put st (list 1f0) :type :f32) smid (car qmid) (cdr qmid)))
+    (dk-q8mv st (lname li "ffn_down_shexp.weight") smid sout :q qmid)
+    (cuda-copy-out rb logits 0 (* 4 ne))
+    (when (or (dk-tier st) (dk-cpu st)) (cuda-copy-out (sb-sys:sap+ rb 4096) norm2 0 (* 4 d)))
+    (cuda-sync dev)
+    (dk-arena-reset st)
+    (dotimes (i ne) (setf (aref lg i) (sb-sys:sap-ref-single rb (* 4 i))))
+    (multiple-value-bind (sel w) (g53-route m l nil lg)
+      (let* ((plan (d4-plan m st li sel nil)) (moe (dk-ffn-tail m st l li plan w nil nil :hc nil)))
+        (launch dev "g53_add" (ceiling d 256) 256 (list d x moe x))
+        (dk-rms dev x (dvec st (gl-head-norm l)) hn d 1 eps qh)
+        (dk-q8mv st "output.weight" hn out :q qh)
+        (cuda-sync dev)
+        (loop for s across (dp-a-slots plan) when (>= s 0) do (decf (aref (dk-pin st) s)))))
+    out))
+
 ;;; --- a token -------------------------------------------------------------------------
 
 (defun g53-cuda-forward (ctx token logits)
@@ -349,6 +425,10 @@
     (dk-rms dev cur (dvec st (gl-attn-norm l)) norm d n (ds4f-eps m))
     (values norm pca)))
 
+(defvar *g53-keep* nil
+  "During a verifying pass: each KDA layer's (hist S) for its state after
+   the pass's first token (G53-CUDA-KEEP-BUFS).")
+
 (defun g53p-kda (m st l li bufs n sa sb)
   (let* ((dev (dk-dev st)) (d (ds4f-d m)) (nh (g53-kda-heads m)) (p (* nh (g53-kda-dim m)))
          (q (pb st :p-kq (* n p))) (k (pb st :p-kk (* n p))) (v (pb st :p-kv (* n p)))
@@ -364,10 +444,13 @@
       (dk-mmx st (lname li "kda_beta.weight") norm braw n)
       (dk-mmx st (lname li "kda_g_a.weight") norm glow n)
       (dk-mmx st (lname li "kda_g_b.weight") glow og n)
-      (launch dev "g53_kda_conv_chunk" (ceiling (* 3 p) 256) 256 (list p n q k v (dvec st (gl-conv3 l)) (first bufs)))
+      (launch dev "g53_kda_conv_chunk" (ceiling (* 3 p) 256) 256
+              (list p n q k v (dvec st (gl-conv3 l)) (first bufs)
+                    (if *g53-keep* 0 -1) (and *g53-keep* (first (svref *g53-keep* li)))))
       (launch dev "g53_kda_prep" (list nh n) 128
               (list p (g53-kda-lb m) q k graw braw (dvec st (gl-dt-bias l)) (dvec st (gl-a-log l))))
-      (launch dev "g53_kda_rec" (list nh 32) 128 (list p n q k v graw braw (second bufs) o))
+      (launch dev "g53_kda_rec" (list nh 32) 128
+              (list p n q k v graw braw (second bufs) o (if *g53-keep* 0 -1) (and *g53-keep* (second (svref *g53-keep* li)))))
       (launch dev "g53_kda_out" (list nh n) 128 (list p (ds4f-eps m) o og (dvec st (gl-o-norm l))))
       (dk-mmx st (lname li "kda_output.weight") o aout n)
       (dk-hc-post-chunk m st aout sa pca sb n))))
@@ -399,6 +482,8 @@
             (launch dev "g53_ix_pool_chunk" (- p1 p0) ixd
                     (list ixd pos0 p0 kr gr tail (dvec st (gl-ix-k-norm l)) (dvec st (gl-ix-k-bias l))
                           (dvec st (gl-ix-ape l)) ixk)))
+          ;; (a verifying pass's tail as right for its first token alone too)
+          (when *g53-keep* (launch dev "g53_ix_tail" 1 ixd (list ixd pos0 (1+ pos0) kr gr tail)))
           (launch dev "g53_ix_tail" 1 ixd (list ixd pos0 end kr gr tail)))
         ;; the sparse tokens' selections
         (when sparse
@@ -412,15 +497,19 @@
         (launch dev "g53_attend_counts" (ceiling n 256) 256 (list n pos0 dense nsel raws nraw ncomp))
         ;; the queries into the latent, attention there, the heads out of it
         (let ((wk (gethash (lname li "attn_k_b.weight") (dk-q8 st))) (wv (gethash (lname li "attn_v_b.weight") (dk-q8 st))))
-          (dotimes (h nh)
-            (dk-mm st "d4_mm_q8_0" (cons (cmat-qs wk) (* h lat kd)) (cons (cmat-d wk) (* 2 h lat (floor kd 32)))
-                   0 lat kd (cons q (* 4 h kd)) (cons qk (* 4 h lat)) n :x-stride (* nh kd) :y-stride (* nh lat)))
+          (if *dk-small*
+              (dk-q8mm st (lname li "attn_k_b.weight") q qk n :group-rows lat)
+              (dotimes (h nh)
+                (dk-mm st "d4_mm_q8_0" (cons (cmat-qs wk) (* h lat kd)) (cons (cmat-d wk) (* 2 h lat (floor kd 32)))
+                       0 lat kd (cons q (* 4 h kd)) (cons qk (* 4 h lat)) n :x-stride (* nh kd) :y-stride (* nh lat))))
           (launch dev "g53_cache_f32" (ceiling (* end lat) 256) 256 (list (list :i64 (* end lat)) cache kf))
           (launch dev "d4_attend" n 512
                   (list nh lat (/ 1f0 (sqrt (float kd 1f0))) maxc 0 0 qk kf kf raws nraw ncomp sel sinks lv))
-          (dotimes (h nh)
-            (dk-mm st "d4_mm_q8_0" (cons (cmat-qs wv) (* h vd lat)) (cons (cmat-d wv) (* 2 h vd (floor lat 32)))
-                   0 vd lat (cons lv (* 4 h lat)) (cons heads (* 4 h vd)) n :x-stride (* nh lat) :y-stride (* nh vd))))
+          (if *dk-small*
+              (dk-q8mm st (lname li "attn_v_b.weight") lv heads n :group-rows vd)
+              (dotimes (h nh)
+                (dk-mm st "d4_mm_q8_0" (cons (cmat-qs wv) (* h vd lat)) (cons (cmat-d wv) (* 2 h vd (floor lat 32)))
+                       0 vd lat (cons lv (* 4 h lat)) (cons heads (* 4 h vd)) n :x-stride (* nh lat) :y-stride (* nh vd)))))
         (dk-mmx st (lname li "attn_output.weight") heads aout n)
         (dk-hc-post-chunk m st aout sa pca sb n)))))
 
@@ -504,3 +593,143 @@
                                  (g53-cuda-prefill-1 ctx piece last)
                                  (decode piece last))))))))
     ctx))
+
+;;; --- drafting with the MTP layer ---------------------------------------------------------
+;;;
+;;; Decoding greedily, a step takes the token and the MTP layer's guess at
+;;; the one after it through one short pass (G53-CUDA-PASS: the prefill's
+;;; layer-major blocks with decode's products, each weight read once for
+;;; both, the experts as decode has them, the second device's included).
+;;; The guess is kept when the first token's greedy choice is the guess --
+;;; two tokens for a pass -- and otherwise only the first is: KDA's state as
+;;; the pass left it after the first token is put back (every other cache is
+;;; by position, written again before it is read).  Either way the MTP layer
+;;; then guesses again from the last kept token's streams.
+
+(defvar *g53-mtp* nil
+  "Whether greedy decoding drafts with the MTP layer (G53-SPECULATE).  Off:
+   its guesses are kept 75-90% of the time, but a pass costs about two
+   decode steps (88 ms against 48), most of it the experts, read through
+   from host memory for both tokens' (61 ms against 27 a token) -- a
+   guessed token's experts cost what a decoded one's do -- so it goes about
+   10% slower (18-20 tok/s against 19-22).")
+(defvar *g53-mtp-stats* (list 0 0) "Guesses, guesses kept (for the REPL: reset it to measure).")
+
+(defun g53-cuda-keep-bufs (m st)
+  "Device buffers for KDA's state after a pass's first token: a KDA layer's (hist S)."
+  (or (getf (dk-bufs st) :v-kda-keep)
+      (let ((p (* (g53-kda-heads m) (g53-kda-dim m))) (dev (dk-dev st)))
+        (setf (getf (dk-bufs st) :v-kda-keep)
+              (map 'simple-vector
+                   (lambda (l) (when (eq (gl-kind l) :kda)
+                                 (list (cuda-alloc dev (* 4 9 p) :zero nil) (cuda-alloc dev (* 4 p (g53-kda-dim m)) :zero nil))))
+                   (ds4f-layers m))))))
+
+(defun g53-cuda-pass (ctx tokens)
+  "TOKENS (at most +DV-NT+) at CTX's next positions, every layer at once,
+   decode's products and experts, KDA's state after the first kept aside
+   (G53-CUDA-KEEP-FIRST): each token's logits, a row of N-VOCAB a token.
+   The trunk's streams after each token stay in :P-SA, a row of N-HC x D each."
+  (let* ((m (d4ctx-model ctx)) (st (g53-cuda-state m)) (dev (dk-dev st))
+         (d (ds4f-d m)) (hcd (* (ds4f-n-hc m) d)) (nv (ds4f-n-vocab m)) (pos0 (d4ctx-pos ctx))
+         (n (length tokens)) (tokv (coerce tokens 'simple-vector))
+         (*dk-small* t) (*dk-mapped* (dk-mapped-arena st)) (*g53-keep* (g53-cuda-keep-bufs m st)))
+    (assert (<= n +dv-nt+))
+    (assert (<= (+ pos0 n) (d4ctx-n-ctx ctx)) () "GLM context full (~D tokens)" (d4ctx-n-ctx ctx))
+    (let ((bufs (g53-ctx-dev ctx st)) (sa (pb st :p-sa (* n hcd))) (sb (pb st :p-sb (* n hcd)))
+          (emb (f32vec (* n hcd))) (row (f32vec hcd)) (held '()))
+      (dotimes (i n) (replace emb (g53-embed! m (svref tokv i) row) :start1 (* i hcd)))
+      (cuda-upload-vector sa emb)
+      (let ((ones (f32vec n))) (fill ones 1f0) (cuda-upload-vector (pb st :p-ones n) ones))
+      (let ((sk (f32vec (ds4f-n-head m)))) (fill sk -1f30) (cuda-upload-vector (pb st :p-sinks (length sk)) sk))
+      (dotimes (li (g53-n-trunk m))
+        (let ((l (svref (ds4f-layers m) li)) (b (svref bufs li)))
+          (if (eq (gl-kind l) :kda) (g53p-kda m st l li b n sa sb) (g53p-dsa m st l li b pos0 n sa sb))
+          (if (< li (g53-n-dense m))
+              (g53p-dense-ffn m st l li n sb sa)
+              (progn
+                (dk-ffn-head-chunk m st l li n sb)
+                ;; (it syncs: the layer before is done with its slots, and the mapped arena)
+                (let ((now (dk-ffn-small m st l li n tokv sb sa)))
+                  (dolist (s held) (decf (aref (dk-pin st) s)))
+                  (setf held now (cdr *dk-mapped*) 0))))))
+      (incf (d4ctx-pos ctx) n)
+      ;; the head, each token's
+      (let ((h (pb st :v-hembd (* n d))) (norm (pb st :v-hnorm (* n d))) (out (pb st :v-out (* n nv)))
+            (rows (f32vec (* n nv))))
+        (dotimes (i n)
+          (launch dev "g53_mean" (ceiling d 256) 256 (list d (ds4f-n-hc m) (cons sa (* 4 i hcd)) (cons h (* 4 i d)))))
+        (dk-rms dev h (dvec st (ds4f-output-norm m)) norm d n (ds4f-eps m))
+        (dk-q8mm st "output.weight" norm out n)
+        (sb-sys:with-pinned-objects (rows) (cuda-download out (sb-sys:vector-sap rows) (* 4 n nv)))
+        (cuda-sync dev)
+        (dk-arena-reset st)
+        (dolist (s held) (decf (aref (dk-pin st) s)))
+        rows))))
+
+(defun g53-cuda-keep-first (ctx pos0)
+  "After a pass from POS0, CTX as if only its first token had been taken."
+  (let* ((m (d4ctx-model ctx)) (st (g53-cuda-state m)) (keep (g53-cuda-keep-bufs m st)))
+    (loop for b across (g53-ctx-dev ctx st) for k across keep
+          when k do (cuda-copy-dd (first b) 0 (first k) 0 (dbuf-bytes (first b)))
+                    (cuda-copy-dd (second b) 0 (second k) 0 (dbuf-bytes (second b))))
+    (cuda-sync (dk-dev st))
+    (setf (d4ctx-pos ctx) (1+ pos0))))
+
+(defun g53-cuda-guess (ctx streams token pos)
+  "The MTP layer's guess, from the trunk's STREAMS after POS and TOKEN at
+   POS+1, at the token at POS+2 (its latent at POS cached)."
+  (let* ((m (d4ctx-model ctx)) (st (g53-cuda-state m)) (n (ds4f-n-vocab m)) (v (f32vec n))
+         (out (g53k-mtp m st ctx streams token pos (or (g53ctx-mtp-from ctx) (setf (g53ctx-mtp-from ctx) pos)))))
+    (sb-sys:with-pinned-objects (v) (cuda-download out (sb-sys:vector-sap v) (* 4 n)))
+    (let ((b 0)) (dotimes (i n b) (when (> (aref v i) (aref v b)) (setf b i))))))
+
+(defun g53-cuda-speculate (ctx tok)
+  "TOK at CTX's next position and, when the MTP layer guessed at the token
+   after it, the guess too, through one pass: the guess in a list if TOK's
+   greedy choice is it (CTX past both), else NIL (CTX past TOK); the next
+   guess made either way."
+  (let* ((m (d4ctx-model ctx)) (st (g53-cuda-state m)) (nv (ds4f-n-vocab m)) (pos0 (d4ctx-pos ctx))
+         (hcd (* (ds4f-n-hc m) (ds4f-d m))) (guess (g53ctx-guess ctx)))
+    (flet ((guess (streams token pos)
+             ;; the guess at POS+2, from the streams after POS and TOKEN at POS+1
+             (setf (g53ctx-guess ctx) (list (1+ pos) token (g53-cuda-guess ctx streams token pos)))))
+      (setf (g53ctx-guess ctx) nil)
+      (with-cuda
+        (cuda-current (dk-dev st))
+        (prog1
+            (if (not (and guess (= (first guess) pos0) (= (second guess) tok) (<= (+ pos0 2) (d4ctx-n-ctx ctx))))
+                ;; a token alone, then a guess from it
+                (progn (g53-cuda-forward ctx tok t)
+                       (guess (dbuf-of st :sa 0) (row-argmax (d4ctx-logits ctx) 0 nv) pos0)
+                       '())
+                (let* ((d (third guess)) (rows (g53-cuda-pass ctx (list tok d))) (sa (pb st :p-sa 0))
+                       (n1 (row-argmax rows 0 nv)))
+                  (incf (first *g53-mtp-stats*))
+                  (if (= n1 d)
+                      (progn
+                        (incf (second *g53-mtp-stats*))
+                        (replace (d4ctx-logits ctx) rows :start2 nv :end2 (* 2 nv))
+                        (g53-cuda-guess ctx sa d pos0) ; (its latent at POS0)
+                        (guess (cons sa (* 4 hcd)) (row-argmax rows 1 nv) (1+ pos0))
+                        (list d))
+                      (progn
+                        (g53-cuda-keep-first ctx pos0)
+                        (replace (d4ctx-logits ctx) rows :end2 nv)
+                        (guess sa n1 pos0)
+                        '()))))
+          (g53-maybe-save ctx))))))
+
+(defun g53-speculate (ctx tok more)
+  "For GENERATE (*SPECULATE-HOOKS*): G53-CUDA-SPECULATE's, for a GLM-5.3
+   context on CUDA with its MTP layer and room for a guess; :NO otherwise."
+  (let ((model (context-model ctx)))
+    (unless (and *g53-mtp* (plusp more) (typep (model-impl model) 'g53) (ds4f-cuda-p)
+                 (> (length (ds4f-layers (model-impl model))) (g53-n-trunk (model-impl model))))
+      (return-from g53-speculate :no))
+    (let ((c (ds4f-context ctx)))
+      (unless (= (d4ctx-pos c) (context-pos ctx)) (return-from g53-speculate :no))
+      (prog1 (sb-int:with-float-traps-masked (:overflow :inexact :underflow :invalid) (g53-cuda-speculate c tok))
+        (setf (context-pos ctx) (d4ctx-pos c))))))
+
+(pushnew 'g53-speculate *speculate-hooks*)

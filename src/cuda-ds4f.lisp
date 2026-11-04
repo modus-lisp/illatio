@@ -805,9 +805,10 @@
             (list 1 ff (svref (ds4f-clamps m) li) sg su one smid (car qmid) (cdr qmid)))
     (dk-q8mv st (lname li "ffn_down_shexp.weight") smid sout :q qmid)))
 
-(defun dk-ffn-tail (m st l li plan w sb sa &key round)
+(defun dk-ffn-tail (m st l li plan w sb sa &key round (hc t))
   "Layer LI's routed experts (PLAN's, weights W) on its FFN input, summed
-   with the shared expert, and its FFN's HC post: streams SB into SA.  The
+   with the shared expert, and its FFN's HC post: streams SB into SA (not
+   HC: the sum, :MOE, the result, for a layer of a single stream).  The
    first device's experts' down rows first, then the second's (copied in
    when it is done), summed in the experts' order.  ROUND: the sum and the
    streams to BF16 (V4.1)."
@@ -849,6 +850,7 @@
         (cuda-copy-in bd (* 4 k1 d) (dt-host-out tr) (* 4 k2 d))))
     (launch dev "d4_moe_sum" (ceiling d 256) 256 (list d k bd (dbuf-of st :sout (* 4 d)) moe perm))
     (when round (launch dev "d41_round" (ceiling d 256) 256 (list d moe nil nil)))
+    (unless hc (return-from dk-ffn-tail moe))
     (dk-hc-post m st moe sb (dbuf-of st :pcf (* 4 32)) sa)
     (when round
       (let ((hcd (* (ds4f-n-hc m) d))) (launch dev "d41_round" (ceiling hcd 256) 256 (list hcd sa nil nil))))))

@@ -10,9 +10,13 @@
 Decode ~21 tok/s, prefill ~340 tok/s at 2-4K tokens (glm53.lisp,
 cuda-glm53.lisp): DS4F's pool and tier, KDA and DSA of its own.
 
-- MTP: layer 45 drafts a token ahead (ds4 verifies it in a 2-token batch);
-  the verifying pass would restore KDA's state (G53-SAVE!'s, but on the
-  device: a rejected token's step undone).
+- MTP (G53-SPECULATE, *G53-MTP*, off): the MTP layer's guesses are kept
+  75-90% of the time (greedy, code and prose), but a 2-token pass costs
+  88 ms against decode's 48 -- its experts 61 ms against 27, the misses
+  read through from host memory for each token's -- so it loses ~10%.  It
+  pays once misses are cheap (the CPUs computing them).  The pass's tokens
+  part from plain decoding's after 40-180 tokens (its attention and KDA
+  are the chunk's kernels); its MTP steps could be one 2-row step.
 - Rewinds (G53-REWIND) go back to saved KDA states (~150 MB each, pinned
   host memory): before a prompt's last token and every 512 decoded.  A
   history edited far back goes to the latest save before the edit, often
