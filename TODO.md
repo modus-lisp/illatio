@@ -5,6 +5,22 @@
 - **GLM** (glm4moe): GLM-4.7-Flash, `GLM-4.7-Flash-UD-Q4_K_XL.gguf` on the
   Linux box (`/mnt/ollama/models/hf/glm-4.7-flash/`).
 
+## GLM-5.3 Flash on CUDA
+
+Decode ~21 tok/s, prefill ~340 tok/s at 2-4K tokens (glm53.lisp,
+cuda-glm53.lisp): DS4F's pool and tier, KDA and DSA of its own.
+
+- MTP: layer 45 drafts a token ahead (ds4 verifies it in a 2-token batch);
+  the verifying pass would want KDA's state saved and restored.
+- Rewinds: KDA's state only goes forward.  Snapshots of it (4 MB a layer)
+  every so many tokens would let a context go back to one.
+- Prefill: D4_ATTEND over a float copy of the latents (exact, f32); the
+  tensor cores could take it.  The passes' copies as V4.1's: the P40
+  could compute its own experts.
+- Its dense layers 0-2 get expert slots in the pinned host memory (6 GB
+  never used).
+- Special tokens in a user's text are parsed as such (as llama.cpp does).
+
 ## DS41F (DeepSeek V4.1 Flash) on CUDA
 
 Decode runs (ds41f.lisp, cuda-ds41f.lisp): ~20 t/s on the 3090 + P40

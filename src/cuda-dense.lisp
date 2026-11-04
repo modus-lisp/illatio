@@ -31,6 +31,14 @@
 (defun load-model-cuda (path &key (device 0))
   "The model at PATH run by CUDA device DEVICE: its metadata, tokenizer and
    small vectors read as usual, its matrices copied to the device."
+  ;; DeepSeek and GLM run on CUDA by themselves (cuda-ds4f.lisp, cuda-glm53.lisp)
+  (when (member (meta (read-gguf path) "general.architecture") '("deepseek4" "deepseek41" "glm5-next") :test #'equal)
+    (setf (symbol-value '*ds4f-cuda-device*) device)   ; (defined in cuda-ds4f.lisp, later)
+    (return-from load-model-cuda
+      (let ((m (load-model path)))
+        ;; the device state now (the experts pinned, the weights copied), not at the first token
+        (funcall (if (equal (model-arch m) "glm5-next") 'g53-cuda-state 'ds4f-cuda-state) (model-impl m))
+        m)))
   (let ((m (let ((*matrices-in-file* t)) (load-model path :threads 1))))
     (unless (member (model-arch m) '("qwen2" "qwen3" "llama" "qwen35") :test #'equal)
       (error "the CUDA path runs qwen2, qwen3, llama and qwen35 models; this is ~A" (model-arch m)))

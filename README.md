@@ -32,6 +32,7 @@ comments sit beside the mechanics they explain.
 | a 27B Qwen3.5 | `qwen35`: gated delta net and gated attention | Q6_K | llama.cpp, CPU and Metal |
 | DeepSeek V4 Flash | `deepseek4`: 43 layers, 256 experts, compressed attention | ds4's IQ2_XXS/Q2_K build (86.7 GB) | ds4's CPU reference |
 | DeepSeek V4.1 Flash | `deepseek41`: 40 layers, 384 experts, shared compressed caches, Engram | IQ2_XXS/Q2_K (153 GB of experts) | its CPU reference (from ds4's) |
+| GLM-5.3 Flash | `glm5-next`: 45 layers (KDA and DSA), 288 experts | antirez's Q2 build (96.5 GB) | its CPU reference (from ds4's graph); Z.AI's replies |
 
 ## DeepSeek V4 Flash, from the SSD
 
@@ -115,6 +116,31 @@ one copies a layer's experts while the one before computes, and is bound
 by PCIe below about 3,500 tokens.  A context goes back exactly (the server
 reuses the longest common prefix), and speculative decoding from the
 context is on: text that repeats goes about 1.2x as fast.
+
+## GLM-5.3 Flash on CUDA
+
+GLM-5.3 Flash runs the same way, on the same machinery: DeepSeek V4's
+hyper-connections, expert pool, second-device tier and expert kernels (its
+experts have V4's shape), with its own attention.  Three layers in four are
+KDA, Kimi's delta attention (a 128 x 128 state a head, no cache); every
+fourth is DSA, attention through a 512-wide latent cached in F16, past
+2,051 tokens over only the 512 pools of 4 tokens an indexer picks
+(`src/glm53.lisp`, `src/cuda-glm53.lisp`, `src/cuda/glm53.cu`).  The pools
+start from illatio's own profile of its routing (`src/glm53-hotlist.lisp`):
+about 81% of the experts a token wants are on a device.
+
+| GLM-5.3 Flash (3090 + P40) | |
+|---|---|
+| decode | ~21 tok/s |
+| prefill, 267 / 1,917 / 3,817 tokens | 3.8 s / 5.2 s / 11.3 s |
+| prefill, 12,017 tokens | 38 s (315 tok/s) |
+| decode at 12K tokens of context | 18 tok/s |
+
+Greedy replies to ds4's GLM-5.3 quality prompts read as Z.AI's do (the
+same structure, often their first lines word for word).  The MTP layer
+(a drafted token ahead) is not run yet, and a context does not rewind (KDA's
+state goes forward only): a conversation that changes its history starts
+over.
 
 ## The other models
 
@@ -337,7 +363,7 @@ with FEAT_DotProd; without them the portable kernels run, which are plain
 Common Lisp).  The Metal paths need macOS on Apple silicon; DeepSeek V4 Flash
 wants a 48 GB machine and a fast SSD there.  The CUDA paths need an NVIDIA
 driver (kernels compiled by NVRTC at load; the passes' products sm_80 or
-newer) and host memory for the experts (78 GB for V4, 153 GB for V4.1).  The core system has no dependencies;
+newer) and host memory for the experts (78 GB for V4, 153 GB for V4.1, 92 GB for GLM-5.3).  The core system has no dependencies;
 the OpenAI layer and the server use `json-simple` and `cl-transport`, from
 modus-lisp.
 

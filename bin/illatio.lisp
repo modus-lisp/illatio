@@ -152,7 +152,9 @@ flags:
               #+(and sbcl darwin) (and (getf opts :gpu)
                                        (illatio::gpu-name (illatio::gmodel-gpu (illatio::model-gpu m))))
               #+(and sbcl linux) (and (getf opts :gpu)
-                                      (illatio::cudev-name (illatio::cmodel-dev (illatio::model-cuda m))))
+                                      (if (illatio::model-cuda m)
+                                          (illatio::cudev-name (illatio::cmodel-dev (illatio::model-cuda m)))
+                                          "CUDA, its experts in host memory"))
               #-(or (and sbcl darwin) (and sbcl linux)) nil
               (/ (- (get-internal-real-time) t0) internal-time-units-per-second))
       m)))

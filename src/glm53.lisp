@@ -443,10 +443,13 @@
 
 (defun g53-hotlist (m)
   "The experts the device pools are seeded with, (layer expert) pairs flat:
-   no profile yet, so every MoE layer's in turn, expert by expert."
-  (coerce (loop for e below (ds4f-n-expert m)
-                append (loop for li from (g53-n-dense m) below (g53-n-trunk m) append (list li e)))
-          'simple-vector))
+   the profile's (glm53-hotlist.lisp) for this shape, else every MoE layer's
+   in turn, expert by expert."
+  (if (and (= (g53-n-trunk m) 45) (= (ds4f-n-expert m) 288) (boundp '+glm53-hotlist+))
+      (symbol-value '+glm53-hotlist+)
+      (coerce (loop for e below (ds4f-n-expert m)
+                    append (loop for li from (g53-n-dense m) below (g53-n-trunk m) append (list li e)))
+              'simple-vector)))
 
 (defun load-g53-model (path threads)
   (let* ((d (load-g53 path :threads threads)) (g (ds4f-gguf d)) (v (make-vocab-from-gguf g)))
