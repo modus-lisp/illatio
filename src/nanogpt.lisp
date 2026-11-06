@@ -72,12 +72,19 @@
       (:fcproj ,(* n c) t) (:res3 ,(* n c) t)
       (:lnf ,(* n c) nil) (:rf ,n nil) (:logits ,(* n vp) nil) (:probs ,(* n vp) nil) (:losses ,n nil))))
 
-(defun nanogpt-metal-source ()
+(defun read-nanogpt-metal-source ()
   "Every kernel in src/metal-train/."
   (let ((dir (merge-pathnames "metal-train/" (asdf:system-relative-pathname "illatio" "src/"))))
     (with-output-to-string (o)
       (dolist (f (sort (directory (merge-pathnames "*.metal" dir)) #'string< :key #'namestring))
         (write-string (uiop:read-file-string f) o)))))
+
+(defvar *nanogpt-metal-source* (read-nanogpt-metal-source)
+  "The kernels as they were when this code was loaded: read later, an edit
+   made while a process runs would give its next model kernels its code does
+   not match.")
+
+(defun nanogpt-metal-source () *nanogpt-metal-source*)
 
 (defun make-nanogpt (&key (l 6) (c 384) (v 50257) (vp (* 64 (ceiling v 64))) (b 8) (tt 1024) (cap 30f0)
                           tied (tied-std 0.05f0) (seed 1337) gpu)
