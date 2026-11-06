@@ -29,3 +29,33 @@ Notes:
 - Record 3's steps ran about 4% slower than record 2's (3.30 s against
   3.17 s; same code), so its gain in steps (950 against 1000) is larger than
   its gain in time.  Step times drift by a few percent between runs.
+
+## Reading record 3 by ablation
+
+`ngpt-ablate.lisp` switches components off in record 3's trained weights and
+measures the validation loss (8 batches, 4.215 with everything on).  All 62
+components take under two minutes; retraining without one takes an hour.
+Switching a part off in a trained model is not the same as training without
+it, and zeroing overstates a part whose output has a large mean, so this
+ranks candidates for retraining rather than replacing it.
+
+| Component | Loss without it |
+| --- | --- |
+| Layer 0's MLP | +1.353 |
+| Layer 2's attention | +1.352 |
+| Layer 1's attention | +1.325 |
+| Layer 2's value residual | +0.847 |
+| Layer 0's attention | +0.580 |
+| The U-net skip from layer 2 into 3 | +0.385 |
+| Layer 5's MLP | +0.238 |
+| Layer 4's attention | +0.074 |
+| Each head of layers 3–5 | +0.005 to +0.044 |
+| The U-net skip from layer 0 into 5 | +0.010 |
+| x0's mixing into layers 2 and 5 | +0.003, +0.009 |
+| Layer 1's value residual | +0.002 |
+
+- The early layers carry the model.  Late attention is nearly idle, which
+  suggests cheaper attention there (short windows, as later modded-nanogpt
+  records use): a retraining worth its hour.
+- Some shortcuts barely register in some layers: layer 1's value residual,
+  the longest skip, x0's mixing into layers 2 and 5.
