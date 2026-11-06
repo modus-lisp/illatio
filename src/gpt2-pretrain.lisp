@@ -90,9 +90,9 @@
       (incf (shard-loader-pos ld) n))
     (values (shard-loader-inputs ld) (shard-loader-targets ld))))
 
-(defun fineweb-shards (dir kind)
-  "DIR's fineweb_KIND_*.bin shards (KIND \"train\" or \"val\"), in order."
-  (sort (mapcar #'namestring (directory (merge-pathnames (format nil "fineweb_~A_*.bin" kind)
+(defun fineweb-shards (dir kind &optional (prefix "fineweb"))
+  "DIR's PREFIX_KIND_*.bin shards (KIND \"train\" or \"val\"), in order."
+  (sort (mapcar #'namestring (directory (merge-pathnames (format nil "~A_~A_*.bin" prefix kind)
                                                          (uiop:ensure-directory-pathname dir))))
         #'string<))
 

@@ -32,6 +32,17 @@
                  (incf done n)))))
   vector)
 
+(defun raw-write (fd vector bytes)
+  "Write BYTES bytes of VECTOR (a specialized simple array) to FD."
+  (sb-sys:with-pinned-objects (vector)
+    (let ((sap (sb-sys:vector-sap vector)) (done 0))
+      (loop while (< done bytes)
+            do (multiple-value-bind (n err)
+                   (sb-unix:unix-write fd sap done (min (- bytes done) (ash 1 30)))
+                 (unless (and n (plusp n))
+                   (error "write failed after ~D of ~D bytes (errno ~A)" done bytes err))
+                 (incf done n))))))
+
 (defmacro with-raw-file ((fd path) &body body)
   `(let ((,fd (sb-unix:unix-open (namestring (truename ,path)) sb-unix:o_rdonly 0)))
      (unless ,fd (error "cannot open ~A" ,path))

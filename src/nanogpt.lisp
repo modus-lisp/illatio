@@ -47,15 +47,16 @@
 (defstruct (ngpt (:constructor %make-ngpt))
   gpu (l 0) (nh 0) (c 0) (v 0) (vp 0) (b 0) (tt 0)
   (cap 30f0) (rope-base 10000f0)
+  (tied nil)                             ; the head is the embedding
   params acts                            ; layouts
   pbuf gbuf m1buf m2buf abuf dabuf       ; GPU buffers: parameters, gradients, two moments, acts, their gradients
   inputs targets norm)
 
-(defun ngpt-param-specs (l c vp)
+(defun ngpt-param-specs (l c vp &optional tied)
   ;; the scalars last, each padded to 4 floats: the matrices stay aligned for float4s
   `((:wte ,(* vp c) nil)
     (:qkvw ,(* 3 c c) t) (:projw ,(* c c) t) (:fcw ,(* 4 c c) t) (:fcprojw ,(* 4 c c) t)
-    (:head ,(* vp c) nil)
+    ,@(unless tied `((:head ,(* vp c) nil)))
     (:lambdas 4 t) (:vlamb 4 t) (:skipw ,(* 4 (- l (floor l 2))) nil)))
 
 (defun ngpt-encoders (m) (floor (ngpt-l m) 2))
@@ -77,18 +78,19 @@
       (dolist (f (sort (directory (merge-pathnames "*.metal" dir)) #'string< :key #'namestring))
         (write-string (uiop:read-file-string f) o)))))
 
-(defun make-nanogpt (&key (l 6) (c 384) (v 50257) (vp 50304) (b 8) (tt 1024) (cap 30f0)
-                          (seed 1337) gpu)
+(defun make-nanogpt (&key (l 6) (c 384) (v 50257) (vp (* 64 (ceiling v 64))) (b 8) (tt 1024) (cap 30f0)
+                          tied (tied-std 0.05f0) (seed 1337) gpu)
   "A model of L layers, C channels (C/64 heads), for steps of B rows of TT
-   tokens, initialized: the embedding N(0, 1)... as modded-nanogpt's: the
-   embedding N(0,1), QKV and the MLP's input uniform +-sqrt(3/C) (std
-   1/sqrt(C)), the projections into the residual stream and the head 0."
+   tokens, initialized as modded-nanogpt's: the embedding N(0,1), QKV and
+   the MLP's input N(0, 1/C), the projections into the residual stream and
+   the head 0.  TIED: the head is the embedding, N(0, TIED-STD^2) (it is read
+   through an RMS norm, but the head's logits are not)."
   (assert (zerop (mod c 64)))
   (let* ((nh (floor c 64)) (gpu (or gpu (open-gpu (nanogpt-metal-source))))
-         (pl (make-layout (ngpt-param-specs l c vp) l))
+         (pl (make-layout (ngpt-param-specs l c vp tied) l))
          (al (make-layout (ngpt-act-specs b tt c nh vp) l))
          (np (layout-total pl)) (na (layout-total al))
-         (m (%make-ngpt :gpu gpu :l l :nh nh :c c :v v :vp vp :b b :tt tt :cap cap
+         (m (%make-ngpt :gpu gpu :l l :nh nh :c c :v v :vp vp :b b :tt tt :cap cap :tied tied
                         :params pl :acts al
                         :pbuf (gpu-buffer gpu (* 4 np)) :gbuf (gpu-buffer gpu (* 4 np))
                         :m1buf (gpu-buffer gpu (* 4 np)) :m2buf (gpu-buffer gpu (* 4 np))
@@ -99,7 +101,7 @@
     (flet ((fill-normal (name std count)
              (let ((o (lof pl name)))
                (dotimes (k count) (setf (aref p (+ o k)) (* std (funcall gauss)))))))
-      (fill-normal :wte 1f0 (* v c))
+      (fill-normal :wte (if tied tied-std 1f0) (* v c))
       (fill-normal :qkvw (/ 1f0 (sqrt (coerce c 'single-float))) (lsize pl :qkvw l))
       (fill-normal :fcw (/ 1f0 (sqrt (coerce c 'single-float))) (lsize pl :fcw l))
       (dotimes (li l)
@@ -108,6 +110,8 @@
     (copy-to-gbuf (ngpt-pbuf m) p)
     (setf (sb-sys:sap-ref-single (gbuf-sap (ngpt-norm m)) 0) 1f0)
     m))
+
+(defun ngpt-head (m) (if (ngpt-tied m) :wte :head))
 
 (defun ngpt-n-params (m) (layout-total (ngpt-params m)))
 
@@ -119,29 +123,18 @@
 ;;; --- checkpoints --------------------------------------------------------------
 ;;;
 ;;; llm.c's shape: a 1024-byte header of int32s (magic, version, L, C, V, VP,
-;;; the softcap's bits, the parameter count), then the parameters as f32s in
+;;; the softcap's bits, the parameter count, 1 if the head is the embedding), then the parameters as f32s in
 ;;; the layout's order.  The optimizer's moments are not kept: a checkpoint is
 ;;; for reading and editing, not for resuming.
 
 (defconstant +ngpt-magic+ 20261106)
-
-(defun raw-write (fd vector bytes)
-  "Write BYTES bytes of VECTOR (a specialized simple array) to FD."
-  (sb-sys:with-pinned-objects (vector)
-    (let ((sap (sb-sys:vector-sap vector)) (done 0))
-      (loop while (< done bytes)
-            do (multiple-value-bind (n err)
-                   (sb-unix:unix-write fd sap done (min (- bytes done) (ash 1 30)))
-                 (unless (and n (plusp n))
-                   (error "write failed after ~D of ~D bytes (errno ~A)" done bytes err))
-                 (incf done n))))))
 
 (defun ngpt-save (m path)
   "Write M's parameters to PATH."
   (let ((h (make-array 256 :element-type '(signed-byte 32) :initial-element 0))
         (v (ngpt-params-vector m)))
     (replace h (list +ngpt-magic+ 1 (ngpt-l m) (ngpt-c m) (ngpt-v m) (ngpt-vp m)
-                     (sb-kernel:single-float-bits (ngpt-cap m)) (length v)))
+                     (sb-kernel:single-float-bits (ngpt-cap m)) (length v) (if (ngpt-tied m) 1 0)))
     (ensure-directories-exist path)
     (let ((fd (sb-unix:unix-open (namestring (merge-pathnames path))
                                  (logior sb-unix:o_wronly sb-unix:o_creat sb-unix:o_trunc) #o644)))
@@ -155,7 +148,8 @@
   (with-raw-file (fd path)
     (let* ((h (read-header fd +ngpt-magic+))
            (m (make-nanogpt :l (aref h 2) :c (aref h 3) :v (aref h 4) :vp (aref h 5)
-                            :cap (sb-kernel:make-single-float (aref h 6)) :b b :tt tt :gpu gpu))
+                            :cap (sb-kernel:make-single-float (aref h 6)) :tied (= 1 (aref h 8))
+                            :b b :tt tt :gpu gpu))
            (v (f32vec (aref h 7))))
       (assert (= (length v) (ngpt-n-params m)))
       (raw-read fd v (* 4 (length v)))
@@ -219,7 +213,7 @@
             (linear (a :fcproj li) (a :fca li) (p :fcprojw li) (* 4 c) c)
             (g2-1d gpu e "g2_add" (* n c) '() (list (a :res3 li) (a :res2 li) (a :fcproj li)))))
         (rms (a :lnf) (a :rf) (a :res3 (1- l)))
-        (linear (a :logits) (a :lnf) (p :head) c (ngpt-vp m) :head)
+        (linear (a :logits) (a :lnf) (p (ngpt-head m)) c (ngpt-vp m) :head)
         (if dloss
             (dispatch gpu e "ng_softcap_ce_fused" (list n (ngpt-v m) (ngpt-vp m) dloss (ngpt-cap m))
                       (list (a :logits) (da :logits) (ngpt-targets m) (a :losses)) n 1024 :shared 256)
@@ -248,7 +242,8 @@
                     (list (da :logits) (a :probs) (ngpt-targets m) (a :logits))
                     (list (ceiling vp 256) n) (list 256 1)))
         ;; IN for LINEAR-BACK: (where the input's gradient goes . the input)
-        (linear-back (da :logits) (cons (da :lnf) (a :lnf)) (p :head) (g :head) c vp :head)
+        ;; tied, the head's gradient is the embedding's first writer; the scatter adds to it
+        (linear-back (da :logits) (cons (da :lnf) (a :lnf)) (p (ngpt-head m)) (g (ngpt-head m)) c vp :head)
         (rms-back (da :res3 (1- l)) (da :lnf) (a :res3 (1- l)) (a :rf) nil)
         (loop for li from (1- l) downto 0
               do (let* ((enc (ngpt-encoders m)) (dec (>= li enc)) (j (- li enc))
@@ -304,7 +299,7 @@
                          (g2-1d gpu e "ng_scaled" (* n c) '() (list (da :skip k) dprev (p :skipw 0 (* 4 j)))))))))
         ;; x0 = rms(emb)
         (rms-back (da :emb) (da :x0acc) (a :emb) (a :r0) nil)
-        (unless accumulate
+        (unless (or accumulate (ngpt-tied m))
           (g2-1d gpu e "g2_zero" (lsize pl :wte) '() (list (g :wte))))
         (dispatch gpu e "ng_embed_bwd" (list n c) (list (ngpt-inputs m) (g :wte) (da :emb))
                   (ceiling c 256) 256)))))

@@ -51,7 +51,7 @@
 (defun ngpt-encode-update (m e step &key (muon-lr 0.04f0) (mu 0.95f0) (embed-lr 0.6f0) (head-lr 0.008f0)
                                       (scalar-lr 0.04f0) (beta1 0.9f0) (beta2 0.95f0) (eps 1f-8))
   "One optimizer step: Muon for the hidden matrices, Adam for the embedding,
-   the head and the scalars."
+   the head and the scalars.  Tied, the embedding is the head, at EMBED-LR."
   (with-ngpt (m)
     (let ((c (ngpt-c m)) (c1 (- 1f0 (expt beta1 step))) (c2 (- 1f0 (expt beta2 step))))
       (flet ((m1 (name &optional (li 0) (plus 0)) (cons (ngpt-m1buf m) (* 4 (+ plus (lof pl name li)))))
@@ -63,8 +63,9 @@
           (encode-muon-matrix m e c c (p :projw li) (g :projw li) (m1 :projw li) muon-lr mu)
           (encode-muon-matrix m e (* 4 c) c (p :fcw li) (g :fcw li) (m1 :fcw li) muon-lr mu)
           (encode-muon-matrix m e c (* 4 c) (p :fcprojw li) (g :fcprojw li) (m1 :fcprojw li) muon-lr mu))
-        (loop for (name lr) in (list* (list :wte embed-lr) (list :head head-lr)
-                                      (mapcar (lambda (s) (list s scalar-lr)) *ngpt-scalars*))
+        (loop for (name lr) in (list* (list :wte embed-lr)
+                                      (append (unless (ngpt-tied m) (list (list :head head-lr)))
+                                      (mapcar (lambda (s) (list s scalar-lr)) *ngpt-scalars*)))
               do (g2-1d gpu e "g2_adamw" (lsize pl name (ngpt-l m))
                         (list lr beta1 beta2 eps 0f0 c1 c2)
                         (list (p name) (g name) (m1 name) (cons (ngpt-m2buf m) (* 4 (lof pl name)))
@@ -84,17 +85,19 @@
       (multiple-value-bind (x y) (shard-next ld) (incf s (ngpt-loss m x y))))))
 
 (defun nanogpt-train (&key (data (merge-pathnames "workspace/modded-nanogpt/data/fineweb10B/" (user-homedir-pathname)))
+                           (prefix "fineweb") (v 50257) tied (tied-std 0.05f0)
                            (l 6) (c 384) (b 8) (tt 1024) (accum 8) (steps 1000) (warmup 0) (warmdown 0.3)
                            (muon-lr 0.04f0) (embed-lr 0.6f0) (head-lr 0.008f0) (scalar-lr 0.04f0) (adam-beta1 0.9f0) (momentum-warmup 500)
                            (cap 30f0) (val-every 50) (val-batches 16) (target nil) (stop-at-target t) (seed 1337)
                            (model nil) (save nil) (out *standard-output*))
-  "Train the speedrun's model on FineWeb: STEPS steps of ACCUM micro-batches
+  "Train the speedrun's model on FineWeb (or DATA's PREFIX_{train,val}_*.bin
+   shards of a V-token vocabulary; TIED, the head the embedding): STEPS steps of ACCUM micro-batches
    of B x TT tokens.  Notes when the validation loss reaches TARGET, and
    stops there if STOP-AT-TARGET.  Writes the model to SAVE at the end.  The model."
   (let* ((*g2-precision* '((:head . "_b") (:attention . "_b") (:linear . "_b")))
-         (m (or model (make-nanogpt :l l :c c :b b :tt tt :cap cap :seed seed)))
-         (train (make-shard-loader (fineweb-shards data "train") b tt))
-         (val (fineweb-shards data "val"))
+         (m (or model (make-nanogpt :l l :c c :v v :b b :tt tt :cap cap :tied tied :tied-std tied-std :seed seed)))
+         (train (make-shard-loader (fineweb-shards data "train" prefix) b tt))
+         (val (fineweb-shards data "val" prefix))
          (tokens (* b tt accum)) (t-start (get-internal-real-time)) (train-ms 0))
     (format out "~:D parameters, ~D layers x ~D channels; ~:D tokens a step (~D x ~D x ~D)~%"
             (ngpt-n-params m) (ngpt-l m) (ngpt-c m) tokens accum b tt)

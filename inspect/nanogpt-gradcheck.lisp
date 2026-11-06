@@ -8,6 +8,7 @@
 ;;; f32.  The step is 4e-2 along a matrix's direction, 1e-2 along the scalars'
 ;;; (their curvature is larger), the loss summed in double.  For each tensor, a random unit direction U in it:
 ;;; the gradient's component along U against (L(p + eU) - L(p - eU)) / 2e.
+;;; ILLATIO_NGPT_TIED=1: the head tied to the embedding.
 
 (defvar cl-user::*system* "illatio/train")
 (load (merge-pathnames "load.lisp" (or *load-truename* *default-pathname-defaults*)))
@@ -15,7 +16,8 @@
 
 (let* ((*g2-precision* '((:head . "") (:attention . "") (:linear . "")))
        (b 2) (tt 160) (v 256)
-       (m (make-nanogpt :l 2 :c 128 :v v :vp v :b b :tt tt :cap 30f0))
+       (tied (equal (uiop:getenv "ILLATIO_NGPT_TIED") "1"))
+       (m (make-nanogpt :l 2 :c 128 :v v :vp v :b b :tt tt :cap 30f0 :tied tied))
        (np (ngpt-n-params m)) (gauss (gaussian-filler 7))
        (p (f32vec np)) (x (make-array (* b tt) :element-type '(signed-byte 32)))
        (y (make-array (* b tt) :element-type '(signed-byte 32)))
