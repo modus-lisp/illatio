@@ -653,7 +653,8 @@
   (let* ((close (and thinking (search "</think>" text)))
          (reasoning (cond (close (subseq text 0 close)) (thinking text) (t nil)))
          (rest (cond (close (subseq text (+ close 8))) (thinking "") (t text)))
-         (start (search "<｜DSML｜tool_calls>" rest))
+         ;; the tag without its '>': a quantized model may write <｜DSML｜tool_calls">
+         (start (search "<｜DSML｜tool_calls" rest))
          (content (string-trim '(#\Space #\Newline #\Tab #\Return) (subseq rest 0 (or start (length rest)))))
          (calls '()))
     (when start
@@ -698,7 +699,7 @@
                                       (progn (write-char (char out i) o) (incf i)))))))
     out))
 
-(defun make-ds4f-stream-filter (emit-content emit-reasoning thinking &key (call-tag "<｜DSML｜tool_calls>"))
+(defun make-ds4f-stream-filter (emit-content emit-reasoning thinking &key (call-tag "<｜DSML｜tool_calls"))
   "A text sink for a DeepSeek (or GLM) reply: reasoning (when THINKING, up
    to </think>) to EMIT-REASONING, then content to EMIT-CONTENT until a
    tool-call block (CALL-TAG) starts (the calls are sent whole once the
