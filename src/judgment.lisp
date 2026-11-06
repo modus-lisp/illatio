@@ -76,7 +76,11 @@
    cut after the same sentence at or after its break.  SHUFFLE: the answer
    by another coin, not by the story (arm E).  NIL if it does not fit TT."
   (let* ((pool (jdata-pool jd))
-         (n (or (position-if (lambda (e) (> (svref e 3) max-distance)) pool) (length pool)))
+         (n (let ((lo 0) (hi (length pool)))  ; the pairs no farther than MAX-DISTANCE: the pool is sorted
+              (loop while (< lo hi)
+                    do (let ((mid (floor (+ lo hi) 2)))
+                         (if (> (svref (svref pool mid) 3) max-distance) (setf hi mid) (setf lo (1+ mid)))))
+              lo))
          (e (svref pool (funcall rng (max 1 n))))
          (p (pool-pair jd e))
          (corrupt (zerop (funcall rng 2)))
