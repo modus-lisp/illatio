@@ -100,6 +100,9 @@ once into pinned host memory on the GPUs' own NUMA node; the 3090 keeps a
 pool of them by least recent use, the P40 a fixed tier of the most used
 (computed there), and the rest are read through PCIe as they are wanted.
 V4.1's Engram tables want to be in memory (`/dev/shm`, `*ds41f-engram-file*`).
+The experts are kept there too, laid out for the copies (`*expert-cache-dir*`):
+the first start reads them from the model (an hour from a busy disk), later
+ones map and pin them where they lie (71 s to serving), one copy in memory.
 
 | DeepSeek V4.1 Flash | |
 |---|---|
