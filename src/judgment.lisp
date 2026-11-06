@@ -70,11 +70,13 @@
 
 ;;; --- rows ---------------------------------------------------------------------------
 
-(defun verdict-example (jd max-distance tt rng &key shuffle)
+(defun verdict-example (jd max-distance tt rng &key shuffle label)
   "A verdict example's tokens and the index of its answer: a pair from the
    pool no farther than MAX-DISTANCE characters, intact or corrupt by a coin,
    cut after the same sentence at or after its break.  SHUFFLE: the answer
-   by another coin, not by the story (arm E).  NIL if it does not fit TT."
+   by another coin, not by the story (arm E).  LABEL, if given, decides the
+   answer instead: a function of the story's tokens and whether it is the
+   corrupt one, true for yes (for sanity checks).  NIL if it does not fit TT."
   (let* ((pool (jdata-pool jd))
          (n (let ((lo 0) (hi (length pool)))  ; the pairs no farther than MAX-DISTANCE: the pool is sorted
               (loop while (< lo hi)
@@ -86,20 +88,22 @@
          (corrupt (zerop (funcall rng 2)))
          (texts (verdict-texts p (make-rng (+ 7 (svref e 2) (funcall rng 1000)))))
          (story (dense-tokens jd (if corrupt (cdr texts) (car texts))))
-         (answer (if (if shuffle (zerop (funcall rng 2)) corrupt) (jdata-no jd) (jdata-yes jd))))
+         (answer (cond ((and label story) (if (funcall label story corrupt) (jdata-yes jd) (jdata-no jd)))
+                       ((if shuffle (zerop (funcall rng 2)) corrupt) (jdata-no jd))
+                       (t (jdata-yes jd)))))
     (when (and story (<= (+ (length story) (length (jdata-suffix jd)) 2) (1+ tt)))
       (let ((tokens (concatenate '(simple-array (signed-byte 32) (*))
                                  story (jdata-suffix jd) answer
                                  (vector (story-vocab-eot (jdata-sv jd))))))
         (values tokens (- (length tokens) 2))))))
 
-(defun verdict-row (jd tt max-distance weight rng &key shuffle)
+(defun verdict-row (jd tt max-distance weight rng &key shuffle label)
   "TT + 1 tokens of whole verdict examples and their weights (WEIGHT where an
    answer is the target)."
   (let ((row (make-array (1+ tt) :element-type '(signed-byte 32) :initial-element (story-vocab-eot (jdata-sv jd))))
         (w (f32vec tt)) (at 0))
     (loop repeat 50
-          do (multiple-value-bind (tokens answer) (verdict-example jd max-distance tt rng :shuffle shuffle)
+          do (multiple-value-bind (tokens answer) (verdict-example jd max-distance tt rng :shuffle shuffle :label label)
                (when tokens
                  (if (> (+ at (length tokens)) (1+ tt))
                      (return)
@@ -129,7 +133,7 @@
     (values x y w)))
 
 (defun judgment-batches (jd b tt &key (verdict-share (constantly 0)) (verdict-weight 1f0)
-                                      (distance (constantly most-positive-fixnum)) shuffle (seed 3))
+                                      (distance (constantly most-positive-fixnum)) shuffle label (seed 3))
   "A BATCHES function for nanogpt-train: each of B rows is a verdict row with
    probability (VERDICT-SHARE progress), else a next-token row; a verdict row's
    breaks are no farther than (DISTANCE progress) characters.  Progress is
@@ -140,7 +144,7 @@
              (rows (loop repeat b
                          collect (if (< (funcall rng 1000000) (* share 1000000))
                                      (multiple-value-bind (row w)
-                                         (verdict-row jd tt (funcall distance progress) verdict-weight rng :shuffle shuffle)
+                                         (verdict-row jd tt (funcall distance progress) verdict-weight rng :shuffle shuffle :label label)
                                        (cons row w))
                                      (cons (stream-row jd tt) nil)))))
         (rows-batch rows tt)))))
@@ -201,3 +205,38 @@
                                (incf right (let ((d (- (aref ll (* 2 i)) (aref ll (1+ (* 2 i))))))
                                              (cond ((plusp d) 1) ((zerop d) 1/2) (t 0)))))
                     (cons kind (coerce (/ right (max 1 n)) 'single-float))))))
+
+(defun verdict-accuracy (m jd pairs)
+  "The share of PAIRS' stories (both of each, whole) for which M, asked
+   \"Coherent?\", finds the right answer likelier than the wrong one: for
+   each kind, an alist.  Two passes over the same inputs, the answer
+   position's target yes in one and no in the other."
+  (let* ((b (ngpt-b m)) (tt (ngpt-tt m)) (eot (story-vocab-eot (jdata-sv jd)))
+         (yes (aref (jdata-yes jd) 0)) (no (aref (jdata-no jd) 0))
+         (items (loop for (kind a c) in pairs
+                      collect (list kind a yes) collect (list kind c no)))
+         (losses (f32vec (* b tt))) (right (make-hash-table)) (n (make-hash-table)))
+    (ngpt-set-weights m nil)
+    (loop for start from 0 below (length items) by b
+          do (let ((x (make-array (* b tt) :element-type '(signed-byte 32) :initial-element eot))
+                   (y (make-array (* b tt) :element-type '(signed-byte 32) :initial-element eot))
+                   (at '()))
+               (loop for (kind s) in (subseq items start (min (length items) (+ start b))) for r from 0
+                     do (let* ((tokens (concatenate '(simple-array (signed-byte 32) (*)) s (jdata-suffix jd)))
+                               (len (length tokens)) (keep (min len (- tt 1))) (from (- len keep)))
+                          ;; the story's end and the question: input eot then the last KEEP tokens
+                          (replace x tokens :start1 (1+ (* r tt)) :start2 from)
+                          (replace y tokens :start1 (* r tt) :start2 from)
+                          (push (+ (* r tt) keep) at)))
+               (setf at (nreverse at))
+               (flet ((answer-losses (target)
+                        (dolist (i at) (setf (aref y i) target))
+                        (ngpt-loss m x y)
+                        (copy-from-gbuf (ngpt-abuf m) losses (lof (ngpt-acts m) :losses))
+                        (mapcar (lambda (i) (aref losses i)) at)))
+                 (loop for ly in (answer-losses yes) for ln in (answer-losses no)
+                       for (kind nil truth) in (subseq items start)
+                       do (incf (gethash kind n 0))
+                          (when (if (= truth yes) (< ly ln) (< ln ly)) (incf (gethash kind right 0)))))))
+    (loop for kind in (remove-duplicates (mapcar #'first pairs))
+          collect (cons kind (coerce (/ (gethash kind right 0) (max 1 (gethash kind n 0))) 'single-float)))))
