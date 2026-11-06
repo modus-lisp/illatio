@@ -108,8 +108,8 @@
           do (cond ((< b #x80) (return n))                     ; ascii: complete
                    ((>= b #xc0)                                 ; a lead byte
                     (let ((need (cond ((>= b #xf0) 4) ((>= b #xe0) 3) (t 2))))
-                      (return (if (>= back need) n (- n back)))))))
-    n))
+                      (return (if (>= back need) n (- n back))))))
+          finally (return n))))
 
 ;;; --- generation -------------------------------------------------------------
 

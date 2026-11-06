@@ -42,6 +42,11 @@
 
 (defun pyjson (x) (with-output-to-string (s) (write-pyjson x s)))
 
+(defvar *reasoning-inline* nil
+  "When true, a reply's reasoning is in its content as <think>...</think>
+   rather than in reasoning_content (llama-server's --reasoning-format
+   none): for clients that show only content.")
+
 (defun jget (obj &rest keys)
   (loop for k in keys
         while (hash-table-p obj)
@@ -332,7 +337,9 @@
            (glm (equal (model-arch m) "glm5-next"))
            (prompt (render-chat m (jget req "messages") (jget req "tools") :thinking thinking))
            (ids (tokenize m prompt))
-           (max (or (jget req "max_completion_tokens") (jget req "max_tokens") (engine-max-tokens engine)))
+           (max (let ((n (or (jget req "max_completion_tokens") (jget req "max_tokens") (engine-max-tokens engine))))
+                  ;; -1 (llama.cpp's web UI) or 0: no limit but the context's room
+                  (if (and (integerp n) (plusp n)) n (max 1 (- (context-n-ctx ctx) (length ids))))))
            (t0 (get-internal-real-time))
            (t1 nil))
       (multiple-value-bind (text out reason reused)
@@ -357,7 +364,9 @@
                                      "message" (let ((msg (hobj "role" "assistant" "content" content)))
                                                  (when calls (setf (gethash "tool_calls" msg) (coerce calls 'vector)))
                                                  (when (and reasoning (plusp (length reasoning)))
-                                                   (setf (gethash "reasoning_content" msg) reasoning))
+                                                   (if *reasoning-inline*
+                                                       (setf (gethash "content" msg) (format nil "<think>~A</think>~A" reasoning (or content "")))
+                                                       (setf (gethash "reasoning_content" msg) reasoning)))
                                                  msg)
                                      "finish_reason" (cond (calls "tool_calls")
                                                            ((eq reason :length) "length")
@@ -407,23 +416,32 @@
 (defun chat-completion-chunks (engine req on-chunk)
   "Answer REQ as CHAT-COMPLETION does, calling ON-CHUNK with each
    chat.completion.chunk object as the reply is generated: content deltas,
-   then any tool calls, then the finish reason, then usage and timings.
-   Returns the complete response object as well."
+   then any tool calls, then the finish reason with usage and timings (as
+   llama-server sends them), then, if stream_options.include_usage, a
+   chunk of usage alone (as OpenAI does).  Returns the complete response
+   object as well."
   (let* ((id (fresh-id "chatcmpl-"))
          (name (model-name (engine-model engine)))
          (sent-role nil)
-         (emit (lambda (text)
+         (thinking nil)                 ; inside an inline <think>
+         (emit-content (lambda (text)
                  (funcall on-chunk
                           (chunk-object id name (if sent-role
                                                     (hobj "content" text)
                                                     (progn (setf sent-role t)
                                                            (hobj "role" "assistant" "content" text)))))))
+         (emit (lambda (text)
+                 (when thinking (setf thinking nil text (concatenate 'string "</think>" text)))
+                 (funcall emit-content text)))
          (emit-reasoning (lambda (text)
-                           (funcall on-chunk
-                                    (chunk-object id name (if sent-role
-                                                              (hobj "reasoning_content" text)
-                                                              (progn (setf sent-role t)
-                                                                     (hobj "role" "assistant" "reasoning_content" text)))))))
+                           (if *reasoning-inline*
+                               (progn (unless thinking (setf thinking t text (concatenate 'string "<think>" text)))
+                                      (funcall emit-content text))
+                               (funcall on-chunk
+                                        (chunk-object id name (if sent-role
+                                                                  (hobj "reasoning_content" text)
+                                                                  (progn (setf sent-role t)
+                                                                         (hobj "role" "assistant" "reasoning_content" text))))))))
          (resp (chat-completion engine req
                                 :on-text (cond ((member (model-arch (engine-model engine)) '("deepseek4" "deepseek41") :test #'equal)
                                                 (make-ds4f-stream-filter emit emit-reasoning (request-thinking req)))
@@ -442,10 +460,14 @@
                                                   (hobj "index" i "id" (jget c "id") "type" "function"
                                                         "function" (jget c "function")))
                                         calls (loop for i below (length calls) collect i))))))
-    (funcall on-chunk (chunk-object id name (hobj) (jget choice "finish_reason")))
-    (funcall on-chunk (hobj "id" id "object" "chat.completion.chunk" "model" name
-                            "choices" (vector) "usage" (jget resp "usage")
-                            "timings" (jget resp "timings")))
+    (when thinking (funcall emit-content "</think>"))
+    (let ((last (chunk-object id name (hobj) (jget choice "finish_reason"))))
+      (setf (gethash "usage" last) (jget resp "usage") (gethash "timings" last) (jget resp "timings"))
+      (funcall on-chunk last))
+    (when (jget req "stream_options" "include_usage")
+      (funcall on-chunk (hobj "id" id "object" "chat.completion.chunk" "model" name
+                              "choices" (vector) "usage" (jget resp "usage")
+                              "timings" (jget resp "timings"))))
     resp))
 
 ;;; --- DeepSeek V4 Flash: its chat format, as ds4's server renders it ----------------

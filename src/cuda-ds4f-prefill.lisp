@@ -96,8 +96,12 @@
   "Y = W X over N tokens for F16 tensor NAME (or a BF16 or F32 one: GLM's,
    their products exact, f32)."
   (destructuring-bind (w rows cols &optional type) (or (gethash name (dk-f16 st)) (error "no F16 tensor ~A" name))
-    (cond ((member type '(:bf16 :f32))
-           (assert (not *dk-small*))
+    (cond ((and *dk-small* (member type '(:bf16 :f32)))
+           ;; decode's matvec a token at a time: its sums exactly
+           (dotimes (i n)
+             (launch (dk-dev st) (if (eq type :bf16) "g53_mv_bf16" "d41_mv_f32") (ceiling rows 4) 256
+                     (list cols rows w (cons x (* 4 i (getf keys :x-stride cols))) (cons y (* 4 i (or y-stride rows)))))))
+          ((member type '(:bf16 :f32))
            (launch (dk-dev st) (if (eq type :bf16) "g53_mm_bf16" "d41_mm_f32") (list (ceiling n 64) (ceiling rows 64)) 256
                    (list cols rows n (getf keys :x-stride cols) (or y-stride rows) w x y)))
           (*dk-small*
