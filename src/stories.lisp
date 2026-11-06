@@ -13,7 +13,7 @@
 
 (in-package #:illatio)
 
-(defparameter *verdict-strings* '("\nCoherent?" " yes" " no")
+(defparameter *verdict-strings* (list (format nil "~%Coherent?") " yes" " no")
   "What a verdict example appends to a story; its ids are always kept.")
 
 (defun map-stories (path fn &key (max nil))
@@ -116,15 +116,15 @@
 
 (defun prepare-stories (&key (dir (merge-pathnames "workspace/data/tinystories/" (user-homedir-pathname)))
                              (teacher (merge-pathnames "models/qwen2.5-0.5b-instruct-q8_0.gguf" (user-homedir-pathname)))
-                             (train-tokens 25000000) (out *standard-output*))
+                             (train-tokens 25000000) (subdir "qwen/") (out *standard-output*))
   "Tokenize TinyStories V2 (GPT-4) with TEACHER's tokenizer: the first
    TRAIN-TOKENS tokens of the training stories and all the validation ones.
-   Writes DIR/qwen/stories_{train,val}_000.bin and vocab.bin.  The vocabulary."
+   Writes DIR/SUBDIR/stories_{train,val}_000.bin and vocab.bin.  The vocabulary."
   (let* ((vocab (make-vocab-from-gguf (read-gguf teacher)))
          (train (tokenize-stories vocab (merge-pathnames "TinyStoriesV2-GPT4-train.txt" dir) :max-tokens train-tokens))
          (val (tokenize-stories vocab (merge-pathnames "TinyStoriesV2-GPT4-valid.txt" dir)))
          (sv (make-story-vocab vocab (list train val)))
-         (qdir (merge-pathnames "qwen/" dir)))
+         (qdir (merge-pathnames subdir dir)))
     (ensure-directories-exist qdir)
     (let ((tr (pack-stories sv train)) (va (pack-stories sv val)))
       (write-token-shard (merge-pathnames "stories_train_000.bin" qdir) tr)

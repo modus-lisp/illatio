@@ -80,6 +80,7 @@
           (t (/ (- steps step) down)))))
 
 (defun ngpt-val-loss (m files batches)
+  (ngpt-set-weights m nil)
   (let ((ld (make-shard-loader files (ngpt-b m) (ngpt-tt m))) (s 0d0))
     (dotimes (i batches (/ s batches))
       (multiple-value-bind (x y) (shard-next ld) (incf s (ngpt-loss m x y))))))
@@ -89,14 +90,19 @@
                            (l 6) (c 384) (b 8) (tt 1024) (accum 8) (steps 1000) (warmup 0) (warmdown 0.3)
                            (muon-lr 0.04f0) (embed-lr 0.6f0) (head-lr 0.008f0) (scalar-lr 0.04f0) (adam-beta1 0.9f0) (momentum-warmup 500)
                            (cap 30f0) (val-every 50) (val-batches 16) (target nil) (stop-at-target t) (seed 1337)
-                           (model nil) (save nil) (out *standard-output*))
+                           (model nil) (save nil) batches report (out *standard-output*))
   "Train the speedrun's model on FineWeb (or DATA's PREFIX_{train,val}_*.bin
    shards of a V-token vocabulary; TIED, the head the embedding): STEPS steps of ACCUM micro-batches
    of B x TT tokens.  Notes when the validation loss reaches TARGET, and
-   stops there if STOP-AT-TARGET.  Writes the model to SAVE at the end.  The model."
+   stops there if STOP-AT-TARGET.  Writes the model to SAVE at the end.
+   BATCHES, if given, supplies the micro-batches instead of the training
+   shards: a function of the step and STEPS giving inputs, targets and loss
+   weights (NIL: every position alike); the objective is the weighted sum
+   over the step's tokens.  REPORT, if given, is called with the model at
+   each validation and returns a string for the log.  The model."
   (let* ((*g2-precision* '((:head . "_b") (:attention . "_b") (:linear . "_b")))
          (m (or model (make-nanogpt :l l :c c :v v :b b :tt tt :cap cap :tied tied :tied-std tied-std :seed seed)))
-         (train (make-shard-loader (fineweb-shards data "train" prefix) b tt))
+         (train (unless batches (make-shard-loader (fineweb-shards data "train" prefix) b tt)))
          (val (fineweb-shards data "val" prefix))
          (tokens (* b tt accum)) (t-start (get-internal-real-time)) (train-ms 0))
     (format out "~:D parameters, ~D layers x ~D channels; ~:D tokens a step (~D x ~D x ~D)~%"
@@ -105,8 +111,8 @@
       (dotimes (step (1+ steps))
         (when (or (= step steps) (and (plusp val-every) (zerop (mod step val-every))))
           (let ((vl (ngpt-val-loss m val val-batches)))
-            (format out "step ~D: val loss ~,4F  train time ~,1F s  tokens ~:D~%"
-                    step vl (/ train-ms 1000.0) (* step tokens))
+            (format out "step ~D: val loss ~,4F  train time ~,1F s  tokens ~:D~@[  ~A~]~%"
+                    step vl (/ train-ms 1000.0) (* step tokens) (and report (funcall report m)))
             (finish-output out)
             (when (and target (<= vl target))
               (format out "target ~,3F reached at step ~D, ~,1F s of training~%" target step (/ train-ms 1000.0))
@@ -117,7 +123,9 @@
                 (k (coerce (trapezoid step steps warmup warmdown) 'single-float))
                 (frac (min 1 (/ step (max 1 momentum-warmup)))))
             (dotimes (i accum)
-              (multiple-value-bind (x y) (shard-next train) (ngpt-set-batch m x y))
+              (multiple-value-bind (x y w) (if batches (funcall batches step steps) (shard-next train))
+                (ngpt-set-batch m x y)
+                (ngpt-set-weights m w))
               (with-gpu-work (e (ngpt-gpu m))
                 (ngpt-encode-forward m e :dloss (/ 1f0 tokens))
                 (ngpt-encode-backward m e :accumulate (plusp i) :fused t))
@@ -132,6 +140,7 @@
                 (format out "step ~D/~D: loss ~,4F  ~,0F ms  ~,0F tok/s~%" (1+ step) steps loss ms
                         (/ (* tokens 1000) ms))
                 (finish-output out)))))))
+    (ngpt-set-weights m nil)
     (when save (ngpt-save m save) (format out "saved ~A~%" save))
     (format out "wall ~,1F s~%" (/ (- (get-internal-real-time) t-start) internal-time-units-per-second))
     m))

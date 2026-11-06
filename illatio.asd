@@ -64,7 +64,8 @@
                              (:file "gpt2-pretrain" :if-feature (:and :sbcl :darwin))
                              (:file "nanogpt" :if-feature (:and :sbcl :darwin))
                              (:file "nanogpt-train" :if-feature (:and :sbcl :darwin))
-                             (:file "ngpt-ablate" :if-feature (:and :sbcl :darwin))))))
+                             (:file "ngpt-ablate" :if-feature (:and :sbcl :darwin))
+                             (:file "judgment" :if-feature (:and :sbcl :darwin))))))
 
 (defsystem "illatio/openai"
   :description "OpenAI chat completions computed in this image: chat templates
