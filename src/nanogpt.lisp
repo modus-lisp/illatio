@@ -50,7 +50,8 @@
   (tied nil)                             ; the head is the embedding
   params acts                            ; layouts
   pbuf gbuf m1buf m2buf abuf dabuf       ; GPU buffers: parameters, gradients, two moments, acts, their gradients
-  inputs targets norm)
+  inputs targets norm
+  lweights (weighted nil))               ; a loss weight per position, when WEIGHTED
 
 (defun ngpt-param-specs (l c vp &optional tied)
   ;; the scalars last, each padded to 4 floats: the matrices stay aligned for float4s
@@ -96,6 +97,7 @@
                         :m1buf (gpu-buffer gpu (* 4 np)) :m2buf (gpu-buffer gpu (* 4 np))
                         :abuf (gpu-buffer gpu (* 4 na)) :dabuf (gpu-buffer gpu (* 4 na))
                         :inputs (gpu-buffer gpu (* 4 b tt)) :targets (gpu-buffer gpu (* 4 b tt))
+                        :lweights (gpu-buffer gpu (* 4 b tt))
                         :norm (gpu-buffer gpu (* 4 (+ 4 +g2-norm-groups+)))))
          (p (f32vec np)) (gauss (gaussian-filler seed)))
     (flet ((fill-normal (name std count)
@@ -215,8 +217,8 @@
         (rms (a :lnf) (a :rf) (a :res3 (1- l)))
         (linear (a :logits) (a :lnf) (p (ngpt-head m)) c (ngpt-vp m) :head)
         (if dloss
-            (dispatch gpu e "ng_softcap_ce_fused" (list n (ngpt-v m) (ngpt-vp m) dloss (ngpt-cap m))
-                      (list (a :logits) (da :logits) (ngpt-targets m) (a :losses)) n 1024 :shared 256)
+            (dispatch gpu e "ng_softcap_ce_fused" (list n (ngpt-v m) (ngpt-vp m) dloss (ngpt-cap m) (if (ngpt-weighted m) 1 0))
+                      (list (a :logits) (da :logits) (ngpt-targets m) (a :losses) (ngpt-lweights m)) n 1024 :shared 256)
             (dispatch gpu e "ng_softcap_ce" (list n (ngpt-v m) (ngpt-vp m) (if targets 1 0) (ngpt-cap m))
                       (list (a :logits) (a :probs) (ngpt-targets m) (a :losses)) n 1024 :shared 128))))))
 
@@ -237,6 +239,7 @@
                (let ((part (cons (ngpt-norm m) 16)))
                  (dispatch gpu e "ng_dot_part" (list n c ldx 64 (if y 1 0)) (list d x (or y x) part) 64 1024 :shared 128)
                  (dispatch gpu e "ng_dot_finish" (list 64 acc) (list part gr) 1 32))))
+        (assert (or fused (not (ngpt-weighted m))) () "loss weights need the fused loss")
         (unless fused
           (dispatch gpu e "ng_softcap_ce_bwd" (list n (ngpt-v m) vp dloss (ngpt-cap m))
                     (list (da :logits) (a :probs) (ngpt-targets m) (a :logits))
@@ -305,9 +308,24 @@
                   (ceiling c 256) 256)))))
 
 (defun ngpt-mean-loss (m)
+  "The mean of the positions' losses; WEIGHTED, by their weights."
   (let* ((n (* (ngpt-b m) (ngpt-tt m)))
          (v (copy-from-gbuf (ngpt-abuf m) (f32vec n) (lof (ngpt-acts m) :losses))))
-    (/ (loop for x across v sum (coerce x 'double-float)) n)))
+    (if (ngpt-weighted m)
+        (let ((w (copy-from-gbuf (ngpt-lweights m) (f32vec n))))
+          (/ (loop for x across v for k across w sum (* k (coerce x 'double-float)))
+             (max 1d-30 (loop for k across w sum (coerce k 'double-float)))))
+        (/ (loop for x across v sum (coerce x 'double-float)) n))))
+
+(defun ngpt-set-weights (m weights)
+  "A loss weight for each position (B x TT floats), or NIL for all alike."
+  (setf (ngpt-weighted m) (and weights t))
+  (when weights (copy-to-gbuf (ngpt-lweights m) (coerce weights 'f32vec))))
+
+(defun ngpt-weight-sum (m)
+  (if (ngpt-weighted m)
+      (loop for k across (copy-from-gbuf (ngpt-lweights m) (f32vec (* (ngpt-b m) (ngpt-tt m)))) sum k)
+      (* (ngpt-b m) (ngpt-tt m))))
 
 (defun ngpt-set-batch (m inputs targets)
   (set-gbuf-ints (ngpt-inputs m) inputs)
@@ -323,6 +341,6 @@
   "Forward and backward: the mean loss, the gradients in GBUF."
   (ngpt-set-batch m inputs targets)
   (with-gpu-work (e (ngpt-gpu m))
-    (ngpt-encode-forward m e :dloss (/ 1f0 (* (ngpt-b m) (ngpt-tt m))))
+    (ngpt-encode-forward m e :dloss (/ 1f0 (ngpt-weight-sum m)))
     (ngpt-encode-backward m e :fused t))
   (ngpt-mean-loss m))

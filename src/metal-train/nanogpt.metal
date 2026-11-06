@@ -206,14 +206,17 @@ kernel void ng_axpby(constant uint *a [[buffer(0)]], device const float *x [[buf
 // row's max and sum of exponentials found online in one pass over its
 // logits, then a second writing the loss and dz = (p - onehot) dl (1 -
 // (capped/cap)^2) -- no probabilities stored, no pass to read them back.
-// A threadgroup of 1024 a row.  args: n, V, Vp, dl, cap
+// A threadgroup of 1024 a row.  args: n, V, Vp, dl, cap, weighted (then each
+// row's dl is scaled by its weight in W)
 kernel void ng_softcap_ce_fused(constant uint *a [[buffer(0)]], device const float *logits [[buffer(1)]],
                                 device float *dlogits [[buffer(2)]], device const int *targets [[buffer(3)]],
-                                device float *losses [[buffer(4)]], threadgroup float *red [[threadgroup(0)]],
+                                device float *losses [[buffer(4)]], device const float *w [[buffer(5)]],
+                                threadgroup float *red [[threadgroup(0)]],
                                 uint r [[threadgroup_position_in_grid]], ushort tid [[thread_index_in_threadgroup]],
                                 ushort sg [[simdgroup_index_in_threadgroup]], ushort l [[thread_index_in_simdgroup]]) {
     const uint V = a[1], Vp = a[2];
-    const float dl = as_type<float>(a[3]), cap = as_type<float>(a[4]);
+    const float cap = as_type<float>(a[4]);
+    const float dl = as_type<float>(a[3]) * (a[5] ? w[r] : 1.0f);
     device const float *x = logits + r * Vp;
     device float *d = dlogits + r * Vp;
     float m = -INFINITY, s = 0.0f;
