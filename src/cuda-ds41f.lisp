@@ -42,7 +42,7 @@
          (kv (dbuf-of st :egkv (* 4 (1+ n) d))))
     (dk-mv16 st (lname li "engram_kv.weight") (dk-put st x :type :f32) kv)
     (dk41-round dev kv (* (1+ n) d))
-    (launch dev "d41_engram" n 1024 (list d n (ds4f-eps m) streams kv (dvec st (dl-eg-q-norm l)) (dvec st (dl-eg-k-norm l))))))
+    (launch dev "d41_engram" n 1024 (list d n (ds4f-eps m) streams kv (dvec st (dl-eg-q-norm l)) (dvec st (dl-eg-k-norm l)) nil))))
 
 (defun dk41-publish (m st l li ctx norm pos k)
   "D41-PUBLISH! on the device: the finished row and its key written in
@@ -189,7 +189,7 @@
         (let ((pre (dk-put st '(1f0 0f0 0f0 0f0) :type :f32)))
           (dotimes (li nl)
             (let ((l (svref (ds4f-layers m) li)) (tbl (position li (d41-eg-layers v))))
-              (when tbl
+              (when (and tbl (not (image-token-p token)))
                 (dk41-engram m st l li sa (d41-engram-input m tbl (nth tbl rows)))
                 (when *d41-probe* (funcall *d41-probe* li :engram (cuda-floats sa hcd))))
               (dk41-attention m st l li ctx pos sa sb pre)

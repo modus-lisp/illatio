@@ -327,8 +327,9 @@
          (g (pb st :p-g (* rows ff))) (u (pb st :p-u (* rows ff))) (mid (pb st :p-mid (* rows ff)))
          (down (pb st :p-down (* rows d))) (moe (pb st :p-moe (* n d))) (ptrs nil))
     (launch dev "d4_route" n ne
-            (list ne nu (cond ((dl-tid2eid l) 1) ((ds4f-glm m) 2) (t 0)) (ds4f-expert-scale m) (if (dl-probs-b l) 1 0)
-                  (pb st :p-logits (* n ne)) (and (dl-probs-b l) (dvec st (dl-probs-b l)))
+            (list ne nu (cond ((dl-tid2eid l) 1) ((ds4f-glm m) 2) (t 0)) (ds4f-expert-scale m)
+                  (cond (*dk-route-bias* 2) ((dl-probs-b l) 1) (t 0))
+                  (pb st :p-logits (* n ne)) (or *dk-route-bias* (and (dl-probs-b l) (dvec st (dl-probs-b l))))
                   (and (dl-tid2eid l) (dk-tid2eid st li l)) toks sel w)
             :shared (* 4 (+ (* 2 ne) 64 nu)))
     (when (functionp slots) (setf slots (funcall slots sel)))
@@ -440,6 +441,10 @@
   (ignore-errors (cuda-sync (dk-dev st)) (cuda-stream-sync (dk-copy-stream st)))
   (fill (dk-pin st) 0)
   (when run (loop for s from (car run) below (+ (car run) (cdr run)) do (setf (aref (dk-used st) s) 0))))
+
+(defvar *dk-route-bias* nil
+  "A device buffer of a router bias row a token, for DK-FFN-ROUTED-CHUNK's
+   routing in place of the layer's one (V4.1's pictures: DK41-FFN-CHUNK).")
 
 (defmacro with-dk-pass ((st bytes &key (stage 0)) &body body)
   "BODY as a pass over ST: its scratch the pool's last slots, enough for

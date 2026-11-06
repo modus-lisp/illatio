@@ -53,15 +53,65 @@
         do (setf obj (gethash k obj))
         finally (return (if (eq obj 'null) nil obj))))
 
+(defvar *image-parts* nil
+  "While a prompt renders: an adjustable vector its messages' pictures go
+   into (their bytes), each leaving a marker where it stood (PROMPT-IDS).")
+
+(defconstant +image-open+ (code-char #xe000))   ; private use: no text has them
+(defconstant +image-close+ (code-char #xe001))
+
+(defun base64-octets (s &key (start 0))
+  (let ((out (make-array (floor (* 3 (- (length s) start)) 4) :element-type '(unsigned-byte 8) :fill-pointer 0))
+        (acc 0) (bits 0))
+    (loop for i from start below (length s)
+          for c = (char s i)
+          for v = (cond ((char<= #\A c #\Z) (- (char-code c) 65)) ((char<= #\a c #\z) (- (char-code c) 71))
+                        ((char<= #\0 c #\9) (+ (char-code c) 4)) ((member c '(#\+ #\-)) 62) ((member c '(#\/ #\_)) 63))
+          when v do (setf acc (logior (ash (ldb (byte 18 0) acc) 6) v)) (incf bits 6)
+                    (when (>= bits 8) (decf bits 8) (vector-push (ldb (byte 8 bits) acc) out)))
+    (coerce out '(simple-array (unsigned-byte 8) (*)))))
+
+(defun image-part-bytes (part)
+  "An image_url (or input_image) part's picture: a data: URL's bytes."
+  (let* ((u (jget part "image_url")) (url (if (stringp u) u (jget u "url"))))
+    (unless (and (stringp url) (eql 0 (search "data:" url)))
+      (error "only data: URLs carry pictures here (got ~A)" (if (stringp url) (subseq url 0 (min 40 (length url))) url)))
+    (let ((comma (or (position #\, url) (error "a data: URL without data"))))
+      (unless (search ";base64" url :end2 comma) (error "a picture's data: URL should be base64"))
+      (base64-octets url :start (1+ comma)))))
+
 (defun content-string (content)
-  "A message's content as text: a string, or the text parts of a parts array."
+  "A message's content as text: a string, or the text parts of a parts array
+   (and, while *IMAGE-PARTS* collects them, a marker for each picture)."
   (cond ((stringp content) content)
         ((vectorp content)
          (with-output-to-string (s)
            (loop for part across content
-                 when (equal (jget part "type") "text")
-                   do (write-string (or (jget part "text") "") s))))
+                 for type = (jget part "type")
+                 do (cond ((equal type "text") (write-string (or (jget part "text") "") s))
+                          ((and *image-parts* (member type '("image_url" "input_image") :test #'equal))
+                           (format s "~C~D~C" +image-open+
+                                   (vector-push-extend (image-part-bytes part) *image-parts*) +image-close+))))))
         (t "")))
+
+(defun prompt-ids (model prompt images)
+  "PROMPT's tokens, a picture's (VISION-IMAGE-TOKENS) where its marker stands."
+  (if (zerop (length images))
+      (tokenize model prompt)
+      (progn
+        (unless (and *vision* (equal (model-arch model) "deepseek41"))
+          (error "this server takes no pictures (DeepSeek V4.1 with --mmproj does)"))
+        (let ((out '()) (start 0))
+          (loop for open = (position +image-open+ prompt :start start)
+                while open
+                do (let ((close (position +image-close+ prompt :start open)))
+                     (setf out (append out (if (zerop start)
+                                               (tokenize model (subseq prompt 0 open))
+                                               (tokenize model (subseq prompt start open) :add-bos nil))
+                                       (funcall 'vision-image-tokens
+                                                (aref images (parse-integer prompt :start (1+ open) :end close))))
+                           start (1+ close))))
+          (append out (tokenize model (subseq prompt start) :add-bos nil))))))
 
 ;;; --- ids ----------------------------------------------------------------------
 ;;; Seeded on first use, not at load: a state made at load time is frozen into
@@ -337,8 +387,10 @@
            (thinking (request-thinking req))
            (ds4f (member (model-arch m) '("deepseek4" "deepseek41") :test #'equal))
            (glm (equal (model-arch m) "glm5-next"))
-           (prompt (render-chat m (jget req "messages") (jget req "tools") :thinking thinking))
-           (ids (tokenize m prompt))
+           (images (make-array 0 :adjustable t :fill-pointer 0))
+           (prompt (let ((*image-parts* images))
+                     (render-chat m (jget req "messages") (jget req "tools") :thinking thinking)))
+           (ids (prompt-ids m prompt images))
            (max (let ((n (or (jget req "max_completion_tokens") (jget req "max_tokens") (engine-max-tokens engine))))
                   ;; -1 (llama.cpp's web UI) or 0: no limit but the context's room
                   (if (and (integerp n) (plusp n)) n (max 1 (- (context-n-ctx ctx) (length ids))))))

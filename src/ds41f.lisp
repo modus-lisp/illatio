@@ -218,6 +218,7 @@
                                   :ffn-norm (f32 (n "ffn_norm.weight"))
                                   :gate-inp (fm-cpu (n "ffn_gate_inp.weight"))
                                   :probs-b (opt (n "exp_probs_b.bias") #'f32)
+                                  :probs-b-vl (opt (n "exp_probs_b_vl.bias") #'f32)
                                   :gate-exps (expert-tensor g (n "ffn_gate_exps.weight"))
                                   :up-exps (expert-tensor g (n "ffn_up_exps.weight"))
                                   :down-exps (expert-tensor g (n "ffn_down_exps.weight"))
@@ -332,7 +333,8 @@
   "ds4_engram_hash: (values rows new-tail), ROWS a list per table of the
    24 table rows: for n-grams of 2, 3 and 4 tokens ending at TOKEN, a
    running xor of id * multiplier, 8 primes each."
-  (let* ((v (ds4f-v41 m)) (cur (aref (d41-token-map v) token)) (pad (d41-pad v))
+  ;; a picture's position is no n-gram: dead, as ds4's text mask makes it
+  (let* ((v (ds4f-v41 m)) (cur (if (image-token-p token) -1 (aref (d41-token-map v) token))) (pad (d41-pad v))
          (ids (let ((blocked nil))
                 (loop for id in (cons cur tail)
                       do (when (minusp id) (setf blocked t))
@@ -556,7 +558,7 @@
     (multiple-value-bind (rows tail) (d41-engram-hash m (d41ctx-tail ctx) token)
       (dotimes (li (ds4f-n-layer m))
         (let ((l (svref (ds4f-layers m) li)) (tbl (position li (d41-eg-layers v))))
-          (when tbl
+          (when (and tbl (not (image-token-p token)))
             (d41-engram! m l streams (d41-engram-input m tbl (nth tbl rows)))
             (when *d41-probe* (funcall *d41-probe* li :engram streams)))
           (multiple-value-bind (pre-a post-a comb-a)
@@ -568,7 +570,8 @@
             (multiple-value-bind (pre-f post-f comb-f)
                 (d41-hc-mix m (dl-hc-ffn-fn l) (dl-hc-ffn-scale l) (dl-hc-ffn-base l) streams)
               (d41-hc-sum m streams pre-a x)
-              (d41-hc-expand! m next (d41-ffn m l li x) streams post-f comb-f)
+              (d41-hc-expand! m next (let ((*d4-vision-position* (image-token-p token))) (d41-ffn m l li x))
+                              streams post-f comb-f)
               (rotatef streams next)
               (when *d41-probe* (funcall *d41-probe* li :ffn streams))
               (setf pre pre-f)))))

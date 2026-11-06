@@ -77,6 +77,9 @@ flags:
   --gpu               run the model on the GPU (DeepSeek V4/V4.1 Flash use CUDA
                       or Metal by themselves)
   --device N          the CUDA device to run on (implies --gpu; default 0)
+  --mmproj PATH       a vision projector (llama.cpp's mmproj GGUF): pictures in
+                      requests' image_url parts (DeepSeek V4.1 Flash, with --gpu)
+  --mmproj-device N   the CUDA device it runs on (default the last)
   -h, --help          this
 ")
 
@@ -108,6 +111,8 @@ flags:
                    ((member a '("-s" "--system") :test #'string=) (setf (getf opts :system) (val)))
                    ((string= a "--chat") (setf (getf opts :mode) :chat))
                    ((string= a "--gpu") (setf (getf opts :gpu) t))
+                   ((string= a "--mmproj") (setf (getf opts :mmproj) (val)))
+                   ((string= a "--mmproj-device") (setf (getf opts :mmproj-device) (int (val))))
                    ((string= a "--device") (setf (getf opts :gpu) t (getf opts :device) (int (val))))
                    ((string= a "--bench") (setf (getf opts :mode) :bench))
                    ((string= a "-p") (setf (getf opts :bench-p) (int-list (val))))
@@ -151,6 +156,14 @@ flags:
   (let ((path (model-path opts))
         (t0 (get-internal-real-time)))
     (format *error-output* "~&illatio: loading ~A~%" (file-namestring path))
+    ;; the vision encoder first: its device memory is taken before the model's pool sizes itself
+    (when (getf opts :mmproj)
+      #+(and sbcl linux)
+      (if (getf opts :gpu)
+          (illatio::load-vision-cuda (getf opts :mmproj)
+                                     :device (or (getf opts :mmproj-device) (1- (illatio::cuda-device-count))))
+          (die "--mmproj needs --gpu (the vision encoder runs on CUDA)"))
+      #-(and sbcl linux) (die "--mmproj needs CUDA (Linux)"))
     (let ((m (if (getf opts :gpu)
                  #+(and sbcl darwin) (illatio::load-model-gpu path)
                  #+(and sbcl linux) (illatio::load-model-cuda path :device (or (getf opts :device) 0))

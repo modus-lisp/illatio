@@ -168,9 +168,10 @@ extern "C" __global__ void d41_ix_scores(int nh, int nc, const float* __restrict
 // KV[h] and the value KV[4] (BF16), its RMS-normed dot with the key under
 // QW*KW, over sqrt(D); the stream += sigmoid(signed sqrt(dot)) * value, BF16.
 extern "C" __global__ void d41_engram(int d, int n, float eps, float* streams, const float* kv,
-                                      const float* qw, const float* kw) {
+                                      const float* qw, const float* kw, const unsigned char* mask) {
   __shared__ float red[32];
   int h = blockIdx.x;
+  if (mask && !mask[blockIdx.y]) return;          // a picture's position: no Engram (ds4's text mask)
   streams += (long long)blockIdx.y * n * d; kv += (long long)blockIdx.y * (n + 1) * d;   // grid (n, tokens)
   float* r = streams + (long long)h * d;
   const float* k = kv + (long long)h * d;

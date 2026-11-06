@@ -77,6 +77,7 @@
   comp-kv comp-gate comp-ape comp-norm comp-width
   ix-q-b ix-proj ixc-kv ixc-gate ixc-ape ixc-norm
   ffn-norm gate-inp probs-b tid2eid
+  probs-b-vl                                 ; V4.1's router bias at a picture's positions
   gate-exps up-exps down-exps                ; (offset row-bytes rows cols) in the file
   sh-gate sh-up sh-down
   hc-attn-fn hc-attn-scale hc-attn-base hc-ffn-fn hc-ffn-scale hc-ffn-base
@@ -941,6 +942,10 @@
     #-sbcl (dolist (j jobs) (apply #'prefetch-file-range j))))
 
 
+(defvar *d4-vision-position* nil
+  "True while a picture's position goes through a pass that routes without
+   its token (V4.1 on the CPU): D4-ROUTE takes the vision bias then.")
+
 (defun d4-route (m l li x token &optional logits-in)
   "(values experts weights): the hash table's experts in the first layers,
    else the top N-USED of sqrt(softplus(router)) + bias; weights from the
@@ -953,7 +958,10 @@
     (if (dl-tid2eid l)
         (dotimes (i nu) (setf (aref sel i) (aref (dl-tid2eid l) (+ (* token nu) i))))
         (let ((s (copy-seq probs)) (idx (make-array nu :initial-element -1)))
-          (when (dl-probs-b l) (dotimes (i ne) (incf (aref s i) (aref (dl-probs-b l) i))))
+          (let ((b (if (and (dl-probs-b-vl l) (or *d4-vision-position* (image-token-p token)))
+                       (dl-probs-b-vl l)
+                       (dl-probs-b l))))
+            (when b (dotimes (i ne) (incf (aref s i) (aref b i)))))
           ;; topk_desc: insertion into a sorted list of K, earlier wins ties
           (dotimes (i ne)
             (loop for j below nu
@@ -1054,10 +1062,16 @@
   (let* ((d (ds4f-d m)) (n (ds4f-n-hc m)) (hcd (* n d)) (wf (ds4f-file m)))
     (declare (type u8vec wf) (type f32vec out))
     (loop for tk in (coerce tokens 'list) for at from 0 by hcd
-          do (let ((o (+ (ds4f-embd-off m) (* tk d 2))))
-               (dotimes (j d)
-                 (let ((v (f16-at wf (+ o (* 2 j)))))
-                   (dotimes (h n) (setf (aref out (+ at (* h d) j)) v))))))
+          do (if (image-token-p tk)
+                 ;; a picture's position: its row of the encoder's output
+                 (multiple-value-bind (rows o width) (image-row tk)
+                   (declare (type f32vec rows))
+                   (assert (= width d))
+                   (dotimes (h n) (replace out rows :start1 (+ at (* h d)) :start2 o :end2 (+ o d))))
+                 (let ((o (+ (ds4f-embd-off m) (* tk d 2))))
+                   (dotimes (j d)
+                     (let ((v (f16-at wf (+ o (* 2 j)))))
+                       (dotimes (h n) (setf (aref out (+ at (* h d) j)) v)))))))
     out))
 
 (defun ds4f-forward-1 (ctx token logits)

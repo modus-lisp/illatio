@@ -108,6 +108,9 @@
         (dk41-rope dev rows cs 1 hd nrot nb)
         (dk41-quant dev rows (* nb hd) :fp4-e4m3)))))
 
+(defvar *dk41-image-rows* nil
+  "In a pass with a picture's positions: a vector, true at each of them.")
+
 (defvar *dk41-pick* nil
   "During a pass: whether the last index-source layer made a pick (its rows
    in :P-IDX), for the layers after it.")
@@ -219,8 +222,14 @@
     (launch dev "d41_swiglu" (ceiling (* n ff) 256) 256 (list (* n ff) (svref (ds4f-clamps m) li) sg su smid nil nil))
     (dk-q8mm st (lname li "ffn_down_shexp.weight") smid sout n)
     (dk41-round dev sout (* n d))
-    ;; V4's routed half (no hash layers here); then the sum and the streams rounded
-    (let ((*dk41-round-moe* t))
+    ;; V4's routed half (no hash layers here); then the sum and the streams rounded.
+    ;; A picture's positions route with the layer's vision bias: a row a token then.
+    (let ((*dk41-round-moe* t)
+          (*dk-route-bias*
+            (and *dk41-image-rows* (dl-probs-b-vl l)
+                 (let ((rows (f32vec (* n ne))) (b (dl-probs-b l)) (bv (dl-probs-b-vl l)))
+                   (dotimes (i n) (replace rows (if (svref *dk41-image-rows* i) bv b) :start1 (* i ne)))
+                   (let ((buf (pb st :p-route-bias (* n ne)))) (cuda-upload-vector buf rows) buf)))))
       (if small
           (dk-ffn-small m st l li n small sb sa)   ; SMALL: the tokens; the slots it holds
           (dk-ffn-routed-chunk m st l li n toks slots sb sa)))))
@@ -254,7 +263,7 @@
   (loop for l across (ds4f-layers m)
         do (dolist (v (list (dl-attn-norm l) (dl-q-a-norm l) (dl-kv-norm l) (dl-ffn-norm l) (dl-sinks l)
                             (dl-hc-attn-scale l) (dl-hc-attn-base l) (dl-hc-ffn-scale l) (dl-hc-ffn-base l)
-                            (dl-comp-norm l) (dl-ix-k-norm l) (dl-probs-b l) (dl-eg-q-norm l) (dl-eg-k-norm l)))
+                            (dl-comp-norm l) (dl-ix-k-norm l) (dl-probs-b l) (dl-probs-b-vl l) (dl-eg-q-norm l) (dl-eg-k-norm l)))
              (when v (dvec st v))))
   (dolist (vs (list (d41ctx-raw ctx) (d41ctx-comp ctx) (d41ctx-ix-comp ctx) (d41ctx-prev-kv ctx) (d41ctx-prev-score ctx)))
     (loop for v across vs do (dvec st v)))
@@ -276,6 +285,14 @@
       (with-dk-pass (st (and (not small) (ds41f-pass-bytes n pos0)) :stage (* 2 (ds4f-n-expert m)))
        (let* ((*dk-small* small) (*dk41-carry-rows* (and small (or *dk41-carry-rows* (make-hash-table))))
               (held '()) (rows nil) (*dk41-pick* nil)
+              (*dk41-image-rows* (and (some #'image-token-p tokv) (map 'simple-vector #'image-token-p tokv)))
+              ;; a byte a token, 0 at a picture's: Engram passes those by
+              (egmask (and *dk41-image-rows*
+                           (let ((b (pb st :p-egmask (ceiling n 4)))
+                                 (v (make-array (* 4 (ceiling n 4)) :element-type '(unsigned-byte 8) :initial-element 0)))
+                             (dotimes (i n) (setf (aref v i) (if (svref *dk41-image-rows* i) 0 1)))
+                             (sb-sys:with-pinned-objects (v) (cuda-upload b (sb-sys:vector-sap v) (length v)))
+                             b)))
               (sa (pb st :p-sa (* n hcd))) (sb (pb st :p-sb (* n hcd))))
         (dk41-ready m st ctx)
         ;; the tokens' embeddings into each stream
@@ -301,7 +318,8 @@
                         (dk-f16mm st (lname li "engram_kv.weight") (nth tbl eg) kv n)
                         (dk41-round dev kv (* n (1+ n-hc) d))
                         (launch dev "d41_engram" (list n-hc n) 1024
-                                (list d n-hc (ds4f-eps m) sa kv (dvec st (dl-eg-q-norm l)) (dvec st (dl-eg-k-norm l))))))
+                                (list d n-hc (ds4f-eps m) sa kv (dvec st (dl-eg-q-norm l)) (dvec st (dl-eg-k-norm l))
+                                      egmask))))
                     (dk41-attention-chunk m st l li ctx pos0 n sa sb pre pstride
                                           (if comp cs1 cs0) (if comp ics1 ics0))
                     (cond

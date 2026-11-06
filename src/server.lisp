@@ -112,7 +112,7 @@
   (hobj "model_path" (model-name (engine-model engine))
         "build_info" "illatio"
         "n_ctx" (context-n-ctx (engine-context engine))
-        "modalities" (hobj "vision" nil "audio" nil)))
+        "modalities" (hobj "vision" (and *vision* (equal (model-arch (engine-model engine)) "deepseek41") t) "audio" nil)))
 
 ;;; --- streaming --------------------------------------------------------------
 ;;; The chunks come from CHAT-COMPLETION-CHUNKS; here they only become SSE.

@@ -50,7 +50,7 @@
 //   d4_route(int ne, int nu, int hash, float scale, int has_bias, const float* logits,
 //            const float* bias, const int* tid2eid, const unsigned* tokens,
 //            unsigned* sel, float* wout)
-//     args as Metal's; grid N, block ne (a multiple of 32, 1024 at most),
+//     args as Metal's (HAS_BIAS 2: BIAS a row of NE a token); grid N, block ne (a multiple of 32, 1024 at most),
 //     shared 4*(2*ne + 64 + nu).  BIAS / TID2EID may be null when unused.
 //   d4_group_zero(int ne, unsigned* counts)
 //     Metal's takes a dummy word; here NE, the bound.  grid ceil(ne/256), block min(ne,256).
@@ -432,7 +432,8 @@ extern "C" __global__ void d4_route(int ne, int nu, int hash, float scale, int h
   const float sp = l > 20.f ? l : (l < -20.f ? expf(l) : logf(1.f + expf(l)));
   const float p = hash == 2 ? d4_sigmoid(l) : sqrtf(sp);
   probs[e] = p;
-  sv[e] = p + (has_bias ? bias[e] : 0.f);
+  // HAS_BIAS 2: a bias row a token (V4.1's pictures route by their own)
+  sv[e] = p + (has_bias ? bias[(has_bias == 2 ? (long long)t * ne : 0) + e] : 0.f);
   __syncthreads();
   if (hash == 1) {
     if (e < nu) picked[e] = (unsigned)tid2eid[(long long)tokens[t] * nu + e];
