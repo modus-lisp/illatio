@@ -33,7 +33,7 @@
      (:file "cuda-dense" :if-feature (:and :sbcl :linux)) ; qwen2/qwen3/llama on them (kernels: src/cuda/)
      (:file "cuda-qwen35" :if-feature (:and :sbcl :linux)) ; qwen35 on them
      (:file "generate")    ; sampling, prompt reuse, streaming text
-     (:file "image")       ; PNG and JPEG decoded, resized and cut into a vision encoder's patches
+     (:file "image")       ; pictures resized and cut into a vision encoder's patches; their tokens
      (:file "ds4f")        ; DeepSeek V4 Flash (deepseek4), ported from ds4.c
      (:file "ds41f")       ; DeepSeek V4.1 Flash (deepseek41): V4's pieces, ds4's V4.1 graph
      (:file "glm53")       ; GLM-5.3 Flash (glm5-next): V4's HC and experts, KDA and DSA layers
@@ -72,7 +72,7 @@
 (defsystem "illatio/openai"
   :description "OpenAI chat completions computed in this image: chat templates
                 rendered in Lisp, tool calls parsed out of the reply."
-  :depends-on ("illatio" "json-simple")
+  :depends-on ("illatio" "json-simple" "pigment")   ; pigment: requests' pictures decoded
   :components ((:module "src" :components ((:file "openai")))))
 
 (defsystem "illatio/server"

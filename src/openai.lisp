@@ -94,6 +94,22 @@
                                    (vector-push-extend (image-part-bytes part) *image-parts*) +image-close+))))))
         (t "")))
 
+(defun decode-picture (bytes)
+  "BYTES (PNG, JPEG, WebP or SVG; pigment decodes them, a JPEG turned upright)
+   as an RGB-IMAGE, any transparency over white."
+  (when (and (>= (length bytes) 3) (= (aref bytes 0) 71) (= (aref bytes 1) 73) (= (aref bytes 2) 70))
+    (image-fail "GIF pictures aren't decoded (pigment reads only their size)"))
+  (let ((img (pigment:decode-image-bytes bytes)))
+    (unless img (image-fail "not a picture pigment decodes (PNG, JPEG, WebP or SVG)"))
+    (let* ((w (pigment:img-w img)) (h (pigment:img-h img)) (rgba (pigment:img-rgba img))
+           (rgb (make-array (* w h 3) :element-type '(unsigned-byte 8))))
+      (dotimes (i (* w h))
+        (let ((a (aref rgba (+ 3 (* 4 i)))))
+          (dotimes (c 3)
+            (let ((v (aref rgba (+ c (* 4 i)))))
+              (setf (aref rgb (+ c (* 3 i))) (if (= a 255) v (round (+ (* v a) (* 255 (- 255 a))) 255)))))))
+      (make-rgb-image w h rgb))))
+
 (defun prompt-ids (model prompt images)
   "PROMPT's tokens, a picture's (VISION-IMAGE-TOKENS) where its marker stands."
   (if (zerop (length images))
@@ -109,7 +125,8 @@
                                                (tokenize model (subseq prompt 0 open))
                                                (tokenize model (subseq prompt start open) :add-bos nil))
                                        (funcall 'vision-image-tokens
-                                                (aref images (parse-integer prompt :start (1+ open) :end close))))
+                                                (aref images (parse-integer prompt :start (1+ open) :end close))
+                                                #'decode-picture))
                            start (1+ close))))
           (append out (tokenize model (subseq prompt start) :add-bos nil))))))
 

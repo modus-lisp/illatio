@@ -121,13 +121,14 @@
         (cuda-sync dev)))
     (values out oh ow)))
 
-(defun vision-image-tokens (bytes)
-  "The prompt tokens for the picture BYTES (a PNG or JPEG): start, its grid's
-   rows each closed by a newline, end -- encoded once, then held."
+(defun vision-image-tokens (bytes decode)
+  "The prompt tokens for the picture BYTES (DECODE makes an RGB-IMAGE of
+   them): start, its grid's rows each closed by a newline, end -- encoded
+   once, then held."
   (let* ((bytes (coerce bytes 'u8vec)) (key (image-key bytes)))
     (or (image-tokens-held key)
         (let ((v (or *vision* (error "no vision encoder: start the server with --mmproj"))))
-          (multiple-value-bind (patches gh gw) (ds41-image-patches (decode-image bytes))
+          (multiple-value-bind (patches gh gw) (ds41-image-patches (funcall decode bytes))
             (multiple-value-bind (emb oh ow) (vision-run v patches gh gw)
               (let* ((wd (vision-width v)) (count (+ (* oh (1+ ow)) 2)) (rows (f32vec (* count wd))) (at 0))
                 (flet ((put (src start) (replace rows src :start1 (* at wd) :start2 start :end2 (+ start wd)) (incf at)))

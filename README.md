@@ -122,9 +122,10 @@ context is on: text that repeats goes about 1.2x as fast.
 
 V4.1 sees pictures with `--mmproj`, its vision projector as llama.cpp
 ships it (unsloth's `mmproj-BF16.gguf`): requests' `image_url` parts (data:
-URLs, PNG or JPEG), and `/props` tells llama.cpp's web UI it may attach
-them.  The picture is decoded here (`src/image.lisp`), fitted to at most
-1,024 tokens as ds4 fits it, and encoded by the 32-block ViT on the last
+URLs: PNG, JPEG, WebP or SVG), and `/props` tells llama.cpp's web UI it may
+attach them.  The picture is decoded by [pigment](../pigment) (a JPEG turned
+upright by its EXIF orientation), fitted to at most 1,024 tokens as ds4
+fits it (`src/image.lisp`), and encoded by the 32-block ViT on the last
 GPU (1.6 GB with its scratch; 0.35 s for a small picture, 3.8 s for the
 largest, on the P40).  Its tokens stand past the vocabulary, named by the
 picture's bytes, so a conversation's picture is encoded once and its
