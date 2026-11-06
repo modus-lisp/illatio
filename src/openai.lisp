@@ -235,7 +235,9 @@
 (defun render-chat (model messages &optional tools &key (thinking t))
   (let ((template (meta (model-gguf model) "tokenizer.chat_template" "")))
     (cond ((member (model-arch model) '("deepseek4" "deepseek41") :test #'equal)
-           (render-ds4f-chat messages tools :thinking thinking :v41 (equal (model-arch model) "deepseek41")))
+           (if (equal (model-arch model) "deepseek41")
+               (render-ds41f-chat messages tools :thinking thinking)
+               (render-ds4f-chat messages tools :thinking thinking)))
           ((equal (model-arch model) "glm5-next") (render-glm53-chat messages tools :thinking thinking))
           ((and (search "<|im_start|>" template) (search "<tool_call>" template)
                 (search "</think>" template))
@@ -351,7 +353,7 @@
         (let ((t2 (get-internal-real-time)))
           (unless t1 (setf t1 t2))
           (multiple-value-bind (content calls reasoning)
-              (cond (ds4f (ds4f-parse-reply text thinking))
+              (cond (ds4f (ds4f-parse-reply text thinking (equal (model-arch m) "deepseek41")))
                     (glm (glm53-parse-reply text thinking))
                     (t (parse-tool-calls text)))
             (flet ((ms (a b) (/ (* 1000d0 (- b a)) internal-time-units-per-second)))
@@ -444,7 +446,8 @@
                                                                          (hobj "role" "assistant" "reasoning_content" text))))))))
          (resp (chat-completion engine req
                                 :on-text (cond ((member (model-arch (engine-model engine)) '("deepseek4" "deepseek41") :test #'equal)
-                                                (make-ds4f-stream-filter emit emit-reasoning (request-thinking req)))
+                                                (make-ds4f-stream-filter emit emit-reasoning (request-thinking req)
+                                                                         :call-tag (format nil "<~A" (dsml "tool_calls" (equal (model-arch (engine-model engine)) "deepseek41")))))
                                                ((equal (model-arch (engine-model engine)) "glm5-next")
                                                 (make-ds4f-stream-filter emit emit-reasoning (request-thinking req)
                                                                          :call-tag "<tool_call>"))
@@ -500,6 +503,28 @@
    "When thinking mode is enabled, finish reasoning with </think> before any tool calls or final response." (string #\Newline) (string #\Newline)
    "Otherwise, output directly after </think> with tool calls or final response." (string #\Newline) (string #\Newline)
    "### Available Tool Schemas" (string #\Newline) (string #\Newline)))
+
+(defun dsml (name v41)
+  "The DSML tag NAME (tool_calls, invoke, parameter) after its ｜DSML｜, as V4
+   spells it or as V4.1 does (｜DSML｜ calls, ｜DSML｜ invoke, ｜DSML｜ parameter)."
+  (concatenate 'string "｜DSML｜"
+               (cond ((not v41) name) ((string= name "tool_calls") " calls") (t (concatenate 'string " " name)))))
+
+(defparameter +ds41f-tools-header+
+  (concatenate 'string
+   "## Tools" (string #\Newline) (string #\Newline)
+   "You can invoke tools using this format:" (string #\Newline) (string #\Newline)
+   "<｜DSML｜ calls>" (string #\Newline)
+   "<｜DSML｜ invoke name=\"$TOOL_NAME\">" (string #\Newline)
+   "<｜DSML｜ parameter name=\"$PARAMETER_NAME\" string=\"true|false\">$PARAMETER_VALUE</｜DSML｜ parameter>" (string #\Newline)
+   "</｜DSML｜ invoke>" (string #\Newline)
+   "</｜DSML｜ calls>" (string #\Newline) (string #\Newline)
+   "String values use string=\"true\"; all other values use JSON and string=\"false\". "
+   "Inside string values only, escape a literal </｜DSML｜ parameter> as &lt;/｜DSML｜ parameter>. "
+   "To write that escaped spelling literally, use &amp;lt;/｜DSML｜ parameter>. Other HTML entities are unchanged." (string #\Newline) (string #\Newline)
+   "Finish reasoning with </think> before tool calls or a final response." (string #\Newline) (string #\Newline)
+   "### Available Tool Schemas" (string #\Newline) (string #\Newline))
+  "V4.1's tools preamble (ds4_server.c, append_tools_prompt_text with v41).")
 
 (defparameter +ds4f-tools-footer+
   (concatenate 'string (string #\Newline) (string #\Newline)
@@ -558,38 +583,38 @@
           do (case c (#\& (write-string "&amp;" o)) (#\< (write-string "&lt;" o)) (#\> (write-string "&gt;" o))
                    (#\" (write-string "&quot;" o)) (t (write-char c o))))))
 
-(defun ds4f-dsml-calls (calls)
+(defun ds4f-dsml-calls (calls &optional v41)
   "append_dsml_tool_calls_text: CALLS (OpenAI tool_calls) as a DSML block."
-  (with-output-to-string (o)
-    (format o "~%~%<｜DSML｜tool_calls>~%")
-    (loop for c across calls
-          do (let* ((f (jget c "function")) (args (jget f "arguments"))
-                    (obj (if (stringp args) (ignore-errors (json-simple:parse args)) args)))
-               (format o "<｜DSML｜invoke name=\"~A\">~%" (ds4f-attr-escape (or (jget f "name") "")))
-               (if (hash-table-p obj)
-                   (maphash (lambda (k v)
-                              (format o "<｜DSML｜parameter name=\"~A\" string=\"~:[false~;true~]\">~A</｜DSML｜parameter>~%"
-                                      (ds4f-attr-escape k) (stringp v)
-                                      (if (stringp v)
-                                          (ds4f-escape-close v "</｜DSML｜parameter>")
-                                          (let ((j (json-simple:stringify v)))
-                                            ;; append_dsml_json_literal: the closing tag's < as \u003c
-                                            (with-output-to-string (o2)
-                                              (loop with end = "</｜DSML｜parameter>"
-                                                    for i from 0 below (length j)
-                                                    do (if (and (<= (+ i (length end)) (length j))
-                                                                (string= end j :start2 i :end2 (+ i (length end))))
-                                                           (write-string "\\u003c" o2)
-                                                           (write-char (char j i) o2))))))))
-                            obj)
-                   (format o "<｜DSML｜parameter name=\"arguments\" string=\"true\">~A</｜DSML｜parameter>~%"
-                           (ds4f-escape-close (if (stringp args) args "") "</｜DSML｜parameter>")))
-               (format o "</｜DSML｜invoke>~%")))
-    (write-string "</｜DSML｜tool_calls>" o)))
+  (let ((pend (format nil "</~A>" (dsml "parameter" v41))))
+    (with-output-to-string (o)
+      (format o "~%~%<~A>~%" (dsml "tool_calls" v41))
+      (loop for c across calls
+            do (let* ((f (jget c "function")) (args (jget f "arguments"))
+                      (obj (if (stringp args) (ignore-errors (json-simple:parse args)) args)))
+                 (format o "<~A name=\"~A\">~%" (dsml "invoke" v41) (ds4f-attr-escape (or (jget f "name") "")))
+                 (if (hash-table-p obj)
+                     (maphash (lambda (k v)
+                                (format o "<~A name=\"~A\" string=\"~:[false~;true~]\">~A~A~%"
+                                        (dsml "parameter" v41) (ds4f-attr-escape k) (stringp v)
+                                        (if (stringp v)
+                                            (ds4f-escape-close v pend)
+                                            (let ((j (json-simple:stringify v)))
+                                              ;; append_dsml_json_literal: the closing tag's < as \u003c
+                                              (with-output-to-string (o2)
+                                                (loop for i from 0 below (length j)
+                                                      do (if (and (<= (+ i (length pend)) (length j))
+                                                                  (string= pend j :start2 i :end2 (+ i (length pend))))
+                                                             (write-string "\\u003c" o2)
+                                                             (write-char (char j i) o2))))))
+                                        pend))
+                              obj)
+                     (format o "<~A name=\"arguments\" string=\"true\">~A~A~%" (dsml "parameter" v41)
+                             (ds4f-escape-close (if (stringp args) args "") pend) pend))
+                 (format o "</~A>~%" (dsml "invoke" v41))))
+      (format o "</~A>" (dsml "tool_calls" v41)))))
 
-(defun render-ds4f-chat (messages tools &key (thinking t) v41)
-  "DeepSeek V4's prompt; V4.1's (V41) opens a system turn with <｜System｜>,
-   with thinking on by ds4's default reasoning effort (high, 75)."
+(defun render-ds4f-chat (messages tools &key (thinking t))
+  "DeepSeek V4's prompt (V4.1's is RENDER-DS41F-CHAT)."
   (let* ((msgs (coerce messages 'list))
          (tools (and tools (plusp (length tools)) (coerce tools 'list)))
          (tool-context (or tools
@@ -613,10 +638,6 @@
                                   (content-string (jget m "content"))))))
     (with-output-to-string (o)
       (write-string "<｜begin▁of▁sentence｜>" o)
-      (when (and v41 thinking)
-        (format o "<｜System｜>Reasoning Effort: 75 (range 1-100, the higher the value, the more thorough the reasoning)~%~%"))
-      (when (and v41 (not thinking) (plusp (length system)))
-        (write-string "<｜System｜>" o))
       (write-string system o)
       (loop for m in msgs for i from 0
             for role = (jget m "role")
@@ -645,32 +666,97 @@
         (write-string "<｜Assistant｜>" o)
         (write-string (if thinking "<think>" "</think>") o)))))
 
-(defun ds4f-parse-reply (text thinking)
+(defun render-ds41f-chat (messages tools &key (thinking t))
+  "DeepSeek V4.1's prompt, as ds4's server renders it
+   (render_deepseek41_chat_ordered): <｜System｜> opens with the reasoning
+   effort and the tools, the client's system text after; tool results and
+   the user turns around them share one <｜User｜>; V4.1's DSML spelling."
+  (let* ((msgs (coerce messages 'list))
+         (tools (and tools (plusp (length tools)) (coerce tools 'list)))
+         (keep-reasoning (or tools
+                             (some (lambda (m) (or (and (equal (jget m "role") "assistant") (jget m "tool_calls")
+                                                        (plusp (length (jget m "tool_calls"))))
+                                                   (member (jget m "role") '("tool" "function") :test #'equal)))
+                                   msgs)))
+         (last-user (loop for m in msgs for i from 0
+                          when (or (member (jget m "role") '("user" "tool" "function") :test #'equal)
+                                   (and (> i 0) (equal (jget m "role") "system")))
+                            maximize i))
+         (initial-system nil) (pending nil) (user-open nil))
+    (with-output-to-string (o)
+      (write-string "<｜begin▁of▁sentence｜>" o)
+      (when (or thinking tools)
+        (write-string "<｜System｜>" o)
+        (setf initial-system t)
+        (when thinking
+          (format o "Reasoning Effort: 75 (range 1-100, the higher the value, the more thorough the reasoning)~%~%"))
+        (when tools
+          (write-string +ds41f-tools-header+ o)
+          (loop for tool in tools for first = t then nil
+                do (unless first (write-char #\Newline o))
+                   (write-string (json-simple:stringify (or (jget tool "function") tool)) o))
+          (write-string +ds4f-tools-footer+ o)))
+      (loop for m in msgs for i from 0
+            for role = (jget m "role")
+            do (cond ((equal role "system")
+                      (if (and (= i 0) initial-system)
+                          (when tools (format o "~%~%"))
+                          (write-string "<｜System｜>" o))
+                      (write-string (content-string (jget m "content")) o)
+                      (setf pending (> i 0) user-open nil))
+                     ((member role '("user" "tool" "function") :test #'equal)
+                      (if user-open (format o "~%~%") (write-string "<｜User｜>" o))
+                      (if (equal role "user")
+                          (write-string (content-string (jget m "content")) o)
+                          (progn (write-string "<tool_result>" o)
+                                 (write-string (ds4f-escape-close (content-string (jget m "content")) "</tool_result>") o)
+                                 (write-string "</tool_result>" o)))
+                      (setf pending t user-open t))
+                     ((equal role "assistant")
+                      (when pending
+                        (write-string "<｜Assistant｜>" o)
+                        (when (and thinking (or keep-reasoning (> i last-user)))
+                          (format o "<think>~A" (or (jget m "reasoning_content") "")))
+                        (write-string "</think>" o))
+                      (write-string (content-string (jget m "content")) o)
+                      (let ((calls (jget m "tool_calls")))
+                        (when (and calls (plusp (length calls))) (write-string (ds4f-dsml-calls calls t) o)))
+                      (write-string "<｜end▁of▁sentence｜>" o)
+                      (setf pending nil user-open nil))))
+      (when pending
+        (write-string "<｜Assistant｜>" o)
+        (write-string (if thinking "<think>" "</think>") o)))))
+
+(defun ds4f-parse-reply (text thinking &optional v41)
   "(values content tool-calls reasoning) from the model's reply: with
    thinking, the reasoning is what comes before </think>; tool calls are
-   the DSML block's invokes, string parameters unescaped as ds4 does,
-   others parsed as JSON."
-  (let* ((close (and thinking (search "</think>" text)))
+   the DSML block's invokes (V4.1's spelling when V41), string parameters
+   unescaped as ds4 does, others parsed as JSON."
+  (let* ((open-inv (format nil "<~A name=\"" (dsml "invoke" v41)))
+         (close-inv (format nil "</~A>" (dsml "invoke" v41)))
+         (open-par (format nil "<~A name=\"" (dsml "parameter" v41)))
+         (pend (format nil "</~A>" (dsml "parameter" v41)))
+         (close (and thinking (search "</think>" text)))
          (reasoning (cond (close (subseq text 0 close)) (thinking text) (t nil)))
          (rest (cond (close (subseq text (+ close 8))) (thinking "") (t text)))
          ;; the tag without its '>': a quantized model may write <｜DSML｜tool_calls">
-         (start (search "<｜DSML｜tool_calls" rest))
+         (start (search (format nil "<~A" (dsml "tool_calls" v41)) rest))
          (content (string-trim '(#\Space #\Newline #\Tab #\Return) (subseq rest 0 (or start (length rest)))))
          (calls '()))
     (when start
-      (let ((pos start) (pend "</｜DSML｜parameter>"))
+      (let ((pos start))
         (loop
-          (let* ((inv (search "<｜DSML｜invoke name=\"" rest :start2 pos))
-                 (inv-end (and inv (search "</｜DSML｜invoke>" rest :start2 inv))))
+          (let* ((inv (search open-inv rest :start2 pos))
+                 (inv-end (and inv (search close-inv rest :start2 inv))))
             (unless (and inv inv-end) (return))
-            (let* ((name-start (+ inv (length "<｜DSML｜invoke name=\"")))
+            (let* ((name-start (+ inv (length open-inv)))
                    (name-end (search "\"" rest :start2 name-start))
                    (args (make-hash-table :test 'equal))
                    (p (search ">" rest :start2 name-end)))
               (loop
-                (let ((ps (search "<｜DSML｜parameter name=\"" rest :start2 p :end2 inv-end)))
+                (let ((ps (search open-par rest :start2 p :end2 inv-end)))
                   (unless ps (return))
-                  (let* ((ks (+ ps (length "<｜DSML｜parameter name=\"")))
+                  (let* ((ks (+ ps (length open-par)))
                          (ke (search "\"" rest :start2 ks))
                          (strp (search "string=\"true\"" rest :start2 ke :end2 (search ">" rest :start2 ke)))
                          (vs (1+ (search ">" rest :start2 ke)))
@@ -685,7 +771,7 @@
                           "function" (hobj "name" (ds4f-attr-unescape (subseq rest name-start name-end))
                                            "arguments" (json-simple:stringify args)))
                     calls)
-              (setf pos (+ inv-end (length "</｜DSML｜invoke>"))))))))
+              (setf pos (+ inv-end (length close-inv))))))))
     (values content (nreverse calls) reasoning)))
 
 (defun ds4f-attr-unescape (s)
