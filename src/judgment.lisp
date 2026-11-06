@@ -240,3 +240,65 @@
                           (when (if (= truth yes) (< ly ln) (< ln ly)) (incf (gethash kind right 0)))))))
     (loop for kind in (remove-duplicates (mapcar #'first pairs))
           collect (cons kind (coerce (/ (gethash kind right 0) (max 1 (gethash kind n 0))) 'single-float)))))
+
+(defun story-final-states (m jd stories names)
+  "For each of STORIES (dense tokens, one a row after end-of-text), activation
+   NAME at its last token, for each (NAME LAYER) of NAMES: a list, one
+   vector of C-float vectors per name."
+  (let* ((b (ngpt-b m)) (tt (ngpt-tt m)) (c (ngpt-c m)) (eot (story-vocab-eot (jdata-sv jd)))
+         (out (mapcar (lambda (n) (declare (ignore n)) (make-array (length stories))) names))
+         (buf (f32vec (* b tt c))))
+    (ngpt-set-weights m nil)
+    (loop for start from 0 below (length stories) by b
+          do (let ((x (make-array (* b tt) :element-type '(signed-byte 32) :initial-element eot))
+                   (y (make-array (* b tt) :element-type '(signed-byte 32) :initial-element eot))
+                   (last '()))
+               (loop for i from start below (min (length stories) (+ start b)) for r from 0
+                     do (let* ((s (elt stories i)) (len (min (length s) (1- tt))))
+                          (replace x s :start1 (1+ (* r tt)) :end2 len)
+                          (push (+ (* r tt) len) last)))
+               (setf last (nreverse last))
+               (ngpt-loss m x y)
+               (loop for (name li) in names for v in out
+                     do (copy-from-gbuf (ngpt-abuf m) buf (lof (ngpt-acts m) name li))
+                        (loop for pos in last for i from start
+                              do (setf (aref v i) (subseq buf (* pos c) (* (1+ pos) c)))))))
+    out))
+
+(defun dense-logistic-accuracy (train test &key (epochs 30) (lr 0.05d0) (l2 1d-3))
+  "TRAIN and TEST: lists of (vector . label 0/1), the vectors standardized
+   by TRAIN's means and deviations.  Logistic regression by SGD; TEST's accuracy."
+  (let* ((c (length (car (first train))))
+         (mean (make-array c :element-type 'double-float :initial-element 0d0))
+         (sd (make-array c :element-type 'double-float :initial-element 0d0))
+         (w (make-array c :element-type 'double-float :initial-element 0d0)) (b 0d0))
+    (dolist (e train) (dotimes (k c) (incf (aref mean k) (aref (car e) k))))
+    (dotimes (k c) (setf (aref mean k) (/ (aref mean k) (length train))))
+    (dolist (e train) (dotimes (k c) (incf (aref sd k) (expt (- (aref (car e) k) (aref mean k)) 2))))
+    (dotimes (k c) (setf (aref sd k) (max 1d-6 (sqrt (/ (aref sd k) (length train))))))
+    (flet ((score (v) (+ b (loop for k below c sum (* (aref w k) (/ (- (aref v k) (aref mean k)) (aref sd k)))))))
+      (let ((tv (coerce train 'simple-vector)))
+        (dotimes (ep epochs)
+          (let ((rate (/ lr (1+ (* 0.1 ep)))))
+            (loop for (v . y) across tv
+                  do (let* ((p (/ 1 (1+ (exp (- (max -30d0 (min 30d0 (score v)))))))) (g (- p y)))
+                       (decf b (* rate g))
+                       (dotimes (k c)
+                         (setf (aref w k) (- (* (aref w k) (- 1 (* rate l2)))
+                                             (* rate g (/ (- (aref v k) (aref mean k)) (aref sd k)))))))))))
+      (/ (count-if (lambda (e) (eql (if (> (score (car e)) 0) 1 0) (cdr e))) test) (max 1 (length test))))))
+
+(defun probe-coherence (m jd pairs &key (names (append (loop for li below (ngpt-l m) collect (list :res3 li)) '((:lnf 0)))))
+  "How well a linear probe reads coherence from M's stream at a story's last
+   token: for each kind of break and each of NAMES, the held-out accuracy of
+   logistic regression on intact against corrupt (a pair's two stories on
+   the same side of the split; chance 0.5).  An alist ((kind name) . accuracy)."
+  (loop for kind in (remove-duplicates (mapcar #'first pairs))
+        append (let* ((ps (remove kind pairs :key #'first :test-not #'eq))
+                      (stories (loop for (nil a c) in ps collect a collect c))
+                      (states (story-final-states m jd stories names))
+                      (split (* 2 (floor (* 4 (length ps)) 5))))
+                 (loop for name in names for v in states
+                       collect (let ((rows (loop for i below (length v) collect (cons (aref v i) (mod i 2)))))
+                                 (cons (list kind name)
+                                       (dense-logistic-accuracy (subseq rows 0 split) (subseq rows split))))))))

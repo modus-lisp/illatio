@@ -156,6 +156,39 @@ take one long night.
 6. **Distillation logprobs** (overnight), after the top-k dump exists.
 7. **Full runs** (one night), then the evaluation.
 
+## Pilot (2026-11-06)
+
+8x384 with tied embeddings (embedding lr 0.01, the best of a sweep of
+0.003, 0.01, 0.03 and untied), context 512, one seed, 10M tokens an arm
+(150 steps of 64K).  Minimal-pair accuracy is on 300 held-out pairs per
+kind.
+
+| Arm | Val loss | Swap | Referent | Splice |
+| --- | --- | --- | --- | --- |
+| A, next-token | **1.883** | 0.982 | 0.892 | 0.780 |
+| C, verdict for the first 25% | 2.264 | 0.968 | 0.755 | 0.677 |
+| D, verdict weight 32 | 1.919 | 0.982 | 0.902 | 0.787 |
+| D, verdict weight 128 | 1.937 | 0.985 | 0.915 | 0.767 |
+
+- **No arm learned the verdict.**  Every arm's held-out verdict accuracy
+  is 0.50; C's verdict loss stayed at ln 2 for its whole phase, and D
+  settled on one answer.
+- **Not from a trained model either.**  Arm A's model, trained on verdicts
+  alone for 4M tokens, stays at ln 2.  (And with the loss only on the
+  answer, it learns to predict "yes"/"no" everywhere: its next-token loss
+  goes from 1.92 to 19.6.)
+- **The pipeline is sound.**  A learnable label through the same batches
+  (does the story name Tim?) trains from 0.88 to 0.007 in 30 steps.
+- **Why: the model has no single-story judgment to read.**  A linear probe
+  on the stream at a held-out story's last token (200 pairs a kind, chance
+  0.5, about +-0.025) finds little: best layer for swaps 0.548, referents
+  0.527, splices 0.587 (arm A); 0.555, 0.540, 0.645 after D's verdict
+  training.  Arm A's 98% on swapped pairs is a comparison of summed
+  likelihoods, not a state it holds.
+
+So at this scale the pre-registered reading is the fourth: one token of
+signal per story is too thin.
+
 ## Risks
 
 | Risk | Mitigation |
