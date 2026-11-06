@@ -67,10 +67,14 @@
              (meta g "tokenizer.ggml.model")))
     ;; DeepSeek's markers (<｜User｜>, <think>, ...) are typed normal in
     ;; some conversions (V4.1's): they are specials all the same
+    ;; and so is a "normal" piece with a character no byte spells (V4.1's
+    ;; ｜DSML｜): byte-level BPE can't have made it, so it is matched whole in
+    ;; text and stands for itself, as ds4 has it (not "?DSML?")
     (loop for p across pieces for id from 0
           when (and (= (svref types id) +tok-normal+)
                     (or (and (> (length p) 4) (string= "<｜" p :end2 2) (string= "｜>" p :start2 (- (length p) 2)))
-                        (member p '("<think>" "</think>") :test #'string=)))
+                        (member p '("<think>" "</think>") :test #'string=)
+                        (find-if-not (lambda (c) (gethash c *char-byte*)) p)))
             do (setf (svref types id) +tok-control+))
     (loop for p across pieces for id from 0
           do (setf (gethash p (vocab-ids v)) id))

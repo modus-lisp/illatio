@@ -121,40 +121,99 @@
                                                     sb-alien:long sb-alien:unsigned-long sb-alien:unsigned-long sb-alien:unsigned-long))
          237 base bytes 1 (sb-sys:sap-int (sb-sys:vector-sap mask)) 65 0)))))  ; SYS_mbind, MPOL_PREFERRED
 
-(defun d4-host-experts (m slot-bytes gate-bytes &key (node -1))
+(defvar *expert-cache-dir* "/dev/shm/"
+  "Where the routed experts are kept between runs, laid out as the host copy
+   wants them (a file per model and layout), so a restart maps them instead
+   of reading the model's file again -- an hour from a busy disk for V4.1's
+   153 GB.  In memory (tmpfs) they are mapped and pinned where they lie, not
+   copied: one copy in memory, not two.  NIL: read the model each time.  A
+   stale file (the model changed) is ignored, by its name; delete old ones.")
+
+(defun d4-expert-cache-path (m slot-bytes span)
+  (let ((path (truename (gguf-path (ds4f-gguf m)))))
+    (and *expert-cache-dir* (uiop:directory-exists-p *expert-cache-dir*)
+         (format nil "~A/illatio-~A-~X-~X-~X.experts" (string-right-trim "/" (namestring *expert-cache-dir*))
+                 (pathname-name path)
+                 (with-open-file (s path :element-type '(unsigned-byte 8)) (file-length s))
+                 slot-bytes span))))
+
+(defun d4-map-shared (path bytes &key create)
+  "BYTES of the file at PATH mapped read-write and shared (made that size
+   when CREATE)."
+  (let ((fd (sb-unix:unix-open (namestring path) (if create (logior sb-unix:o_rdwr sb-unix:o_creat) sb-unix:o_rdwr)
+                               #o644)))
+    (unless fd (error "cannot open ~A" path))
+    (unwind-protect
+         (progn
+           (when create
+             (unless (zerop (sb-alien:alien-funcall
+                             (sb-alien:extern-alien "ftruncate" (function sb-alien:int sb-alien:int sb-alien:long))
+                             fd bytes))
+               (error "cannot size ~A to ~:D bytes" path bytes)))
+           (let ((addr (sb-alien:alien-funcall
+                        (sb-alien:extern-alien "mmap" (function sb-alien:unsigned-long sb-alien:unsigned-long
+                                                                sb-alien:unsigned-long sb-alien:int sb-alien:int
+                                                                sb-alien:int sb-alien:long))
+                        0 bytes 3 1 fd 0)))       ; PROT_READ | PROT_WRITE, MAP_SHARED
+             (when (= addr (ldb (byte 64 0) -1)) (error "mmap of ~A failed" path))
+             addr))
+      (sb-unix:unix-close fd))))
+
+(defun d4-host-experts (m slot-bytes gate-bytes &key (node -1) (register t))
   "Every routed expert in host memory, pinned: expert E of layer LI in slot
    LI*N-EXPERT+E (SLOT-BYTES each) as a device slot holds it -- gate, up,
    then down -- so a copy into the pool is one DMA.  Read by the model's
-   threads, an expert's tensor a read; from memory node NODE where it can."
+   threads, an expert's tensor a read; from memory node NODE where it can.
+   Kept in *EXPERT-CACHE-DIR* when there is one: mapped from there when it
+   holds them, else read into it (a partial file is never taken for whole:
+   it is renamed into place once full).  REGISTER NIL leaves them unpinned
+   (filling the cache from outside the server)."
   (let* ((ne (ds4f-n-expert m)) (keys (* (ds4f-n-layer m) ne))
          (span (* 2097152 (ceiling (* keys slot-bytes) 2097152)))
-         (base (%mmap-anon span)) (sap (sb-sys:int-sap base)) (fd (d4-open m))
+         (cache (d4-expert-cache-path m slot-bytes span))
+         (cached (and cache (probe-file cache)
+                      (= span (with-open-file (s cache :element-type '(unsigned-byte 8)) (file-length s)))))
+         (partial (and cache (not cached) (concatenate 'string cache ".partial")))
+         (base (cond (cached (d4-map-shared cache span))
+                     (partial (d4-map-shared partial span :create t))
+                     (t (%mmap-anon span))))
+         (sap (sb-sys:int-sap base))
          (t0 (get-internal-real-time)))
-    ;; huge pages: fewer for the kernel to walk, and for the driver to pin
-    (sb-alien:alien-funcall (sb-alien:extern-alien "madvise" (function sb-alien:int sb-alien:unsigned-long
-                                                                       sb-alien:unsigned-long sb-alien:int))
-                            base span 14)  ; MADV_HUGEPAGE
-    (d4-prefer-node base span node)
-    (unwind-protect
-         (parallel-for (k (* 3 keys) (ds4f-pool m))
-           (multiple-value-bind (key part) (floor k 3)
-             (multiple-value-bind (li e) (floor key ne)
-               (let ((tensor (ecase part
-                               (0 (dl-gate-exps (svref (ds4f-layers m) li)))
-                               (1 (dl-up-exps (svref (ds4f-layers m) li)))
-                               (2 (dl-down-exps (svref (ds4f-layers m) li))))))
-                 ;; (GLM's dense layers have none: their slots stay empty)
-                 (when tensor
-                   (destructuring-bind (off rb rows cols) tensor
-                     (declare (ignore cols))
-                     (d4-pread fd (sb-sys:sap+ sap (+ (* key slot-bytes) (* part gate-bytes)))
-                               (+ off (* e rows rb)) (* rows rb))))))))
-      (sb-unix:unix-close fd))
+    (unless cached
+      ;; huge pages: fewer for the kernel to walk, and for the driver to pin
+      (sb-alien:alien-funcall (sb-alien:extern-alien "madvise" (function sb-alien:int sb-alien:unsigned-long
+                                                                         sb-alien:unsigned-long sb-alien:int))
+                              base span 14)  ; MADV_HUGEPAGE
+      (d4-prefer-node base span node)
+      (let ((fd (d4-open m)))
+        (unwind-protect
+             (parallel-for (k (* 3 keys) (ds4f-pool m))
+               (multiple-value-bind (key part) (floor k 3)
+                 (multiple-value-bind (li e) (floor key ne)
+                   (let ((tensor (ecase part
+                                   (0 (dl-gate-exps (svref (ds4f-layers m) li)))
+                                   (1 (dl-up-exps (svref (ds4f-layers m) li)))
+                                   (2 (dl-down-exps (svref (ds4f-layers m) li))))))
+                     ;; (GLM's dense layers have none: their slots stay empty)
+                     (when tensor
+                       (destructuring-bind (off rb rows cols) tensor
+                         (declare (ignore cols))
+                         (d4-pread fd (sb-sys:sap+ sap (+ (* key slot-bytes) (* part gate-bytes)))
+                                   (+ off (* e rows rb)) (* rows rb))))))))
+          (sb-unix:unix-close fd)))
+      (when partial
+        (unless (zerop (sb-alien:alien-funcall
+                        (sb-alien:extern-alien "rename" (function sb-alien:int sb-alien:c-string sb-alien:c-string))
+                        partial cache))
+          (error "cannot rename ~A to ~A" partial cache))))
     (let ((t1 (get-internal-real-time)))
-      (cuda-host-register sap span)
-      (format *error-output* "illatio: the experts (~,1F GB) read in ~,1Fs, pinned in ~,1Fs~%" (/ span 1d9)
+      (when register (cuda-host-register sap span))
+      (format *error-output* "illatio: the experts (~,1F GB) ~:[read~;mapped from ~:*~A~] in ~,1Fs, pinned in ~,1Fs~%"
+              (/ span 1d9) (and cached cache)
               (/ (- t1 t0) internal-time-units-per-second)
-              (/ (- (get-internal-real-time) t1) internal-time-units-per-second)))
+              (/ (- (get-internal-real-time) t1) internal-time-units-per-second))
+      (when (and partial (not cached))
+        (format *error-output* "illatio: and kept in ~A for the next start~%" cache)))
     (values sap span)))
 
 (defun d4-expert-sap (m st li e)
