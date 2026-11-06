@@ -420,10 +420,13 @@
           a)))))
 
 (defun ds41f-pass-bytes (n pos0)
-  "The scratch a pass of N tokens from POS0 takes: the tokens' activations,
-   and per (token, compressed row) the indexer's score, a block maximum and
-   a mask byte (5 bytes, generously)."
-  (+ (* n *ds41f-cuda-chunk-bytes*) (* 5 n (+ pos0 n)) (* 64 1024 1024)))
+  "The scratch a pass of N tokens from POS0 takes: the tokens' activations;
+   per (token, position) the indexer's scores -- a ratio-2 layer's (half the
+   positions) and then, the arena only growing, a ratio-1 layer's: 6 bytes
+   -- and past 2,048 candidate blocks a block maximum and a mask byte per
+   block (7 bytes in all, a little spare); and per token those blocks' 2,048
+   picks (8 KB)."
+  (+ (* n *ds41f-cuda-chunk-bytes*) (* 7 n (+ pos0 n)) (* n 8448) (* 64 1024 1024)))
 
 (defun ds41f-cuda-chunk-max (m pos0)
   "The most tokens a pass from POS0 has room for: the pool's slots past

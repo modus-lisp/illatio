@@ -110,6 +110,8 @@ ones map and pin them where they lie (71 s to serving), one copy in memory.
 | prefill, 245 / 1,904 / 3,800 tokens | 4.2 s / 7.2 s / 8.4 s |
 | prefill, 20,181 tokens | 52 s (387 tok/s) |
 | decode at 20K tokens of context | 13 tok/s |
+| prefill, 129,211 tokens (`-c 131072`) | 6 min (~370 tok/s) |
+| decode at 129K tokens of context | 12 tok/s |
 
 A prompt goes through layer-major passes (`src/cuda-ds41f-prefill.lisp`):
 each layer's dense weights read once for thousands of tokens, its experts
