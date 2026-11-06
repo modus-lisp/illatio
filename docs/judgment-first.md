@@ -60,7 +60,7 @@ break.  The only thing separating the labels is coherence.
 
 | Source | Edits | Volume |
 | --- | --- | --- |
-| Programmatic | Swap two sentences; rename a character partway through; splice in another story's ending | As many as needed, free |
+| Programmatic (`corrupt.lisp`) | Swap two sentences; call a character by another character's name from some sentence on (a wrong referent); splice in another story's ending | As many as needed, free |
 | Teacher (Qwen3-4B) | One edit of one type: a contradiction of an earlier fact, a cause without effect, an out-of-character act, a wrong referent, a timeline error | About 20K, with the sentence changed |
 
 - **One type held out.** Timeline errors stay out of training and are used
@@ -74,6 +74,26 @@ break.  The only thing separating the labels is coherence.
 - **Shortcut audit, before any training.** Length-match each pair, then fit
   a bag-of-bigrams logistic regression on intact against corrupted.  Above
   about 60%, the corruptions leave surface traces; remove them first.
+
+  The audit, on 4,000 pairs of each kind from the first 20,000 training
+  stories, cut as verdict examples (held-out accuracy, chance 0.5):
+
+  | Break | Bigram accuracy |
+  | --- | --- |
+  | Swap | 0.561 |
+  | Wrong referent | 0.561 |
+  | Splice | 0.591 |
+  | Rename (not used) | 0.707 |
+
+  What the audit caught on the way:
+  - Sentences split inside quotations, so a swap could carry half a quote
+    out of its marks.  A quotation and its attribution are now one piece.
+  - A short donor's whole story spliced in, opening and all ("Once upon a
+    time").  The ending now comes from the donor's second half.
+  - Renaming, even with the names balanced (drawn alike for both sides, by
+    gender), leaves the corrupted story one name more than its twin, and a
+    bag of words can count names.  The wrong referent replaces it: both
+    names are already in the story.
 
 ## Training arms
 

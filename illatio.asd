@@ -59,6 +59,7 @@
   :components ((:module "src" :serial t
                 :components ((:file "gpt2-train")
                              (:file "stories")
+                             (:file "corrupt")
                              (:file "metal-gpt2-train" :if-feature (:and :sbcl :darwin))
                              (:file "gpt2-pretrain" :if-feature (:and :sbcl :darwin))
                              (:file "nanogpt" :if-feature (:and :sbcl :darwin))
