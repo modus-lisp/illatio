@@ -87,10 +87,10 @@
                            (l 6) (c 384) (b 8) (tt 1024) (accum 8) (steps 1000) (warmup 0) (warmdown 0.3)
                            (muon-lr 0.04f0) (embed-lr 0.6f0) (head-lr 0.008f0) (scalar-lr 0.04f0) (adam-beta1 0.9f0) (momentum-warmup 500)
                            (cap 30f0) (val-every 50) (val-batches 16) (target nil) (stop-at-target t) (seed 1337)
-                           (model nil) (out *standard-output*))
+                           (model nil) (save nil) (out *standard-output*))
   "Train the speedrun's model on FineWeb: STEPS steps of ACCUM micro-batches
    of B x TT tokens.  Notes when the validation loss reaches TARGET, and
-   stops there if STOP-AT-TARGET.  The model."
+   stops there if STOP-AT-TARGET.  Writes the model to SAVE at the end.  The model."
   (let* ((*g2-precision* '((:head . "_b") (:attention . "_b") (:linear . "_b")))
          (m (or model (make-nanogpt :l l :c c :b b :tt tt :cap cap :seed seed)))
          (train (make-shard-loader (fineweb-shards data "train") b tt))
@@ -129,5 +129,6 @@
                 (format out "step ~D/~D: loss ~,4F  ~,0F ms  ~,0F tok/s~%" (1+ step) steps loss ms
                         (/ (* tokens 1000) ms))
                 (finish-output out)))))))
+    (when save (ngpt-save m save) (format out "saved ~A~%" save))
     (format out "wall ~,1F s~%" (/ (- (get-internal-real-time) t-start) internal-time-units-per-second))
     m))

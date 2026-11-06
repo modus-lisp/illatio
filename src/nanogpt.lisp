@@ -116,6 +116,52 @@
 (defun ngpt-params-vector (m)
   (copy-from-gbuf (ngpt-pbuf m) (f32vec (ngpt-n-params m))))
 
+;;; --- checkpoints --------------------------------------------------------------
+;;;
+;;; llm.c's shape: a 1024-byte header of int32s (magic, version, L, C, V, VP,
+;;; the softcap's bits, the parameter count), then the parameters as f32s in
+;;; the layout's order.  The optimizer's moments are not kept: a checkpoint is
+;;; for reading and editing, not for resuming.
+
+(defconstant +ngpt-magic+ 20261106)
+
+(defun raw-write (fd vector bytes)
+  "Write BYTES bytes of VECTOR (a specialized simple array) to FD."
+  (sb-sys:with-pinned-objects (vector)
+    (let ((sap (sb-sys:vector-sap vector)) (done 0))
+      (loop while (< done bytes)
+            do (multiple-value-bind (n err)
+                   (sb-unix:unix-write fd sap done (min (- bytes done) (ash 1 30)))
+                 (unless (and n (plusp n))
+                   (error "write failed after ~D of ~D bytes (errno ~A)" done bytes err))
+                 (incf done n))))))
+
+(defun ngpt-save (m path)
+  "Write M's parameters to PATH."
+  (let ((h (make-array 256 :element-type '(signed-byte 32) :initial-element 0))
+        (v (ngpt-params-vector m)))
+    (replace h (list +ngpt-magic+ 1 (ngpt-l m) (ngpt-c m) (ngpt-v m) (ngpt-vp m)
+                     (sb-kernel:single-float-bits (ngpt-cap m)) (length v)))
+    (ensure-directories-exist path)
+    (let ((fd (sb-unix:unix-open (namestring (merge-pathnames path))
+                                 (logior sb-unix:o_wronly sb-unix:o_creat sb-unix:o_trunc) #o644)))
+      (unless fd (error "cannot write ~A" path))
+      (unwind-protect (progn (raw-write fd h 1024) (raw-write fd v (* 4 (length v))))
+        (sb-unix:unix-close fd)))
+    path))
+
+(defun ngpt-load (path &key (b 8) (tt 1024) gpu)
+  "A model from the checkpoint at PATH, for batches of B x TT tokens."
+  (with-raw-file (fd path)
+    (let* ((h (read-header fd +ngpt-magic+))
+           (m (make-nanogpt :l (aref h 2) :c (aref h 3) :v (aref h 4) :vp (aref h 5)
+                            :cap (sb-kernel:make-single-float (aref h 6)) :b b :tt tt :gpu gpu))
+           (v (f32vec (aref h 7))))
+      (assert (= (length v) (ngpt-n-params m)))
+      (raw-read fd v (* 4 (length v)))
+      (copy-to-gbuf (ngpt-pbuf m) v)
+      m)))
+
 ;;; --- encoding -----------------------------------------------------------------
 
 (defmacro with-ngpt ((m) &body body)
