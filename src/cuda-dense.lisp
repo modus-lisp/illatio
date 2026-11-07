@@ -40,7 +40,7 @@
         (funcall (if (equal (model-arch m) "glm5-next") 'g53-cuda-state 'ds4f-cuda-state) (model-impl m))
         m)))
   (let ((m (let ((*matrices-in-file* t)) (load-model path :threads 1))))
-    (unless (member (model-arch m) '("qwen2" "qwen3" "llama" "qwen35") :test #'equal)
+    (unless (member (model-arch m) '("qwen2" "qwen3" "qwen3vl" "llama" "qwen35") :test #'equal)
       (error "the CUDA path runs qwen2, qwen3, llama and qwen35 models; this is ~A" (model-arch m)))
     (let* ((dev (open-cuda device))
            (cm (%make-cmodel :dev dev))

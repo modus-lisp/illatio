@@ -70,8 +70,11 @@
          (d (arch-key g arch "embedding_length"))
          (n-head (arch-key g arch "attention.head_count"))
          (vocab (make-vocab-from-gguf g)))
-    (unless (member arch '("qwen2" "qwen3" "qwen35" "llama") :test #'equal)
-      (error "architecture ~S is not supported (qwen2, qwen3, qwen35 and llama are)" arch))
+    ;; qwen3vl: Qwen3-VL's text model is qwen3's.  Its M-RoPE turns a token's
+    ;; frequencies by three positions, which for text are one and the same:
+    ;; NEOX RoPE.  (Pictures, which would need the others, are not read.)
+    (unless (member arch '("qwen2" "qwen3" "qwen3vl" "qwen35" "llama") :test #'equal)
+      (error "architecture ~S is not supported (qwen2, qwen3, qwen3vl's text, qwen35 and llama are)" arch))
     (flet ((q8 (name) (load-qmat g name))
            (f32 (name) (load-f32 g name))
            (opt (name f) (and (gguf-tensor g name nil) (funcall f name))))
@@ -90,7 +93,7 @@
        :rope-base (coerce (or (arch-key g arch "rope.freq_base") 10000) 'single-float)
        ;; llama.cpp's rope type per architecture: qwen2 rotates (i, i+d/2)
        ;; pairs (NEOX), llama rotates adjacent (2i, 2i+1) pairs.
-       :rope-neox (member arch '("qwen2" "qwen3" "qwen35") :test #'equal)
+       :rope-neox (member arch '("qwen2" "qwen3" "qwen3vl" "qwen35") :test #'equal)
        :rope-dims (or (arch-key g arch "rope.dimension_count")
                       (arch-key g arch "attention.key_length") (floor d n-head))
        :ssm-conv (or (arch-key g arch "ssm.conv_kernel") 0)
