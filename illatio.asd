@@ -24,6 +24,7 @@
      (:file "iquant")      ; IQ2_XXS / Q2_K (DeepSeek V4 Flash's experts), read in the file
      (:file "unicode-data") ; letter/number/space ranges, generated from SBCL's tables
      (:file "tokenizer")   ; byte-level BPE
+     (:file "steer")       ; directional steering: a direction per layer projected out (ds4's)
      (:file "model")       ; the forward pass
      (:file "batch")       ; prefill: three tokens per multiply
      (:file "qwen35")      ; Qwen3.5's hybrid layers: gated delta net, gated attention

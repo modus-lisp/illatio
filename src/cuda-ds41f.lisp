@@ -153,7 +153,7 @@
     (dk41-round dev low nlow qlow)
     (dk-q8mv st (lname li "attn_output_b.weight") low aout :q qlow)
     (dk41-round dev aout d)
-    (dk-hc-post m st aout sa pca sb)
+    (dk-hc-post m st aout sa pca sb (cons li :attn))
     (dk41-round dev sb (* (ds4f-n-hc m) d))))
 
 (defun dk41-ffn-head (m st l li sb)

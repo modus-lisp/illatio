@@ -233,6 +233,10 @@
 
 (defstruct (dbuf (:constructor %make-dbuf)) (ptr 0 :type (unsigned-byte 64)) (bytes 0 :type (unsigned-byte 62)) dev)
 
+(defvar *cuda-alloc-hook* nil
+  "A function called with each new DBUF, or NIL: how a PARKING learns its
+   owner's buffers (cuda-park below).")
+
 (defun cuda-alloc (dev bytes &key (zero t))
   "BYTES of DEV's memory (zeroed unless ZERO is NIL)."
   (with-cuda
@@ -241,7 +245,18 @@
       (cu "cuMemAlloc_v2" (sb-sys:system-area-pointer (out-ptr p)) (sb-alien:unsigned-long (max bytes 256)))
       (let ((b (%make-dbuf :ptr p :bytes bytes :dev dev)))
         (when zero (cuda-zero b))
+        (when *cuda-alloc-hook* (funcall *cuda-alloc-hook* b))
         b))))
+
+(defun cuda-realloc (b)
+  "Device memory again for B, freed: a new address in the same DBUF."
+  (assert (zerop (dbuf-ptr b)))
+  (with-cuda
+    (cuda-current (dbuf-dev b))
+    (with-out (p)
+      (cu "cuMemAlloc_v2" (sb-sys:system-area-pointer (out-ptr p)) (sb-alien:unsigned-long (max (dbuf-bytes b) 256)))
+      (setf (dbuf-ptr b) p)))
+  b)
 
 (defun cuda-free (b)
   (when (and b (plusp (dbuf-ptr b)))
@@ -423,3 +438,82 @@
     (cond ((zerop r) t)
           ((= r 600) nil)                   ; CUDA_ERROR_NOT_READY
           (t (error "CUDA: cuEventQuery: ~A" (cuda-error-string r))))))
+
+;;; --- parking: one program's device memory moved aside for another's ---------------
+;;; A PARKING keeps the buffers its owner allocated (CUDA-ALLOC while
+;;; WITH-PARKING-RECORD binds the hook) and can move them all to pinned host
+;;; memory (CUDA-PARK: the device memory freed) and back (CUDA-UNPARK: new
+;;; device memory, in the same DBUFs, so whatever holds them holds them
+;;; still).  Buffers recorded as CONST (weights) are copied out once; the rest
+;;; (scratch, caches) every time.  The owner must not run while parked.
+
+(defstruct (parking (:constructor make-parking (&optional name)))
+  name
+  (bufs '())                                  ; every DBUF recorded, newest first
+  (const (make-hash-table :test 'eq))         ; DBUF -> T: its contents never change
+  (host (make-hash-table :test 'eq))          ; DBUF -> its pinned host copy (a SAP)
+  (saved (make-hash-table :test 'eq))         ; DBUF -> T: the host copy is current
+  (parked '())                                ; the DBUFs moved out, whose memory is to come back
+  (bytes 0))
+
+(defun parking-recorder (parking const)
+  "A *CUDA-ALLOC-HOOK* recording new buffers in PARKING (as CONST: weights).
+   What their owner frees is dropped from the record now and then."
+  (let ((n 0))
+    (lambda (b)
+      (when (> (incf n) 4096)
+        (setf n 0
+              (parking-bufs parking)
+              (delete-if (lambda (x) (and (zerop (dbuf-ptr x)) (not (gethash x (parking-host parking)))))
+                         (parking-bufs parking))))
+      (push b (parking-bufs parking))
+      (when const (setf (gethash b (parking-const parking)) t)))))
+
+(defmacro with-parking-record ((parking &key const) &body body)
+  "BODY's device allocations recorded in PARKING (as CONST: weights), and in
+   no other: an outer record (a global one) is shadowed."
+  `(let ((*cuda-alloc-hook* (parking-recorder ,parking ,const))) ,@body))
+
+(defun cuda-parked-p (parking) (and (parking-parked parking) t))
+
+(defun cuda-park (parking)
+  "PARKING's buffers out to pinned host memory, their device memory freed.
+   Buffers their owner freed are forgotten.  Returns the bytes moved aside.
+   A buffer is in PARKING-PARKED as soon as it is freed, so a failure part
+   way leaves what was moved out to come back."
+  (let ((live '()) (out (make-hash-table :test 'eq)))
+    (dolist (b (parking-parked parking)) (setf (gethash b out) t))   ; still out from before (a failed CUDA-UNPARK)
+    (dolist (b (parking-bufs parking))
+      (cond ((plusp (dbuf-ptr b)) (push b live))
+            ((gethash b out))
+            (t (let ((h (gethash b (parking-host parking))))   ; freed by its owner
+                 (when h (cuda-host-free h) (remhash b (parking-host parking)))
+                 (remhash b (parking-const parking)) (remhash b (parking-saved parking))))))
+    (setf live (nreverse live)
+          (parking-bufs parking) (append live (parking-parked parking))
+          (parking-bytes parking) (reduce #'+ (parking-parked parking) :key #'dbuf-bytes))
+    (with-cuda
+      (dolist (b live)
+        (cuda-current (dbuf-dev b))       ; (the host memory wants a current context too)
+        (unless (and (gethash b (parking-const parking)) (gethash b (parking-saved parking)))
+          (let ((h (or (gethash b (parking-host parking))
+                       (setf (gethash b (parking-host parking)) (cuda-host-alloc (dbuf-bytes b))))))
+            (cuda-download b h (dbuf-bytes b))
+            (setf (gethash b (parking-saved parking)) t)))
+        (cuda-free b)
+        (push b (parking-parked parking))
+        (incf (parking-bytes parking) (dbuf-bytes b))))
+    (parking-bytes parking)))
+
+(defun cuda-unpark (parking)
+  "PARKING's buffers back on their devices, as they were."
+  (let ((done '()))
+    (handler-bind ((error (lambda (e) (declare (ignore e))   ; out of memory: leave it all parked
+                            (dolist (b done) (cuda-free b)))))
+      (with-cuda
+        (dolist (b (parking-parked parking))
+          (cuda-realloc b)
+          (push b done)
+          (cuda-upload b (gethash b (parking-host parking)) (dbuf-bytes b))))))
+  (setf (parking-parked parking) '())
+  parking)

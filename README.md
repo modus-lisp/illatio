@@ -248,7 +248,7 @@ bin/illatio-server -m PATH [--host 127.0.0.1] [--port 9931] [-c 8192] [-n 2048]
 ```
 
 It answers `POST /v1/chat/completions` (streamed with `"stream": true`),
-`GET /v1/models` and `GET /health`, on loopback unless told otherwise: there
+`GET /v1/models` and `GET /health` (and pictures, with `--images`: below), on loopback unless told otherwise: there
 is no authentication in front of it.
 
 A web UI comes from wherever its files are: `--path DIR` serves DIR at `/`
@@ -275,6 +275,41 @@ SSE, tool calls and reasoning included), `GET /v1/models` (with
 `context_length`, which operandi reads to size its compaction budget), and
 `GET /health`.  One request runs at a time.  A request that extends the
 previous one (an agent's growing conversation) evaluates only the new tokens.
+
+**Pictures too.** `--images DIR` loads [ex-nihilo](../ex-nihilo), a sibling
+checkout, into the same server: Qwen-Image's weights from DIR (`--image-encoder
+FILE` for another prompt encoder), answering `POST /v1/images/generations`
+(OpenAI's image API) and `GET /images` (a page to try it).  illatio does not
+depend on ex-nihilo; the flag loads it, and fails with a message when it
+isn't there.  The two take turns on the GPUs: ex-nihilo's models wait in
+pinned host memory, and a picture is made between chat requests, the chat
+model moved to host memory meanwhile (its weights copied out once, its
+caches each time; DeepSeek's expert pools simply given up, and seeded again
+after).  With a 4B chat model on the 3090, a 1024² picture took 15-17 s
+(12.5 s alone): about 2 s to bring Qwen-Image back, 1.5 s to put it away.
+
+**Steering.** Directional steering, as ds4 does it: one direction per layer,
+taken out of each layer's FFN output (and, if asked, its attention output),
+`y ← y − scale · u (u·y)`.  Scale 1 removes the direction, 0 leaves the
+model as it was (bit for bit), a negative scale amplifies it; past about ±2
+models fall into repetition.  A file is f32 rows of the model's width, one
+per layer, so ds4's `.f32` files load as they are.
+
+```
+bin/illatio --gpu -m M --steer-build dir.f32 --targets a.txt --contrasts b.txt
+bin/illatio --gpu -m M --steer dir.f32 --steer-ffn -1 --chat
+bin/illatio-server -m M --steer dir.f32          # a request may send "steering": {"ffn": F, "attn": F}
+```
+
+`--steer-build` writes the mean last-token FFN output of the target prompts
+less the contrast prompts' (`--steer-at attn` for the attention's), each a
+user turn in the model's chat template, a unit vector per layer.  It applies
+to the dense models (CPU and CUDA) and DeepSeek V4, V4.1 and GLM-5.3 on CUDA;
+not yet on Metal, nor to Qwen3.5.  A change of steering starts a cached
+prompt over.  What a direction captures depends on the model: ds4 reports
+a clean terse/verbose axis for DeepSeek V4 from its verbosity pairs; for
+Qwen3-4B the same pairs give something less clean (at −1 one answer grew
+and another shrank).
 
 **In a Lisp image.**
 

@@ -10,6 +10,10 @@
 ;;;        (/chat/completions too, as llama-server takes it)
 ;;;   GET  anything else          -> a file under STATIC (SERVE's), if given:
 ;;;        a web UI's, e.g. llama.cpp's (tools/server/public_simplechat)
+;;;
+;;; Another program may add routes (*ROUTES*) and models (*MORE-MODELS*),
+;;; and borrow the GPUs between requests (LEND-DEVICES): ex-nihilo's
+;;; pictures, loaded by bin/illatio-server --images.
 
 (in-package #:illatio)
 
@@ -90,13 +94,64 @@
     (write-sequence body s)
     (force-output s)))
 
+;;; --- other programs' routes, and the GPUs lent to them -----------------------------
+
+(defvar *routes* '()
+  "(METHOD PATHS FUNCTION) entries: a request for one of PATHS by METHOD is
+   FUNCTION's, called with the stream and the body (a string).")
+
+(defvar *more-models* '() "More entries for GET /v1/models (objects).")
+
+(defun add-route (method paths function)
+  (setf *routes* (cons (list method paths function)
+                       (remove-if (lambda (r) (and (string= (first r) method) (intersection (second r) paths :test #'string=)))
+                                  *routes*))))
+
+(defun model-lend (m)
+  "Move model M's device memory aside where it is a cache: (values thunk
+   bytes), THUNK putting it back.  DeepSeek's and GLM's experts' pools on
+   CUDA; other models keep theirs (0 bytes)."
+  #+(and sbcl linux)
+  (let ((impl (model-impl m)))
+    (when (and impl (member (model-arch m) '("deepseek4" "deepseek41" "glm5-next") :test #'equal))
+      (let ((st (getf (ds4f-gpu-plist impl) :cuda)))
+        (when st (return-from model-lend (d4-lend impl st))))))
+  (values (lambda ()) 0))
+
+(defvar *chat-parking* nil
+  "The chat model's device memory, recorded (LOAD-LENDABLE) so that it can
+   be moved to host memory while the GPUs are lent; or NIL.")
+
+(defun load-lendable (thunk)
+  "THUNK's result (a model loaded), its device memory recorded in
+   *CHAT-PARKING* (as weights), and all device memory allocated outside
+   another record from now on (contexts' caches, scratch) as well."
+  (setf *chat-parking* (make-parking "chat"))
+  (prog1 (with-parking-record (*chat-parking* :const t) (funcall thunk))
+    (setf *cuda-alloc-hook* (parking-recorder *chat-parking* nil))))
+
+(defun lend-devices (engine function)
+  "FUNCTION called with ENGINE's GPUs as free as can be: between its
+   requests (its lock held), its model's caches given up (MODEL-LEND) and,
+   when it was loaded by LOAD-LENDABLE, the rest of its device memory moved
+   to host memory; all of it back after."
+  (sb-thread:with-mutex ((engine-lock engine))
+    (multiple-value-bind (restore bytes) (model-lend (engine-model engine))
+      (declare (ignore bytes))
+      (unwind-protect
+           (progn
+             (when *chat-parking* (cuda-park *chat-parking*))
+             (unwind-protect (funcall function)
+               (when *chat-parking* (cuda-unpark *chat-parking*))))
+        (funcall restore)))))
+
 (defun error-object (message &optional (type "invalid_request_error"))
   (hobj "error" (hobj "message" message "type" type)))
 
 (defun models-object (engine)
   (let ((m (engine-model engine)))
     (hobj "object" "list"
-          "data" (vector (hobj "id" (model-name m)
+          "data" (apply #'vector (hobj "id" (model-name m)
                                "object" "model"
                                "owned_by" "illatio"
                                ;; what a client may send in one conversation:
@@ -104,7 +159,8 @@
                                "context_length" (context-n-ctx (engine-context engine))
                                "status" (hobj "value" "loaded")
                                "meta" (hobj "n_ctx_train" (model-context-length m)
-                                            "n_vocab" (model-n-vocab m)))))))
+                                            "n_vocab" (model-n-vocab m)))
+                         *more-models*))))
 
 ;; GET /props: what llama.cpp's web UI asks of its server (its model, context size, and whether
 ;; images or audio may be attached -- neither, here)
@@ -153,6 +209,9 @@
                       (respond s "400 Bad Request" (error-object "messages must be an array")))
                      ((jget req "stream") (stream-completion engine req s))
                      (t (respond s "200 OK" (chat-completion engine req))))))
+            ((let ((r (find-if (lambda (r) (and (string= method (first r)) (member path (second r) :test #'string=)))
+                               *routes*)))
+               (when r (funcall (third r) s body) t)))
             ((and static (string= method "GET") (static-file static path))
              (multiple-value-call #'respond-file s (static-file static path)))
             (t (respond s "404 Not Found" (error-object (format nil "no route for ~A ~A" method path)

@@ -448,6 +448,42 @@
     (format *error-output* "illatio: and ~D more (~,1F GB) on ~A~%" n (/ (* n sb) 1d9) (cudev-name dev))
     tr))
 
+;;; --- lending the devices ------------------------------------------------------------
+;;; The experts' slots are a cache of pinned host memory, so the devices can
+;;; be lent to another program between tokens (an image model: LEND-DEVICES,
+;;; server.lisp): the pool and the tier freed, the weights and the contexts'
+;;; caches kept; then the pool made again (seeded as at the start) and the
+;;; tier's experts copied back into it.
+
+(defun d4-lend (m st)
+  "Free ST's expert pool and its tier's: (values thunk bytes), THUNK making
+   them again.  Nothing may run on ST until it has."
+  (cuda-current (dk-dev st))
+  (cuda-stream-sync (dk-copy-stream st)) (cuda-stream-sync (dk-fill-stream st))
+  (d4-fills-done st)
+  (let ((tr (dk-tier st)) (bytes (dbuf-bytes (dk-pool st))))
+    (cuda-free (dk-pool st))
+    (when tr
+      (incf bytes (dbuf-bytes (dt-pool tr)))
+      (cuda-free (dt-pool tr))
+      (setf (dk-tier st) nil))
+    (values (lambda ()
+              (cuda-current (dk-dev st))
+              (d4-make-pool m st)
+              (when tr
+                (let* ((dev (dt-dev tr)) (sb (dk-slot-bytes st)) (ne (ds4f-n-expert m)))
+                  (cuda-current dev)
+                  (cuda-realloc (dt-pool tr))
+                  (loop for key from 0 below (length (dt-slot-of tr))
+                        for s = (aref (dt-slot-of tr) key)
+                        when (>= s 0)
+                          do (multiple-value-bind (li e) (floor key ne)
+                               (cuda-copy-in (dt-pool tr) (* s sb) (d4-expert-sap m st li e) sb)))
+                  (cuda-sync dev)
+                  (cuda-current (dk-dev st))
+                  (setf (dk-tier st) tr))))
+            bytes)))
+
 (defun d4-copy-expert (m st li e s &optional (stream (dk-copy-stream st)))
   "Queue layer LI's expert E's copy into slot S, on the copy stream."
   (cuda-copy-in (dk-pool st) (* s (dk-slot-bytes st)) (d4-expert-sap m st li e) (dk-slot-bytes st) stream)
@@ -756,8 +792,12 @@
     (launch dev "d4_hc_pre_fin" (ceiling d 256) 256
             (list d n (ds4f-sinkhorn m) 1f-6 mix (dvec st scale) (dvec st base) streams out pc))))
 
-(defun dk-hc-post (m st block streams pc out)
+(defun dk-hc-post (m st block streams pc out &optional steer)
+  "BLOCK (a layer's attention or FFN output) into the streams; first
+   steered when STEER, (layer . kind), says which it is (steer.lisp)."
   (let ((d (ds4f-d m)) (n (ds4f-n-hc m)))
+    (when (and steer (steer-wants-p (car steer) (cdr steer)))
+      (cuda-steer (dk-dev st) block (car steer) (cdr steer) 1 d))
     (launch (dk-dev st) "d4_hc_post" (ceiling (* n d) 256) 256 (list d n 1 1f-6 block streams pc out))))
 
 (defun dk-compressor (m st li c norm pos ratio wkv wgate ape normw rows-of n-of hd kind)
@@ -838,7 +878,7 @@
     (launch dev "d4_rope_q" nh hd (list hd nrot heads ics (car qheads) (cdr qheads)))
     (dk-q8mv st (lname li "attn_output_a.weight") heads low :group-rows (ds4f-lora-o m) :q qheads)
     (dk-q8mv st (lname li "attn_output_b.weight") low aout)
-    (dk-hc-post m st aout sa pca sb)))
+    (dk-hc-post m st aout sa pca sb (cons li :attn))))
 
 (defun dk-ffn-head (m st l li sb)
   "Layer LI's FFN up to the routing: HC pre of SB, the norm, the router's
@@ -911,7 +951,7 @@
     (launch dev "d4_moe_sum" (ceiling d 256) 256 (list d k bd (dbuf-of st :sout (* 4 d)) moe perm))
     (when round (launch dev "d41_round" (ceiling d 256) 256 (list d moe nil nil)))
     (unless hc (return-from dk-ffn-tail moe))
-    (dk-hc-post m st moe sb (dbuf-of st :pcf (* 4 32)) sa)
+    (dk-hc-post m st moe sb (dbuf-of st :pcf (* 4 32)) sa (cons li :ffn))
     (when round
       (let ((hcd (* (ds4f-n-hc m) d))) (launch dev "d41_round" (ceiling hcd 256) 256 (list hcd sa nil nil))))))
 

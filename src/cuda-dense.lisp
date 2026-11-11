@@ -115,6 +115,7 @@
   ;; qwen35's linear layers: scratch, and per layer (NIL for a full one) the
   ;; convolution's history and the delta net's state
   qkv z alpha beta c o qg gate conv ssm
+  steer                                 ; a layer's output apart from the residual, when steered
   (max-split 0 :type fixnum))
 
 (defconstant +att-chunk+ 64 "Positions a block of ATTN_DECODE takes at most (AD_CHUNK).")
@@ -176,6 +177,11 @@
           (cuda-upload-vector (cctx-rope st) tab))
         st))))
 
+(defun steer-buffer (dev st n d)
+  "The state's room for N rows of D, for a steered output (made the first time)."
+  (declare (ignore n))
+  (or (cctx-steer st) (setf (cctx-steer st) (cuda-alloc dev (* 4 *cuda-chunk* d) :zero nil))))
+
 (defun reset-cuda-state (ctx)
   "Zero the linear layers' state: the context starts over."
   (let ((st (getf (context-plist ctx) :cuda)))
@@ -195,7 +201,7 @@
 (defun free-cuda-state (ctx)
   (let ((st (getf (context-plist ctx) :cuda)))
     (when st
-      (dolist (s '(tokens x xq xs xsum h q k v att fa fb logits part rope qkv z alpha beta c o qg gate))
+      (dolist (s '(tokens x xq xs xsum h q k v att fa fb logits part rope qkv z alpha beta c o qg gate steer))
         (cuda-free (slot-value st s)))
       (cuda-free (car (find-if-not #'null (cctx-kc st))))
       (cuda-free (car (find-if-not #'null (cctx-vc st))))
@@ -256,6 +262,24 @@
    block sums into XSUM, unless NIL).  A single row is spread over a block
    per 256 of its elements."
   (launch dev "rmsnorm_q8" (list (if (= n 1) (ceiling d 256) 1) n) 256 (list x w nil xq xs xsum d eps)))
+
+(defun steer-device-dirs (dev)
+  "*STEERING*'s directions on DEV (copied the first time)."
+  (let ((s *steering*))
+    (or (gethash dev (steering-device s))
+        (setf (gethash dev (steering-device s))
+              (cuda-upload-vector (cuda-alloc dev (* 4 (length (steering-dirs s))) :zero nil) (steering-dirs s))))))
+
+(defun cuda-steer (dev y li kind n d &key add)
+  "STEER-ROWS! on the device: N rows of D at Y (a DBUF, or (DBUF . offset)),
+   the last captured, all steered; and added into ADD's rows when given."
+  (when *steer-capture*
+    (let ((b (if (consp y) (car y) y)) (off (if (consp y) (cdr y) 0)))
+      (funcall *steer-capture* li kind (cuda-floats b d (+ (floor off 4) (* (1- n) d))))))
+  (let ((scale (steer-scale li kind)))
+    (when (or add (/= scale 0f0))
+      (launch dev "steer_rows" n 256
+              (list y (if (zerop scale) nil (cons (steer-device-dirs dev) (* 4 li d))) scale d add)))))
 
 (defun attn-prefill-shape (dev hd)
   "(VALUES queries-per-warp shared-bytes) for ATTN_PREFILL: as many queries
@@ -371,12 +395,20 @@
                              (cctx-rope st) (svref (cctx-kc st) li) (svref (cctx-vc st) li)
                              nh nkv hd (model-rope-dims m) pos0 eps (if (model-rope-neox m) 1 0)))
                (attention dev m st li n pos0 visible)
-               (cmat-mul dev (cmat-of cm (layer-wo l)) xq xs x n :acc t :xsum xsum)
+               (if (steer-wants-p li :attn)       ; the output apart, steered, then added
+                   (let ((y (steer-buffer dev st n d)))
+                     (cmat-mul dev (cmat-of cm (layer-wo l)) xq xs y n :xsum xsum)
+                     (cuda-steer dev y li :attn n d :add x))
+                   (cmat-mul dev (cmat-of cm (layer-wo l)) xq xs x n :acc t :xsum xsum))
                (rmsnorm-q8 dev x (cvec-of cm (layer-ffn-norm l)) xq xs xsum d eps n)
                (glu-mul dev st (cmat-of cm (layer-wgate l)) (cmat-of cm (layer-wup l)) n f d)
                (launch dev "quant_q8" (ceiling (* n f) 256) 256
                        (list (cctx-fa st) xq xs xsum (list :i64 (floor (* n f) 32))))
-               (cmat-mul dev (cmat-of cm (layer-wdown l)) xq xs x n :acc t :xsum xsum))
+               (if (steer-wants-p li :ffn)
+                   (let ((y (steer-buffer dev st n d)))
+                     (cmat-mul dev (cmat-of cm (layer-wdown l)) xq xs y n :xsum xsum)
+                     (cuda-steer dev y li :ffn n d :add x))
+                   (cmat-mul dev (cmat-of cm (layer-wdown l)) xq xs x n :acc t :xsum xsum)))
       (when logits
         (rmsnorm-q8 dev (cons x (* 4 (1- n) d)) (cvec-of cm (model-output-norm m)) xq xs xsum d eps 1)
         (cmat-mul dev (cmat-of cm (model-output m)) xq xs (cctx-logits st) 1 :xsum xsum)

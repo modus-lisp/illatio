@@ -48,6 +48,17 @@ flags:
                       on CUDA
   --device N          the CUDA device to run on (implies --gpu; default 0)
   -s, --system TEXT   system prompt for --chat
+  --steer FILE        directional steering (ds4's): one direction per layer, f32
+                      rows of the model's width (a ds4 .f32 file loads as it is),
+                      taken out of each layer's FFN output; --steer-build makes one
+  --steer-ffn F       its scale there: 1 removes the direction, 0 leaves it, a
+                      negative scale amplifies it (default 1)
+  --steer-attn F      its scale on each attention output (default 0)
+  --steer-build OUT --targets FILE --contrasts FILE
+                      make a steering file: the mean last-token FFN output (or
+                      attention's, with --steer-at attn) of the target prompts
+                      less the contrast prompts', per layer (one prompt a line,
+                      each a user turn in the model's chat template; --raw: as is)
   -h, --help          this
 ")
 
@@ -58,6 +69,7 @@ usage:
   illatio-server [flags]
 
   POST /v1/chat/completions   (\"stream\": true for server-sent events)
+  POST /v1/images/generations (with --images)
   GET  /v1/models
   GET  /health
 
@@ -80,6 +92,22 @@ flags:
   --mmproj PATH       a vision projector (llama.cpp's mmproj GGUF): pictures in
                       requests' image_url parts (DeepSeek V4.1 Flash, with --gpu)
   --mmproj-device N   the CUDA device it runs on (default the last)
+  --images DIR        also make pictures: ex-nihilo (a sibling checkout) with the
+                      Qwen-Image weights in DIR, at POST /v1/images/generations
+                      and GET /images.  They wait in host memory; a picture
+                      borrows the GPUs between chat requests, the chat model
+                      moved to host memory meanwhile (DeepSeek's expert pools
+                      given up, and made again after)
+  --image-encoder FILE  the prompt encoder instead of DIR's te-q8_0.gguf
+  --image-device N    the CUDA device the pictures are made on (default 0)
+  --image-encoder-device N|cpu  where the prompt is encoded (default 1)
+  --steer FILE        directional steering (ds4's): one direction per layer, f32
+                      rows of the model's width (a ds4 .f32 file loads as it is),
+                      taken out of each layer's FFN output; --steer-build makes one
+  --steer-ffn F       its scale there: 1 removes the direction, 0 leaves it, a
+                      negative scale amplifies it (default 1)
+  --steer-attn F      its scale on each attention output (default 0)
+                      (a request's \"steering\": {\"ffn\": F, \"attn\": F} sets them for it)
   -h, --help          this
 ")
 
@@ -93,6 +121,9 @@ flags:
           do (let ((a (pop args)))
                (flet ((val () (or (pop args) (die "~A needs a value" a)))
                       (int (s) (or (parse-integer s :junk-allowed t) (die "~A is not a number" s)))
+                      (num (s) (let ((*read-default-float-format* 'single-float))
+                                 (let ((x (ignore-errors (read-from-string s))))
+                                   (if (realp x) (coerce x 'single-float) (die "~A is not a number" s)))))
                       (int-list (s)
                         (mapcar (lambda (x) (or (parse-integer x :junk-allowed t) (die "~A is not a number" x)))
                                 (uiop:split-string s :separator ","))))
@@ -121,6 +152,22 @@ flags:
                    ((string= a "--host") (setf (getf opts :host) (val)))
                    ((string= a "--port") (setf (getf opts :port) (int (val))))
                    ((string= a "--path") (setf (getf opts :static) (val)))
+                   ((string= a "--steer") (setf (getf opts :steer) (val)))
+                   ((string= a "--steer-ffn") (setf (getf opts :steer-ffn) (num (val))))
+                   ((string= a "--steer-attn") (setf (getf opts :steer-attn) (num (val))))
+                   ((string= a "--steer-build") (setf (getf opts :mode) :steer-build (getf opts :steer-out) (val)))
+                   ((string= a "--targets") (setf (getf opts :targets) (val)))
+                   ((string= a "--contrasts") (setf (getf opts :contrasts) (val)))
+                   ((string= a "--steer-at")
+                    (let ((v (val)))
+                      (unless (member v '("ffn" "attn") :test #'string=) (die "--steer-at is ffn or attn"))
+                      (setf (getf opts :steer-at) (if (string= v "ffn") :ffn :attn))))
+                   ((string= a "--raw") (setf (getf opts :raw) t))
+                   ((string= a "--images") (setf (getf opts :images) (val)))
+                   ((string= a "--image-encoder") (setf (getf opts :image-encoder) (val)))
+                   ((string= a "--image-device") (setf (getf opts :image-device) (int (val))))
+                   ((string= a "--image-encoder-device")
+                    (let ((v (val))) (setf (getf opts :image-encoder-device) (if (string-equal v "cpu") :cpu (int v)))))
                    ((string= a "--reasoning-format")
                     (let ((v (val)))
                       (unless (member v '("none" "deepseek") :test #'string=) (die "--reasoning-format is none or deepseek"))
@@ -180,6 +227,15 @@ flags:
                                           "CUDA, its experts in host memory"))
               #-(or (and sbcl darwin) (and sbcl linux)) nil
               (/ (- (get-internal-real-time) t0) internal-time-units-per-second))
+      (when (getf opts :steer)
+        (unless (probe-file (getf opts :steer)) (die "--steer: no file ~A" (getf opts :steer)))
+        (setf illatio::*steering*
+              (handler-case (illatio::load-steering (getf opts :steer) m :ffn (getf opts :steer-ffn 1f0)
+                                                                         :attn (getf opts :steer-attn 0f0))
+                (error (e) (die "--steer: ~A" e))))
+        (format *error-output* "illatio: steering by ~A (~D layers; ffn ~,2F, attention ~,2F)~%"
+                (file-namestring (getf opts :steer)) (illatio::steering-n-layer illatio::*steering*)
+                (illatio::steering-ffn illatio::*steering*) (illatio::steering-attn illatio::*steering*)))
       m)))
 
 (defun out (text) (write-string text) (force-output))
@@ -224,19 +280,59 @@ flags:
                     (jget tm "prompt_n") (jget tm "cache_n"))
             (setf messages (append messages (list msg)))))))))
 
+(defun load-images (opts)
+  "ex-nihilo's image model, when --images asks for it: loaded (ASDF finds the
+   sibling checkout; illatio does not depend on it) and moved to host
+   memory before the chat model sizes its device memory.  Its tenant."
+  (let ((dir (getf opts :images)))
+    (when dir
+      (unless (uiop:directory-exists-p dir) (die "--images: no directory ~A" dir))
+      (when (and (getf opts :image-encoder) (not (probe-file (getf opts :image-encoder))))
+        (die "--image-encoder: no file ~A" (getf opts :image-encoder)))
+      (unless (asdf:find-system "ex-nihilo/server" nil)
+        (die "--images needs ex-nihilo, a checkout beside illatio's"))
+      (handler-bind ((warning #'muffle-warning))
+        (asdf:load-system "ex-nihilo/server"))
+      (let ((ed (getf opts :image-encoder-device 1)))
+        (uiop:symbol-call '#:ex-nihilo '#:make-tenant
+                          :weights dir :encoder (getf opts :image-encoder)
+                          :device (getf opts :image-device 0) :encoder-device (if (eq ed :cpu) nil ed))))))
+
 (defun run-serve (opts)
   (multiple-value-bind (host port) (parse-addr (getf opts :addr) (getf opts :host) (getf opts :port))
-    (let* ((m (load-it opts))
+    (let* ((images (load-images opts))
+           ;; with pictures the chat model's device memory is recorded, to be lent to them
+           (m (if images (illatio::load-lendable (lambda () (load-it opts))) (load-it opts)))
            (engine (apply #'make-engine m :n-ctx (getf opts :ctx)
                           (and (getf opts :predict-given) (list :max-tokens (getf opts :predict))))))
       (when (and (getf opts :static) (not (uiop:directory-exists-p (getf opts :static))))
         (die "--path: no directory ~A" (getf opts :static)))
       (setf illatio::*reasoning-inline* (getf opts :reasoning-inline))
+      (when images (uiop:symbol-call '#:ex-nihilo '#:attach-tenant images engine))
       (serve engine :host host :port port :static (getf opts :static))
       (format *error-output* "illatio: serving http://~A:~D/v1 (context ~D)~%" host port (getf opts :ctx))
       (when (getf opts :static)
         (format *error-output* "illatio: and ~A at http://~A:~D/~%" (getf opts :static) host port))
+      (when images
+        (format *error-output* "illatio: and pictures at http://~A:~D/v1/images/generations (try http://~A:~D/images)~%"
+                host port host port))
       (loop (sleep 3600)))))
+
+(defun prompt-lines (path what)
+  (unless (and path (probe-file path)) (die "--steer-build needs ~A FILE" what))
+  (or (remove-if (lambda (l) (zerop (length (string-trim " " l)))) (uiop:read-file-lines path))
+      (die "~A: no prompts" path)))
+
+(defun run-steer-build (opts)
+  (let* ((targets (prompt-lines (getf opts :targets) "--targets"))
+         (contrasts (prompt-lines (getf opts :contrasts) "--contrasts"))
+         (m (load-it (list* :steer nil opts)))
+         (wrap (lambda (p)
+                 (if (getf opts :raw) p
+                     (illatio::render-chat m (vector (hobj "role" "user" "content" p)) nil :thinking nil)))))
+    (illatio::build-direction m (mapcar wrap targets) (mapcar wrap contrasts)
+                              :kind (getf opts :steer-at :ffn) :out (getf opts :steer-out))
+    (format *error-output* "illatio: wrote ~A (and its .json)~%" (getf opts :steer-out))))
 
 (defun run-bench (opts)
   "llama-bench's pp and tg tests, timed the way it times them: random
@@ -294,6 +390,7 @@ flags:
     (cond ((getf opts :help) (write-string +usage+))
           ((eq (getf opts :mode) :serve) (run-serve opts))
           ((eq (getf opts :mode) :bench) (run-bench opts))
+          ((eq (getf opts :mode) :steer-build) (run-steer-build opts))
           ((eq (getf opts :mode) :chat) (run-chat opts (and (plusp (length text)) text)))
           ((plusp (length text)) (run-complete opts text))
           (t (write-string +usage+) (uiop:quit 2)))))

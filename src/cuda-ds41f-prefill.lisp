@@ -199,7 +199,7 @@
     (dk41-round dev low (* n groups rank))
     (dk-q8mm st (lname li "attn_output_b.weight") low aout n)
     (dk41-round dev aout (* n d))
-    (dk-hc-post-chunk m st aout sa pca sb n)
+    (dk-hc-post-chunk m st aout sa pca sb n (cons li :attn))
     (dk41-round dev sb (* n (ds4f-n-hc m) d))))
 
 (defun dk41-ffn-chunk (m st l li n toks slots sb sa &optional small)

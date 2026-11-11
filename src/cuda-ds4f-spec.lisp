@@ -126,7 +126,7 @@
           (launch dev "d4_moe_sum_rows" (ceiling (* n d) 256) 256
                   (list d nu n down (dk-put st (coerce smap 'list)) (pb st :p-sout (* n d)) moe))
           (when *dk41-round-moe* (launch dev "d41_round" (ceiling (* n d) 256) 256 (list (* n d) moe nil nil)))
-          (dk-hc-post-chunk m st moe sb (pb st :p-pcf (* n 32)) sa n)
+          (dk-hc-post-chunk m st moe sb (pb st :p-pcf (* n 32)) sa n (cons li :ffn))
           (when *dk41-round-moe*
             (let ((k (* n (ds4f-n-hc m) d))) (launch dev "d41_round" (ceiling k 256) 256 (list k sa nil nil)))))))
     held))

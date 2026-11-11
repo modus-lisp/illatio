@@ -369,14 +369,40 @@
 
 (defstruct (engine (:constructor %make-engine))
   model context
+  side                                  ; a second, smaller context for other prompts (PICK-CONTEXT), or NIL
+  (side-n-ctx 0)
   (max-tokens 2048)                     ; a request's max_tokens when it gives none
   (lock (sb-thread:make-mutex :name "illatio engine")))
+
+(defparameter *side-context-tokens* 32768
+  "The side context's size: room for an agent's side requests (a fetched
+   page checked, a summary), which would otherwise evict its conversation.")
+
+(defparameter *side-keep-tokens* 2048
+  "A cached conversation at least this long is kept from a request that
+   shares less than half of it: that request goes to the side context.")
+
+(defun pick-context (engine ids max)
+  "The context for prompt IDS (and up to MAX tokens of reply): the main one,
+   unless that would throw away most of a long cached conversation and the
+   side context holds the request -- an agent's side requests (a fetched page
+   checked, a summary) then leave its conversation cached."
+  (let* ((main (engine-context engine)) (have (context-tokens main))
+         (common (or (mismatch have ids) (length ids))))
+    (if (and (plusp (engine-side-n-ctx engine))
+             (>= (length have) *side-keep-tokens*)
+             (< common (floor (length have) 2))
+             (<= (+ (length ids) max) (engine-side-n-ctx engine)))
+        (or (engine-side engine)
+            (setf (engine-side engine) (make-context (engine-model engine) :n-ctx (engine-side-n-ctx engine))))
+        main)))
 
 (defun make-engine (model &key (n-ctx (min 32768 (model-context-length model))) (max-tokens 2048))
   "A model and the one live context requests share.  One request runs at a
    time; consecutive requests that share a prefix (an agent's growing
    conversation) reuse its KV cache."
-  (%make-engine :model model :context (make-context model :n-ctx n-ctx) :max-tokens max-tokens))
+  (%make-engine :model model :context (make-context model :n-ctx n-ctx) :max-tokens max-tokens
+                :side-n-ctx (if (> n-ctx (* 2 *side-context-tokens*)) *side-context-tokens* 0)))
 
 (defun hobj (&rest kv)
   (let ((h (make-hash-table :test 'equal)))
@@ -394,13 +420,25 @@
     (cond ((stringp s) (list s))
           ((vectorp s) (coerce (remove-if-not #'stringp s) 'list)))))
 
+(defun request-steering (req)
+  "*STEERING* as REQ's \"steering\" object sets its scales (\"ffn\",
+   \"attn\"), or as it is."
+  (let ((o (jget req "steering")) (s *steering*))
+    (if (and s (hash-table-p o))
+        (let ((c (copy-steering s)))
+          (flet ((num (k) (let ((v (jget o k))) (and (realp v) (coerce v 'single-float)))))
+            (when (num "ffn") (setf (steering-ffn c) (num "ffn")))
+            (when (num "attn") (setf (steering-attn c) (num "attn"))))
+          c)
+        s)))
+
 (defun chat-completion (engine req &key on-text)
   "Answer the chat-completions request REQ (a parsed JSON object).  ON-TEXT,
    if given, gets the reply's text as it is generated (for streaming).
    Returns the response object."
   (sb-thread:with-mutex ((engine-lock engine))
-    (let* ((m (engine-model engine))
-           (ctx (engine-context engine))
+    (let* ((*steering* (request-steering req))
+           (m (engine-model engine))
            (thinking (request-thinking req))
            (ds4f (member (model-arch m) '("deepseek4" "deepseek41") :test #'equal))
            (glm (equal (model-arch m) "glm5-next"))
@@ -408,9 +446,11 @@
            (prompt (let ((*image-parts* images))
                      (render-chat m (jget req "messages") (jget req "tools") :thinking thinking)))
            (ids (prompt-ids m prompt images))
-           (max (let ((n (or (jget req "max_completion_tokens") (jget req "max_tokens") (engine-max-tokens engine))))
-                  ;; -1 (llama.cpp's web UI) or 0: no limit but the context's room
-                  (if (and (integerp n) (plusp n)) n (max 1 (- (context-n-ctx ctx) (length ids))))))
+           (asked (let ((n (or (jget req "max_completion_tokens") (jget req "max_tokens") (engine-max-tokens engine))))
+                    (and (integerp n) (plusp n) n)))
+           (ctx (pick-context engine ids (or asked 0)))
+           ;; -1 (llama.cpp's web UI) or 0: no limit but the context's room
+           (max (or asked (max 1 (- (context-n-ctx ctx) (length ids)))))
            (t0 (get-internal-real-time))
            (t1 nil))
       (multiple-value-bind (text out reason reused)

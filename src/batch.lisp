@@ -266,6 +266,7 @@
                    (attend-head! ctx li q (+ (* tk qd) (* hh hd)) att (+ pos0 tk 1) hh))))
              (quantize-batch! att n ab pool)
              (matmul! pool (layer-wo l) ab h)
+             (when (steer-wants-p li :attn) (steer-rows! h li :attn n d))
              (add! x h (* n d))          ; elementwise, so whole rows at once
              (dotimes (tk n) (rmsnorm! x (layer-ffn-norm l) h eps (* tk d)))
              (quantize-batch! h n xb pool)
@@ -274,6 +275,7 @@
              (swiglu-par! pool fa fb (* n f))
              (quantize-batch! fa n fbq pool)
              (matmul! pool (layer-wdown l) fbq h)
+             (when (steer-wants-p li :ffn) (steer-rows! h li :ffn n d))
              (add! x h (* n d)))
     (incf (context-pos ctx) n)
     (when logits

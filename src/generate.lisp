@@ -74,6 +74,11 @@
   "Make the cache hold exactly IDS, re-evaluating only past the prefix it
    already has, and leave the logits of the last one.  Returns how many
    tokens were reused."
+  ;; a cache made under other steering is no prefix of this one's
+  (unless (equal (getf (context-plist ctx) :steer-key) (steer-key))
+    (setf (context-tokens ctx) '() (getf (context-plist ctx) :steer-key) (steer-key))
+    (when (and (model-recurrent-p (context-model ctx)) (not (model-rewinds-p (context-model ctx))))
+      (reset-recurrent! ctx)))
   (let* ((have (context-tokens ctx))
          (common (or (mismatch have ids) (length ids))))
     ;; The last prompt token is always re-run even when cached: its logits

@@ -199,7 +199,7 @@
               (list p (g53-kda-lb m) (ds4f-eps m) qkv graw braw og (dvec st (gl-dt-bias l)) (dvec st (gl-a-log l))
                     (dvec st (gl-o-norm l)) (second bufs) o))
       (dk-mv st (lname li "kda_output.weight") o aout)
-      (dk-hc-post m st aout sa pca sb))))
+      (dk-hc-post m st aout sa pca sb (cons li :attn)))))
 
 (defun g53k-dsa (m st l li bufs pos sa sb)
   "DSA layer LI for the token at POS: streams SA into SB."
@@ -242,7 +242,7 @@
                 :shared (* 4 ns))
         (dk-q8mv st (lname li "attn_v_b.weight") lv heads :group-rows vd)
         (dk-mv st (lname li "attn_output.weight") heads aout)
-        (dk-hc-post m st aout sa pca sb)))))
+        (dk-hc-post m st aout sa pca sb (cons li :attn))))))
 
 (defun g53k-dense-ffn (m st l li sb sa)
   "Dense FFN layer LI: streams SB into SA."
@@ -257,7 +257,7 @@
     (dk-mv st (lname li "ffn_up.weight") norm2 u :q qn2)
     (launch dev "d4_swiglu_w" (ceiling ff 256) 256 (list 1 ff (g53-clamp m) g u one mid (car qmid) (cdr qmid)))
     (dk-mv st (lname li "ffn_down.weight") mid out :q qmid)
-    (dk-hc-post m st out sb pcf sa)))
+    (dk-hc-post m st out sb pcf sa (cons li :ffn))))
 
 (defun g53k-head (m st streams)
   "The streams' mean, normed, to the logits (:OUT)."
@@ -478,7 +478,7 @@
               (list p n q k v graw braw (second bufs) o (if *g53-keep* 0 -1) (and *g53-keep* (second (svref *g53-keep* li)))))
       (launch dev "g53_kda_out" (list nh n) 128 (list p (ds4f-eps m) o og (dvec st (gl-o-norm l))))
       (dk-mmx st (lname li "kda_output.weight") o aout n)
-      (dk-hc-post-chunk m st aout sa pca sb n))))
+      (dk-hc-post-chunk m st aout sa pca sb n (cons li :attn)))))
 
 (defun g53p-dsa (m st l li bufs pos0 n sa sb)
   (destructuring-bind (cache ixk tail) bufs
@@ -536,7 +536,7 @@
                 (dk-mm st "d4_mm_q8_0" (cons (cmat-qs wv) (* h vd lat)) (cons (cmat-d wv) (* 2 h vd (floor lat 32)))
                        0 vd lat (cons lv (* 4 h lat)) (cons heads (* 4 h vd)) n :x-stride (* nh lat) :y-stride (* nh vd)))))
         (dk-mmx st (lname li "attn_output.weight") heads aout n)
-        (dk-hc-post-chunk m st aout sa pca sb n)))))
+        (dk-hc-post-chunk m st aout sa pca sb n (cons li :attn))))))
 
 (defun g53p-dense-ffn (m st l li n sb sa)
   (let* ((dev (dk-dev st)) (d (ds4f-d m)) (ff (cmat-rows (gethash (lname li "ffn_gate.weight") (dk-q8 st))))
@@ -548,7 +548,7 @@
     (dk-mmx st (lname li "ffn_up.weight") norm2 u n)
     (launch dev "d4_swiglu_w" (ceiling (* n ff) 256) 256 (list n ff (g53-clamp m) g u (pb st :p-ones n) mid nil nil))
     (dk-mmx st (lname li "ffn_down.weight") mid out n)
-    (dk-hc-post-chunk m st out sb pcf sa n)))
+    (dk-hc-post-chunk m st out sb pcf sa n (cons li :ffn))))
 
 (defun g53-cuda-prefill-1 (ctx tokens logits)
   "TOKENS at CTX's next positions, layer-major on the device."

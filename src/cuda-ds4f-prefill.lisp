@@ -157,8 +157,11 @@
                   (dvec st (if (eq which :attn) (dl-hc-attn-scale l) (dl-hc-ffn-scale l)))
                   (dvec st (if (eq which :attn) (dl-hc-attn-base l) (dl-hc-ffn-base l))) streams out pc))))
 
-(defun dk-hc-post-chunk (m st block streams pc out n)
+(defun dk-hc-post-chunk (m st block streams pc out n &optional steer)
+  "DK-HC-POST for N tokens."
   (let ((d (ds4f-d m)) (nh (ds4f-n-hc m)))
+    (when (and steer (steer-wants-p (car steer) (cdr steer)))
+      (cuda-steer (dk-dev st) block (car steer) (cdr steer) n d))
     (launch (dk-dev st) "d4_hc_post" (ceiling (* n nh d) 256) 256 (list d nh n 1f-6 block streams pc out))))
 
 (defun dk-rope-chunk (st x cs nh hd nrot n)
@@ -277,7 +280,7 @@
                0 rank gdim (cons heads (* 4 g gdim)) (cons low (* 4 g rank)) n
                :x-stride (* nh hd) :y-stride (* groups rank)))))
     (dk-q8mm st (lname li "attn_output_b.weight") low aout n)
-    (dk-hc-post-chunk m st aout sa pc sb n)))
+    (dk-hc-post-chunk m st aout sa pc sb n (cons li :attn))))
 
 (defun dk-ffn-head-chunk (m st l li n sb)
   "The chunk's FFN up to its routing: HC pre, norm, router logits, shared expert."
@@ -348,7 +351,7 @@
       (mm-id "d4_mm_id_q2_k" ff drows drb (* 2 gb) mid down))
     (launch dev "d4_moe_sum_rows" (ceiling (* n d) 256) 256 (list d nu n down smap (pb st :p-sout (* n d)) moe))
     (when *dk41-round-moe* (launch dev "d41_round" (ceiling (* n d) 256) 256 (list (* n d) moe nil nil)))
-    (dk-hc-post-chunk m st moe sb (pb st :p-pcf (* n 32)) sa n)
+    (dk-hc-post-chunk m st moe sb (pb st :p-pcf (* n 32)) sa n (cons li :ffn))
     (when *dk41-round-moe*
       (let ((k (* n (ds4f-n-hc m) d))) (launch dev "d41_round" (ceiling k 256) 256 (list k sa nil nil))))))
 
