@@ -292,7 +292,9 @@
       (setf p 0 (d41ctx-written ctx) 0))
     (let ((map (d41-token-map (ds4f-v41 m))))
       (setf (d41ctx-tail ctx) (loop for i from (1- p) downto (- p 3)
-                                    collect (if (minusp i) -1 (aref map (svref hist i))))
+                                    collect (cond ((minusp i) -1)          ; a picture's token has no n-gram id: -1, as DS41F-ENGRAM-IDS
+                                                  ((image-token-p (svref hist i)) -1)
+                                                  (t (aref map (svref hist i)))))
             (d41ctx-pos ctx) p))
     (append (coerce (subseq hist p pos) 'list) tokens)))
 

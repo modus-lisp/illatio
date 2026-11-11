@@ -384,7 +384,7 @@
    KEEP (the tokens KEPT) had gone through; TAIL0 the Engram tail before."
   (let* ((m (d41ctx-model ctx)) (st (ds4f-cuda-state m)) (hd (ds4f-head-dim m))
          (map (d41-token-map (ds4f-v41 m))) (tail tail0))
-    (dolist (tk kept) (setf tail (list (aref map tk) (first tail) (second tail))))
+    (dolist (tk kept) (setf tail (list (if (image-token-p tk) -1 (aref map tk)) (first tail) (second tail))))
     (when (and (< keep n) (oddp (+ pos0 keep)))
       (maphash (lambda (li b)
                  (let ((k (d41-owner m li)))

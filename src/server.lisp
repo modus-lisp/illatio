@@ -181,7 +181,13 @@
   (write-utf8 s (format nil "HTTP/1.1 200 OK~C~CContent-Type: text/event-stream~C~CCache-Control: no-cache~C~CConnection: close~C~C~C~C"
                         #\Return #\Newline #\Return #\Newline #\Return #\Newline
                         #\Return #\Newline #\Return #\Newline))
-  (chat-completion-chunks engine req (lambda (chunk) (send-event s chunk)))
+  ;; past the header a failure can't be a 500: it is an error event, as OpenAI's and llama.cpp's
+  ;; streams carry one, so a client sees why its reply stopped rather than an empty one
+  (handler-case (chat-completion-chunks engine req (lambda (chunk) (send-event s chunk)))
+    (stream-error (e) (error e))
+    (error (e)
+      (format *error-output* "~&illatio: a streamed request failed: ~A~%" e)
+      (send-event s (error-object (princ-to-string e) "server_error"))))
   (write-utf8 s (format nil "data: [DONE]~%~%"))
   (force-output s))
 
@@ -218,6 +224,7 @@
                                                          "not_found"))))))
     (stream-error () nil)               ; the client went away
     (error (e)
+      (format *error-output* "~&illatio: a request failed: ~A~%" e)
       (ignore-errors (respond s "500 Internal Server Error"
                               (error-object (princ-to-string e) "server_error"))))))
 
