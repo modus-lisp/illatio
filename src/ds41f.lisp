@@ -131,17 +131,25 @@
    the rows are read in the model's file.")
 
 (defun d41-engram-source! (v file path)
-  "Point V's tables at *DS41F-ENGRAM-FILE* when it holds them, else at FILE."
+  "Point V's tables at *DS41F-ENGRAM-FILE* when it holds them -- the model
+   file's last bytes, from the first table or from anywhere before it -- else
+   at FILE (and say so: rows read at random from a disk are slow)."
   (let* ((base (reduce #'min (d41-eg-offs v)))
          (size (with-open-file (s path :element-type '(unsigned-byte 8)) (file-length s)))
-         (copy (and *ds41f-engram-file* (probe-file *ds41f-engram-file*)
-                    (= (with-open-file (s *ds41f-engram-file* :element-type '(unsigned-byte 8)) (file-length s))
-                       (- size base))
-                    *ds41f-engram-file*)))
-    (if copy
-        (setf (d41-eg-file v) (map-file-vector copy)
-              (d41-eg-offs v) (mapcar (lambda (o) (- o base)) (d41-eg-offs v)))
-        (setf (d41-eg-file v) file))
+         (have (and *ds41f-engram-file* (probe-file *ds41f-engram-file*)
+                    (with-open-file (s *ds41f-engram-file* :element-type '(unsigned-byte 8)) (file-length s))))
+         (start (and have (- size have))))         ; where in the model file the copy begins
+    (cond ((and start (<= 0 start base))
+           (setf (d41-eg-file v) (map-file-vector *ds41f-engram-file*)
+                 (d41-eg-offs v) (mapcar (lambda (o) (- o start)) (d41-eg-offs v)))
+           (format *error-output* "~&illatio: Engram's tables (~,1F GB) from ~A~%" (/ (- size base) 1d9) *ds41f-engram-file*))
+          (t
+           (when have
+             (format *error-output* "~&illatio: ~A (~:D bytes) is not the end of the model file from its first ~
+                                     table (~:D bytes); not used~%" *ds41f-engram-file* have (- size base)))
+           (format *error-output* "~&illatio: Engram's tables read in the model file: slow from a disk; ~
+                                   copy its last ~:D bytes to ~A~%" (- size base) *ds41f-engram-file*)
+           (setf (d41-eg-file v) file)))
     v))
 
 (defun load-ds41f (path &key (threads (default-thread-count)))
