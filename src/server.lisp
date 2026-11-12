@@ -110,13 +110,28 @@
 (defun model-lend (m)
   "Move model M's device memory aside where it is a cache: (values thunk
    bytes), THUNK putting it back.  DeepSeek's and GLM's experts' pools on
-   CUDA; other models keep theirs (0 bytes)."
+   CUDA, DeepSeek V4's on Metal; other models keep theirs (0 bytes)."
   #+(and sbcl linux)
   (let ((impl (model-impl m)))
     (when (and impl (member (model-arch m) '("deepseek4" "deepseek41" "glm5-next") :test #'equal))
       (let ((st (getf (ds4f-gpu-plist impl) :cuda)))
         (when st (return-from model-lend (d4-lend impl st))))))
+  #+(and sbcl darwin)
+  (let ((impl (model-impl m)))
+    (when (and impl (equal (model-arch m) "deepseek4"))
+      (return-from model-lend (ds4f-gpu-lend impl))))
   (values (lambda ()) 0))
+
+(defun park-memory (parking)
+  "PARKING's device memory given up (CUDA's moved to host memory; Metal's
+   released from its working set): the bytes."
+  #+(and sbcl linux) (cuda-park parking)
+  #+(and sbcl darwin) (gpu-park parking))
+
+(defun unpark-memory (parking)
+  "PARKING's device memory back, as it was."
+  #+(and sbcl linux) (cuda-unpark parking)
+  #+(and sbcl darwin) (gpu-unpark parking))
 
 (defvar *chat-parking* nil
   "The chat model's device memory, recorded (LOAD-LENDABLE) so that it can
@@ -128,7 +143,8 @@
    another record from now on (contexts' caches, scratch) as well."
   (setf *chat-parking* (make-parking "chat"))
   (prog1 (with-parking-record (*chat-parking* :const t) (funcall thunk))
-    (setf *cuda-alloc-hook* (parking-recorder *chat-parking* nil))))
+    #+(and sbcl linux) (setf *cuda-alloc-hook* (parking-recorder *chat-parking* nil))
+    #+(and sbcl darwin) (setf *gpu-alloc-hook* (parking-recorder *chat-parking* nil))))
 
 (defun lend-devices (engine function)
   "FUNCTION called with ENGINE's GPUs as free as can be: between its
@@ -136,14 +152,21 @@
    when it was loaded by LOAD-LENDABLE, the rest of its device memory moved
    to host memory; all of it back after."
   (sb-thread:with-mutex ((engine-lock engine))
-    (multiple-value-bind (restore bytes) (model-lend (engine-model engine))
-      (declare (ignore bytes))
-      (unwind-protect
-           (progn
-             (when *chat-parking* (cuda-park *chat-parking*))
-             (unwind-protect (funcall function)
-               (when *chat-parking* (cuda-unpark *chat-parking*))))
-        (funcall restore)))))
+    (let ((t0 (get-internal-real-time)))
+      (multiple-value-bind (restore lent) (model-lend (engine-model engine))
+        (let ((t1 nil))
+          (unwind-protect
+               (let ((parked (if *chat-parking* (park-memory *chat-parking*) 0)))
+                 (format *error-output* "illatio: the GPU lent: ~,1F GB of caches given up, ~,1F GB parked, ~,1Fs~%"
+                         (/ lent 1d9) (/ parked 1d9) (/ (- (get-internal-real-time) t0) internal-time-units-per-second))
+                 (unwind-protect (funcall function)
+                   (setf t1 (get-internal-real-time))
+                   (when *chat-parking* (unpark-memory *chat-parking*))))
+            ;; the caches made again whatever happened (a failed park included)
+            (funcall restore)
+            (when t1
+              (format *error-output* "illatio: the GPU back, ~,1Fs~%"
+                      (/ (- (get-internal-real-time) t1) internal-time-units-per-second)))))))))
 
 (defun error-object (message &optional (type "invalid_request_error"))
   (hobj "error" (hobj "message" message "type" type)))

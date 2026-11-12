@@ -188,6 +188,39 @@
       (setf (dx-free xc) k)))
   xc)
 
+(defun ds4f-gpu-lend (m)
+  "Free DS4F M's expert pool for another program's use of the GPU: (values
+   thunk bytes), THUNK making it again with the experts it held (read from
+   the file), so decode goes on warm.  Reads in flight finish first; nothing
+   may run on M until THUNK has."
+  (let* ((st (getf (ds4f-gpu-plist m) :gpu)) (xc (and st (getf (d4gpu-plist* st) :xcache))))
+    (if (or (null xc) (null (dx-buf xc)))
+        (values (lambda ()) 0)
+        (let ((r (getf (d4gpu-plist* st) :reader)) (pending (dx-pending xc)))
+          (declare (type (simple-array fixnum (*)) pending))
+          (when r
+            (sb-thread:with-mutex ((dr-mutex r))
+              (loop while (some #'plusp pending) do (sb-thread:condition-wait (dr-cv r) (dr-mutex r)))))
+          (let ((owners (copy-seq (dx-owner xc))) (bytes (gbuf-bytes (dx-buf xc))))
+            (gpu-free (dx-buf xc))
+            (setf (dx-buf xc) nil)
+            (values (lambda ()
+                      (setf (dx-buf xc) (lock-buffer (gpu-buffer (d4gpu-gpu st) bytes) "expert pool"))
+                      (reread-experts m xc owners))
+                    bytes))))))
+
+(defun reread-experts (m xc owners)
+  "Each slot of XC's pool read again from the file with the expert OWNERS gives it."
+  (let* ((ne (ds4f-n-expert m)) (sb (d4gpu-slot-bytes (ds4f-gpu-state m)))
+         (by-layer (make-array (ds4f-n-layer m) :initial-element '())))
+    (loop for key across owners for slot from 0
+          when (>= key 0) do (multiple-value-bind (li e) (floor key ne) (push (cons e slot) (svref by-layer li))))
+    (dotimes (li (length by-layer) xc)
+      (let ((v (svref by-layer li)))
+        (when v
+          (read-experts-pieces m (svref (ds4f-layers m) li) (mapcar #'car v)
+                               (mapcar (lambda (x) (* (cdr x) sb)) v) (dx-buf xc)))))))
+
 (defparameter *ds4f-read-piece* (* 1024 1024)
   "Expert reads go in pieces of this many bytes, on several threads: the
    SSD reads many at once.")
@@ -245,7 +278,7 @@
   "XC's reading-ahead threads (started the first time)."
   (let ((st (ds4f-gpu-state m)))
     (or (getf (d4gpu-plist* st) :reader)
-        (let ((r (make-d4reader)) (fd (ds4f-fd m)) (base (gbuf-sap (dx-buf xc))) (pending (dx-pending xc)))
+        (let ((r (make-d4reader)) (fd (ds4f-fd m)) (pending (dx-pending xc)))
           (declare (type (simple-array fixnum (*)) pending))
           (setf (dr-threads r)
                 (loop repeat 8
@@ -262,7 +295,8 @@
                                            (progn (setf job (pop (dr-ahead r)))
                                                   (unless (dr-ahead r) (setf (dr-ahead-tail r) '())))))
                                      (destructuring-bind (src dst bytes slot) job
-                                       (pread-into fd (sb-sys:sap+ base dst) src bytes)
+                                       ;; (the pool's address read each time: lent, it is made again elsewhere)
+                                       (pread-into fd (sb-sys:sap+ (gbuf-sap (dx-buf xc)) dst) src bytes)
                                        (sb-thread:with-mutex ((dr-mutex r))
                                          (when (zerop (decf (aref pending slot)))
                                            (sb-thread:condition-broadcast (dr-cv r))))))))

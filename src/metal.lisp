@@ -128,42 +128,168 @@
 
 ;;; --- buffers --------------------------------------------------------------------
 
-(defstruct (gbuf (:constructor %make-gbuf)) obj sap (bytes 0 :type (unsigned-byte 62)))
+(defstruct (gbuf (:constructor %make-gbuf))
+  obj sap (bytes 0 :type (unsigned-byte 62))
+  device                                ; the MTLDevice it was made on (parking makes it again there)
+  wrapped                               ; T: memory not its own (GPU-WRAP's), which it never frees
+  locked)                               ; T: its pages locked (GPU-MLOCK), to be locked again if remade
 
 (defconstant +shared+ 0 "MTLResourceStorageModeShared: CPU and GPU see the same memory.")
 
-(defun gpu-buffer (gpu bytes)
-  "A new zeroed shared buffer of BYTES."
+(defvar *gpu-alloc-hook* nil
+  "A function called with each buffer GPU-BUFFER or GPU-WRAP makes (a
+   parking's record, WITH-PARKING-RECORD), or NIL.")
+
+(defun new-buffer-object (device bytes)
   (with-metal
-    (let ((obj (msg ptr (gpu-device gpu) "newBufferWithLength:options:"
+    (let ((obj (msg ptr device "newBufferWithLength:options:"
                     (sb-alien:unsigned-long (max bytes 16)) (sb-alien:unsigned-long +shared+))))
       (when (nullp obj) (error "Metal: no buffer of ~:D bytes" bytes))
-      (let ((sap (msg ptr obj "contents")))
-        (%make-gbuf :obj obj :sap sap :bytes bytes)))))
+      obj)))
+
+(defun wrap-object (device sap bytes)
+  (with-metal
+    (let ((obj (msg ptr device "newBufferWithBytesNoCopy:length:options:deallocator:"
+                    (ptr sap) (sb-alien:unsigned-long bytes) (sb-alien:unsigned-long +shared+)
+                    (ptr (sb-sys:int-sap 0)))))
+      (when (nullp obj) (error "Metal: could not wrap ~:D bytes" bytes))
+      obj)))
+
+(defun gpu-buffer (gpu bytes)
+  "A new zeroed shared buffer of BYTES."
+  (let* ((obj (new-buffer-object (gpu-device gpu) bytes))
+         (b (%make-gbuf :obj obj :sap (with-metal (msg ptr obj "contents")) :bytes bytes :device (gpu-device gpu))))
+    (when *gpu-alloc-hook* (funcall *gpu-alloc-hook* b))
+    b))
+
+(defun mlock-bytes (sap bytes)
+  (zerop (sb-alien:alien-funcall
+          (sb-alien:extern-alien "mlock" (function sb-alien:int sb-sys:system-area-pointer sb-alien:unsigned-long))
+          sap bytes)))
 
 (defun gpu-mlock (b)
   "Lock buffer B's pages in memory (mlock): the system neither compresses nor
    pages them out, so a command buffer using B doesn't wait on making it
    resident.  Whether it could."
-  (zerop (sb-alien:alien-funcall
-          (sb-alien:extern-alien "mlock" (function sb-alien:int sb-sys:system-area-pointer sb-alien:unsigned-long))
-          (gbuf-sap b) (gbuf-bytes b))))
+  (setf (gbuf-locked b) (mlock-bytes (gbuf-sap b) (gbuf-bytes b))))
 
 (defun gpu-free (b)
   "Give back buffer B (GPU-BUFFER's or GPU-WRAP's; a wrapped one's memory
    stays its owner's)."
-  (with-metal (msg sb-alien:void (gbuf-obj b) "release"))
+  (when (gbuf-obj b)
+    (with-metal (msg sb-alien:void (gbuf-obj b) "release"))
+    (setf (gbuf-obj b) nil))
   nil)
 
 (defun gpu-wrap (gpu sap bytes)
   "BYTES at SAP (page-aligned, BYTES a whole number of pages) as a buffer,
    without copying: unified memory, the GPU reads it where it is."
-  (with-metal
-    (let ((obj (msg ptr (gpu-device gpu) "newBufferWithBytesNoCopy:length:options:deallocator:"
-                    (ptr sap) (sb-alien:unsigned-long bytes) (sb-alien:unsigned-long +shared+)
-                    (ptr (sb-sys:int-sap 0)))))
-      (when (nullp obj) (error "Metal: could not wrap ~:D bytes" bytes))
-      (%make-gbuf :obj obj :sap sap :bytes bytes))))
+  (let ((b (%make-gbuf :obj (wrap-object (gpu-device gpu) sap bytes) :sap sap :bytes bytes
+                       :device (gpu-device gpu) :wrapped t)))
+    (when *gpu-alloc-hook* (funcall *gpu-alloc-hook* b))
+    b))
+
+;;; --- parking: one program's GPU memory given up for another's ----------------------
+;;; cuda.lisp's parking on unified memory.  The memory is the same memory, but
+;;; Metal's working set is not: a buffer counts against it until released,
+;;; and a command buffer past it fails.  So a PARKING keeps the buffers its
+;;; owner made (while WITH-PARKING-RECORD binds the hook) and can release
+;;; them all (GPU-PARK) and make them again (GPU-UNPARK), in the same GBUFs,
+;;; so whatever holds them holds them still.  A wrapped buffer (a mapped
+;;; file's) is just released and wrapped again; one of its own is copied out
+;;; to host memory first and back after -- once for a CONST one (weights),
+;;; every time for the rest (scratch, caches).  The owner must not run while
+;;; parked.
+
+(defstruct (parking (:constructor make-parking (&optional name)))
+  name
+  (bufs '())                                  ; every GBUF recorded, newest first
+  (const (make-hash-table :test 'eq))         ; GBUF -> T: its contents never change
+  (host (make-hash-table :test 'eq))          ; GBUF -> its host copy (a SAP, malloc's)
+  (saved (make-hash-table :test 'eq))         ; GBUF -> T: the host copy is current
+  (parked '())                                ; the GBUFs released, to be made again
+  (bytes 0))
+
+(defun parking-recorder (parking const)
+  "A *GPU-ALLOC-HOOK* recording new buffers in PARKING (as CONST: weights).
+   What their owner frees is dropped from the record now and then."
+  (let ((n 0))
+    (lambda (b)
+      (when (> (incf n) 4096)
+        (setf n 0
+              (parking-bufs parking)
+              (delete-if (lambda (x) (and (null (gbuf-obj x)) (not (member x (parking-parked parking)))))
+                         (parking-bufs parking))))
+      (push b (parking-bufs parking))
+      (when const (setf (gethash b (parking-const parking)) t)))))
+
+(defmacro with-parking-record ((parking &key const) &body body)
+  "BODY's GPU buffers recorded in PARKING (as CONST: weights), and in no
+   other: an outer record (a global one) is shadowed."
+  `(let ((*gpu-alloc-hook* (parking-recorder ,parking ,const))) ,@body))
+
+(defun host-alloc (bytes)
+  (let ((p (sb-alien:alien-funcall (sb-alien:extern-alien "malloc" (function sb-sys:system-area-pointer sb-alien:unsigned-long))
+                                   bytes)))
+    (when (nullp p) (error "no host memory for ~:D bytes" bytes))
+    p))
+
+(defun host-free (sap)
+  (sb-alien:alien-funcall (sb-alien:extern-alien "free" (function sb-alien:void sb-sys:system-area-pointer)) sap))
+
+(defun copy-bytes-sap (dst src bytes)
+  (sb-alien:alien-funcall
+   (sb-alien:extern-alien "memcpy" (function sb-sys:system-area-pointer sb-sys:system-area-pointer
+                                             sb-sys:system-area-pointer sb-alien:unsigned-long))
+   dst src bytes))
+
+(defun gpu-park (parking)
+  "PARKING's buffers released (their contents, but a wrapped one's, copied to
+   host memory first).  Buffers their owner freed are forgotten.  Returns
+   the bytes given up.  A buffer is in PARKING-PARKED as soon as it is
+   released, so a failure part way leaves what was released to come back."
+  (let ((live '()) (out (make-hash-table :test 'eq)))
+    (dolist (b (parking-parked parking)) (setf (gethash b out) t))
+    (dolist (b (parking-bufs parking))
+      (cond ((gbuf-obj b) (push b live))
+            ((gethash b out))
+            (t (let ((h (gethash b (parking-host parking))))    ; freed by its owner
+                 (when h (host-free h) (remhash b (parking-host parking)))
+                 (remhash b (parking-const parking)) (remhash b (parking-saved parking))))))
+    (setf live (nreverse live)
+          (parking-bufs parking) (append live (parking-parked parking))
+          (parking-bytes parking) (reduce #'+ (parking-parked parking) :key #'gbuf-bytes))
+    (dolist (b live)
+      (unless (or (gbuf-wrapped b)
+                  (and (gethash b (parking-const parking)) (gethash b (parking-saved parking))))
+        (let ((h (or (gethash b (parking-host parking))
+                     (setf (gethash b (parking-host parking)) (host-alloc (gbuf-bytes b))))))
+          (copy-bytes-sap h (gbuf-sap b) (gbuf-bytes b))
+          (setf (gethash b (parking-saved parking)) t)))
+      (gpu-free b)
+      (unless (gbuf-wrapped b) (setf (gbuf-sap b) nil))
+      (push b (parking-parked parking))
+      (incf (parking-bytes parking) (gbuf-bytes b)))
+    (parking-bytes parking)))
+
+(defun gpu-unpark (parking)
+  "PARKING's buffers made again, as they were."
+  (let ((done '()))
+    (handler-bind ((error (lambda (e) (declare (ignore e))     ; out of memory: leave it all parked
+                            (dolist (b done) (gpu-free b) (unless (gbuf-wrapped b) (setf (gbuf-sap b) nil))))))
+      (dolist (b (parking-parked parking))
+        (if (gbuf-wrapped b)
+            (setf (gbuf-obj b) (wrap-object (gbuf-device b) (gbuf-sap b) (gbuf-bytes b)))
+            (let ((obj (new-buffer-object (gbuf-device b) (gbuf-bytes b))))
+              (setf (gbuf-obj b) obj (gbuf-sap b) (with-metal (msg ptr obj "contents")))
+              (copy-bytes-sap (gbuf-sap b) (gethash b (parking-host parking)) (gbuf-bytes b))
+              (unless (gethash b (parking-const parking))      ; scratch's copy: not kept
+                (host-free (gethash b (parking-host parking)))
+                (remhash b (parking-host parking)) (remhash b (parking-saved parking)))))
+        (when (gbuf-locked b) (mlock-bytes (gbuf-sap b) (gbuf-bytes b)))
+        (push b done))))
+  (setf (parking-parked parking) '())
+  parking)
 
 (defun gbuf-floats (b n &optional (start 0))
   "Floats START..START+N-1 of buffer B, as a vector."
