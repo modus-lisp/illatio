@@ -43,9 +43,9 @@ flags:
   --seed S            sampling seed
   -c, --ctx N         context size in tokens (default 8192)
   -t, --threads N     worker threads (default: the performance cores)
-  --gpu               run the model on the GPU: a qwen35 model on Metal (DeepSeek
-                      V4 Flash always uses it on a Mac); qwen2, qwen3 and llama
-                      on CUDA
+  --gpu               run the model on the GPU: on Metal a qwen35 model, or a
+                      qwen2, qwen3 or llama one in Q8_0 (DeepSeek V4 Flash
+                      always uses it on a Mac); on CUDA qwen2, qwen3 and llama
   --device N          the CUDA device to run on (implies --gpu; default 0)
   -s, --system TEXT   system prompt for --chat
   --steer FILE        directional steering (ds4's): one direction per layer, f32

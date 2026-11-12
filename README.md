@@ -185,6 +185,21 @@ Qwen3-4B (`llama-bench -ngl 0`; its prefill still uses BLAS), and illatio in
 | decode, 8–10 threads | 38.7 | 13.0 | 43.2 |
 | prefill, 8–10 threads | 149.5 | 16.7 | 294 |
 
+On the GPU (Metal, `--gpu`; `llama-bench -ngl 99 -p 512 -n 128`): the
+products where they lie in the file (half products summed in floats), the
+KV cache in halves, a flash attention on the half simdgroup matrices
+(`src/metal-dense.lisp`):
+
+| tok/s | illatio, Metal | llama.cpp, Metal |
+|---|---|---|
+| Qwen3-4B Q8_0, prefill | 848 | 879 |
+| Qwen3-4B Q8_0, decode | 49.8 | 53.4 |
+| Qwen2.5-0.5B Q8_0, prefill | 6,724 | 7,782 |
+| Qwen2.5-0.5B Q8_0, decode | 262 | 265 |
+
+Both give the CPU path's top token after a 591-token prompt and its first 32
+greedy tokens.
+
 Qwen3-4B in Q4_K_M (2.5 GB):
 
 | tok/s | illatio, SBCL | illatio, modus | llama.cpp |
@@ -261,8 +276,9 @@ bin/illatio-server --gpu -m M --port 8081 \
   --path llama.cpp/tools/server/public_simplechat --reasoning-format none
 ```
 
-`--gpu` runs a `qwen35` model on the GPU; DeepSeek V4 Flash always uses it
-on a Mac, and the DeepSeek models always use CUDA where it is.  Raw text ends with llama-simple's speed line, so a quick
+`--gpu` runs a `qwen35` model on the GPU, and on a Mac a dense one (`qwen2`,
+`qwen3`, `llama`) in Q8_0 too; DeepSeek V4 Flash always uses it on a Mac,
+and the DeepSeek models always use CUDA where it is.  Raw text ends with llama-simple's speed line, so a quick
 comparison is
 
 ```

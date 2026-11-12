@@ -479,6 +479,7 @@
    CTX is unusable afterwards.  Harmless to call twice."
   (disown-static-vectors ctx)
   #+(and sbcl linux) (free-cuda-state ctx)
+  #+(and sbcl darwin) (free-gpu-states ctx)
   (map nil #'free-static-vector (context-static-vectors ctx))
   (setf (context-k-cache ctx) nil (context-v-cache ctx) nil)
   (remf (context-plist ctx) :q35)

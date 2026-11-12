@@ -31,17 +31,24 @@
            (values (sb-sys:int-sap addr) bytes))
       (sb-unix:unix-close fd))))
 
-(defun load-model-gpu (path)
+(defparameter +dense-archs+ '("qwen2" "qwen3" "qwen3vl" "llama")
+  "The dense architectures the GPU runs (metal-dense.lisp).")
+
+(defun load-model-gpu (path &key gpu)
   "The model at PATH run by the GPU: its metadata, tokenizer and small
-   vectors read as usual, its matrices left in the file (GMATs)."
+   vectors read as usual, its matrices left in the file (GMATs).  A qwen35
+   model, or a dense one (metal-dense.lisp).  GPU: an opened GPU whose
+   library holds these kernels (and a caller's), or NIL for a new one."
   (let ((m (let ((*matrices-in-file* t)) (load-model path :threads 1))))
-    (unless (equal (model-arch m) "qwen35")
-      (error "the GPU path runs qwen35 models; this is ~A" (model-arch m)))
-    ;; the kernels' fixed shapes (src/metal/qwen35.metal)
-    (assert (= (model-ssm-k-dim m) 128) () "q35_delta is written for 128-wide K heads")
-    (assert (zerop (mod (model-ssm-v-dim m) 32)) () "q35_delta takes values 32 at a time")
-    (assert (= (model-head-dim m) 256) () "attend_fa is written for 256-wide heads")
-    (let ((gpu (open-gpu)) (g (model-gguf m)))
+    (cond ((equal (model-arch m) "qwen35")
+           ;; the kernels' fixed shapes (src/metal/qwen35.metal)
+           (assert (= (model-ssm-k-dim m) 128) () "q35_delta is written for 128-wide K heads")
+           (assert (zerop (mod (model-ssm-v-dim m) 32)) () "q35_delta takes values 32 at a time")
+           (assert (= (model-head-dim m) 256) () "attend_fa is written for 256-wide heads"))
+          ((member (model-arch m) +dense-archs+ :test #'equal) (dense-gpu-check m))
+          (t (error "the GPU path runs qwen35 and dense models (~{~A~^, ~}); this is ~A"
+                    +dense-archs+ (model-arch m))))
+    (let ((gpu (or gpu (open-gpu))) (g (model-gguf m)))
       (multiple-value-bind (sap bytes) (mmap-file path)
         (let ((gm (%make-gmodel :gpu gpu :file (gpu-wrap gpu sap bytes))))
           (maphash (lambda (name ti)
@@ -147,6 +154,8 @@
 (defun gpu-forward-n (ctx tokens logits)
   "TOKENS (at most *GPU-CHUNK*) at the next positions, as one command
    buffer; the logits, if LOGITS, are the last token's."
+  (unless (model-recurrent-p (context-model ctx))
+    (return-from gpu-forward-n (dense-forward-n ctx tokens logits)))
   (let* ((m (context-model ctx)) (gm (model-gpu m)) (gpu (gmodel-gpu gm))
          (st (gpu-state ctx)) (pos0 (context-pos ctx)) (n (length tokens)) (eps (model-eps m))
          (d (model-d m)) (f (model-ffn m)) (ch (q35-channels m))
