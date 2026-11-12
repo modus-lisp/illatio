@@ -233,3 +233,35 @@ kernel void dn_attend_h(constant dn_attn_args & a [[buffer(0)]],
 typedef decltype(dn_attend_h<64>) dn_attend_t;
 template [[host_name("dn_attend_h64")]]  kernel dn_attend_t dn_attend_h<64>;
 template [[host_name("dn_attend_h128")]] kernel dn_attend_t dn_attend_h<128>;
+
+// a threadgroup's sum, in every thread (qwen35.metal's tg_sum, which this file is compiled before)
+static inline float dn_tg_sum(float v, threadgroup float * sh, uint tid, uint ntg) {
+    v = simd_sum(v);
+    const uint lane = tid % 32, sg = tid / 32, nsg = (ntg + 31) / 32;
+    if (lane == 0) sh[sg] = v;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float r = lane < nsg ? sh[lane] : 0.0f;
+    r = simd_sum(r);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    return r;
+}
+
+struct dn_steer_args { uint d; float scale; uint cap_row; uint cap; };
+
+// Directional steering (steer.lisp), a row of D a threadgroup: row CAP_ROW
+// first copied to CAPTURE when CAP (taken before steering), then each row
+// y <- y - SCALE u (u . y), U the layer's unit direction (unread at SCALE 0).
+kernel void dn_steer(constant dn_steer_args & a [[buffer(0)]], device float * y [[buffer(1)]],
+                     device const float * u [[buffer(2)]], device float * capture [[buffer(3)]],
+                     uint t [[threadgroup_position_in_grid]], uint tid [[thread_position_in_threadgroup]],
+                     uint ntg [[threads_per_threadgroup]]) {
+    threadgroup float sh[32];
+    device float * row = y + (ulong)t * a.d;
+    if (a.cap && t == a.cap_row)
+        for (uint i = tid; i < a.d; i += ntg) capture[i] = row[i];
+    if (a.scale == 0.f) return;
+    float s = 0.f;
+    for (uint i = tid; i < a.d; i += ntg) s += u[i] * row[i];
+    const float k = a.scale * dn_tg_sum(s, sh, tid, ntg);
+    for (uint i = tid; i < a.d; i += ntg) row[i] -= k * u[i];
+}

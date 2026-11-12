@@ -320,8 +320,8 @@ bin/illatio-server -m M --steer dir.f32          # a request may send "steering"
 `--steer-build` writes the mean last-token FFN output of the target prompts
 less the contrast prompts' (`--steer-at attn` for the attention's), each a
 user turn in the model's chat template, a unit vector per layer.  It applies
-to the dense models (CPU and CUDA) and DeepSeek V4, V4.1 and GLM-5.3 on CUDA;
-not yet on Metal, nor to Qwen3.5.  A change of steering starts a cached
+to the dense models (CPU, CUDA and Metal) and DeepSeek V4, V4.1 and GLM-5.3
+on CUDA; not yet to DeepSeek on Metal, nor to Qwen3.5.  A change of steering starts a cached
 prompt over.  What a direction captures depends on the model: ds4 reports
 a clean terse/verbose axis for DeepSeek V4 from its verbosity pairs; for
 Qwen3-4B the same pairs give something less clean (at −1 one answer grew

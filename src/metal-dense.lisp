@@ -8,7 +8,8 @@
 ;;; simdgroup matrices.  A caller may put rows into the stream after the
 ;;; embedding and after each layer (*GPU-AFTER-EMBED*, *GPU-AFTER-LAYER*, as
 ;;; cuda-dense.lisp's hooks: a vision model's picture), and may replace the
-;;; RoPE table (GPU-SET-ROPE: Qwen3-VL's positions for a picture).
+;;; RoPE table (GPU-SET-ROPE: Qwen3-VL's positions for a picture).  Steering
+;;; (steer.lisp) applies to the attention's and FFN's outputs as on the CPU.
 
 (in-package #:illatio)
 
@@ -40,6 +41,7 @@
 
 (defstruct (dctx (:constructor %make-dctx))
   x h q k v qh att fa fb logits rope
+  capture                               ; steering's capture: a row of D a layer and kind, or NIL
   kc vc)                                ; per layer: halves, n-ctx positions
 
 (defun dense-state (ctx)
@@ -79,8 +81,8 @@
   (let ((st (getf (context-plist ctx) :gpu-dense)))
     (when st
       (dolist (b (list (dctx-x st) (dctx-h st) (dctx-q st) (dctx-k st) (dctx-v st) (dctx-qh st) (dctx-att st)
-                       (dctx-fa st) (dctx-fb st) (dctx-logits st) (dctx-rope st)))
-        (gpu-free b))
+                       (dctx-fa st) (dctx-fb st) (dctx-logits st) (dctx-rope st) (dctx-capture st)))
+        (when b (gpu-free b)))
       (loop for b across (dctx-kc st) do (gpu-free b))
       (loop for b across (dctx-vc st) do (gpu-free b))
       (remf (context-plist ctx) :gpu-dense)))
@@ -91,6 +93,25 @@
       (dolist (slot '(kc vc conv ssm))
         (loop for b across (slot-value st slot) when b do (gpu-free b)))
       (remf (context-plist ctx) :gpu))))
+
+;;; --- steering ---------------------------------------------------------------------------
+
+(defun gpu-steer-dirs (gpu)
+  "The steering's directions on GPU (made the first time)."
+  (let ((s *steering*))
+    (or (gethash gpu (steering-device s))
+        (setf (gethash gpu (steering-device s))
+              (let ((b (gpu-buffer gpu (* 4 (length (steering-dirs s))))))
+                (gbuf-set-floats b (steering-dirs s)))))))
+
+(defun gpu-steer (gpu e st y li kind n d)
+  "STEER-ROWS! in the pass: Y's N rows of D steered for layer LI's KIND
+   output, the last row first copied to the state's capture when capturing."
+  (let ((scale (steer-scale li kind)) (slot (+ (* 2 li) (if (eq kind :attn) 0 1))))
+    (dispatch gpu e "dn_steer" (list d scale (1- n) (if *steer-capture* 1 0))
+              (list y (if (zerop scale) y (cons (gpu-steer-dirs gpu) (* 4 li d)))
+                    (cons (dctx-capture st) (* 4 slot d)))
+              n 256)))
 
 ;;; --- a pass ---------------------------------------------------------------------------
 
@@ -117,6 +138,8 @@
     (assert (<= 1 n *gpu-chunk*))
     (when (> (+ pos0 n) (context-n-ctx ctx))
       (error "context is full (~D tokens)" (context-n-ctx ctx)))
+    (unless (dctx-capture st)   ; (every layer's two outputs: the steering's, or its capture's)
+      (setf (dctx-capture st) (gpu-buffer gpu (* 4 2 (model-n-layer m) d))))
     (with-gpu-work (e gpu)
       (let ((emb (model-token-embd m)))
         (loop for tok in tokens for tk from 0
@@ -148,12 +171,14 @@
                          (list (dctx-qh st) (svref (dctx-kc st) li) (svref (dctx-vc st) li) (dctx-att st))
                          (list nh (ceiling n 64)) 256 :shared (+ (* 2 32 hd 2) 16384))
                (mat-q8 gm e (layer-wo l) (dctx-att st) h n)
+               (when (steer-wants-p li :attn) (gpu-steer gpu e st h li :attn n d))
                (dispatch gpu e "add" (list (* n d)) (list x h) (ceiling (* n d) 256) 256)
                (dispatch gpu e "rmsnorm" (list d eps 0) (list x (gm-layer gm li "ffn_norm.weight") h) n 1024)
                (mat-q8 gm e (layer-wgate l) h (dctx-fa st) n)
                (mat-q8 gm e (layer-wup l) h (dctx-fb st) n)
                (dispatch gpu e "swiglu" (list (* n f)) (list (dctx-fa st) (dctx-fb st)) (ceiling (* n f) 256) 256)
                (mat-q8 gm e (layer-wdown l) (dctx-fa st) h n)
+               (when (steer-wants-p li :ffn) (gpu-steer gpu e st h li :ffn n d))
                (dispatch gpu e "add" (list (* n d)) (list x h) (ceiling (* n d) 256) 256)
                (when *gpu-after-layer* (funcall *gpu-after-layer* e li x pos0 n)))
       (when logits
@@ -161,6 +186,11 @@
                   (list (cons x (* 4 (1- n) d)) (gw gm "output_norm.weight") h) 1 1024)
         (mat-q8 gm e (model-output m) h (dctx-logits st) 1)))
     (incf (context-pos ctx) n)
+    (when *steer-capture*                 ; the last token's outputs, in the CPU's order
+      (dotimes (li (model-n-layer m))
+        (dolist (kind '(:attn :ffn))
+          (funcall *steer-capture* li kind
+                   (gbuf-floats (dctx-capture st) d (* d (+ (* 2 li) (if (eq kind :attn) 0 1))))))))
     (when logits
       (let ((out (context-logits ctx)) (sap (gbuf-sap (dctx-logits st))))
         (declare (type f32vec out))
