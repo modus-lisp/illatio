@@ -43,6 +43,7 @@
 (defstruct (dctx (:constructor %make-dctx))
   x h q k v qh att fa fb logits rope
   capture                               ; steering's capture: a row of D a layer and kind, or NIL
+  part ml                               ; one token's attention, split: chunks' outputs, maxima, sums
   kc vc)                                ; per layer: halves, n-ctx positions
 
 (defun dense-state (ctx)
@@ -58,6 +59,8 @@
                 (let ((st (%make-dctx :x (fb (* n d)) :h (fb (* n d)) :q (fb (* n qd)) :k (fb (* n kvd))
                                       :v (fb (* n kvd)) :qh (hb (* n qd)) :att (fb (* n qd))
                                       :fa (fb (* n f)) :fb (fb (* n f)) :logits (fb (model-n-vocab m))
+                                      :part (fb (* (model-n-head m) (ceiling 256 (model-n-kv-head m)) (model-head-dim m)))
+                                      :ml (fb (* (model-n-head m) (ceiling 256 (model-n-kv-head m)) 2))
                                       :rope (fb (* n-ctx rd))
                                       :kc (map 'simple-vector (lambda (l) (declare (ignore l)) (hb (* n-ctx kvd)))
                                                (model-layers m))
@@ -82,7 +85,8 @@
   (let ((st (getf (context-plist ctx) :gpu-dense)))
     (when st
       (dolist (b (list (dctx-x st) (dctx-h st) (dctx-q st) (dctx-k st) (dctx-v st) (dctx-qh st) (dctx-att st)
-                       (dctx-fa st) (dctx-fb st) (dctx-logits st) (dctx-rope st) (dctx-capture st)))
+                       (dctx-fa st) (dctx-fb st) (dctx-logits st) (dctx-rope st) (dctx-capture st)
+                       (dctx-part st) (dctx-ml st)))
         (when b (gpu-free b)))
       (loop for b across (dctx-kc st) do (gpu-free b))
       (loop for b across (dctx-vc st) do (gpu-free b))
@@ -181,10 +185,22 @@
                                (if (layer-k-norm l) (gm-layer gm li "attn_k_norm.weight") (dctx-k st))
                                (dctx-rope st) (dctx-qh st) (svref (dctx-kc st) li) (svref (dctx-vc st) li))
                          (list (+ nh nkv) n) (max 32 (floor hd 2)))
-               (dispatch gpu e (if (= hd 64) "dn_attend_h64" "dn_attend_h128")
-                         (list n pos0 nh nkv (/ 1f0 (sqrt (coerce hd 'single-float))))
-                         (list (dctx-qh st) (svref (dctx-kc st) li) (svref (dctx-vc st) li) (dctx-att st))
-                         (list nh (ceiling n 64)) 256 :shared (+ (* 2 32 hd 2) 16384))
+               (if (and (= n 1) *split-decode* (member (floor nh nkv) '(1 2 4 6 7 8)))
+                   ;; one token: split over the keys, a threadgroup a KV head and chunk, then merged
+                   ;; chunks enough for about 256 threadgroups, at least 16 positions each
+                   (let* ((len (1+ pos0)) (grp (floor nh nkv))
+                          (nsplit (max 1 (min (ceiling len 16) (ceiling 256 nkv))))
+                          (chunk (ceiling len nsplit)) (nsplit (ceiling len chunk)))
+                     (dispatch gpu e (format nil "dn_attend_split~D_~D" hd grp)
+                               (list nkv grp len chunk nsplit (/ 1f0 (sqrt (coerce hd 'single-float))))
+                               (list (dctx-qh st) (svref (dctx-kc st) li) (svref (dctx-vc st) li) (dctx-part st) (dctx-ml st))
+                               (list nkv nsplit) 128 :shared (* 4 4 grp (+ hd 2)))
+                     (dispatch gpu e "dn_attend_merge" (list nsplit hd) (list (dctx-part st) (dctx-ml st) (dctx-att st))
+                               nh hd))
+                   (dispatch gpu e (if (= hd 64) "dn_attend_h64" "dn_attend_h128")
+                             (list n pos0 nh nkv (/ 1f0 (sqrt (coerce hd 'single-float))))
+                             (list (dctx-qh st) (svref (dctx-kc st) li) (svref (dctx-vc st) li) (dctx-att st))
+                             (list nh (ceiling n 64)) 256 :shared (+ (* 2 32 hd 2) 16384)))
                (mat-q8 gm e (layer-wo l) (dctx-att st) h n)
                (when (steer-wants-p li :attn) (gpu-steer gpu e st h li :attn n d))
                (dispatch gpu e "add" (list (* n d)) (list x h) (ceiling (* n d) 256) 256)

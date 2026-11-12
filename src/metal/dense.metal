@@ -7,6 +7,7 @@
 //   dn_qk_rope(...)                          a head of Q or K: RMSNorm (qwen3), RoPE; Q to halves,
 //                                            K and V to the cache (halves) at their positions
 //   dn_attend_h64, dn_attend_h128            causal attention over the cache, GQA, flash style
+//   dn_attend_split<D,G>, dn_attend_merge     one token's attention, split over the keys
 //   dn_steer                                 directional steering of a layer's output rows
 //   dn_mv_q4_k, dn_row_q4_k                  Q4_K: one token's product, an embedding row
 //                                            (a prefill's products: ds4f.metal's d4_mm_q4_k)
@@ -355,4 +356,105 @@ kernel void dn_row_q4_k(constant dn_rowk_args & a [[buffer(0)]], device const ch
     const uint8_t q = blk->qs[c * 32 + (pos % 32)];
     const uchar2 sm = dn_q4k_scale(k / 32, blk->scales);
     out[j] = (float)blk->d * sm[0] * (float)(pos >= 32 ? (q >> 4) : (q & 0xF)) - (float)blk->dmin * sm[1];
+}
+
+// --- decode attention, split over the keys -------------------------------------
+//
+// One token's attention as flash decoding: a threadgroup per KV head and
+// chunk of positions, its GRP query heads at once (K and V read once for
+// them).  Each of its four simdgroups walks every fourth position of the
+// chunk, lanes across the head's dimensions (D/32 a lane, read 8 bytes at a
+// time at 128), keeping each query head's softmax and output running; the
+// four are then combined, and the chunk's unnormalized output, max and sum
+// written per query head for dn_attend_merge.  grid (nkv, nsplit),
+// threads 128, shared 4 * GRP * (D + 2) floats.
+
+struct dn_split_args { uint nkv; uint grp; uint n; uint chunk; uint nsplit; float scale; };
+
+template <short D, short G>
+kernel void dn_attend_split(constant dn_split_args & a [[buffer(0)]],
+                            device const half * q [[buffer(1)]],
+                            device const half * kc [[buffer(2)]], device const half * vc [[buffer(3)]],
+                            device float * part [[buffer(4)]], device float * ml [[buffer(5)]],
+                            threadgroup float * shm [[threadgroup(0)]],
+                            uint2 tgp [[threadgroup_position_in_grid]],
+                            ushort sg [[simdgroup_index_in_threadgroup]], ushort lane [[thread_index_in_simdgroup]]) {
+    constexpr short PD = D / 32, NSG = 4;
+    const uint g = tgp.x, c = tgp.y, p0 = c * a.chunk, p1 = min(p0 + a.chunk, a.n);
+    const uint kvd = a.nkv * D;
+    float qv[G][PD], o[G][PD], m[G], l[G];
+    for (short hh = 0; hh < G; ++hh) {
+        for (short i = 0; i < PD; ++i) { qv[hh][i] = (float)q[(g * G + hh) * D + lane * PD + i] * a.scale; o[hh][i] = 0.f; }
+        m[hh] = -INFINITY; l[hh] = 0.f;
+    }
+    // UN positions' K and V loaded before any is used: more loads in flight a lane
+    constexpr short UN = 4;
+    for (uint pb = p0 + sg * UN; pb < p1; pb += NSG * UN) {
+        float kv[UN][PD], vv[UN][PD];
+        for (short u = 0; u < UN; ++u) {
+            const uint p = min(pb + u, p1 - 1);
+            device const half * kr = kc + (ulong)p * kvd + g * D + lane * PD;
+            device const half * vr = vc + (ulong)p * kvd + g * D + lane * PD;
+            for (short i = 0; i < PD; ++i) { kv[u][i] = (float)kr[i]; vv[u][i] = (float)vr[i]; }
+        }
+        for (short u = 0; u < UN && pb + u < p1; ++u) {
+            for (short hh = 0; hh < G; ++hh) {
+                float s = 0.f;
+                for (short i = 0; i < PD; ++i) s += kv[u][i] * qv[hh][i];
+                s = simd_sum(s);
+                const float mn = max(m[hh], s), f = exp(m[hh] - mn), e = exp(s - mn);
+                l[hh] = l[hh] * f + e;
+                for (short i = 0; i < PD; ++i) o[hh][i] = o[hh][i] * f + e * vv[u][i];
+                m[hh] = mn;
+            }
+        }
+    }
+    // the four simdgroups' partials: each writes its own, the first combines them
+    threadgroup float * mine = shm + sg * G * (D + 2);
+    for (short hh = 0; hh < G; ++hh) {
+        for (short i = 0; i < PD; ++i) mine[hh * (D + 2) + lane * PD + i] = o[hh][i];
+        if (lane == 0) { mine[hh * (D + 2) + D] = m[hh]; mine[hh * (D + 2) + D + 1] = l[hh]; }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (sg != 0) return;
+    for (short hh = 0; hh < G; ++hh) {
+        float M = -INFINITY;
+        for (short k = 0; k < NSG; ++k) M = max(M, shm[(k * G + hh) * (D + 2) + D]);
+        float L = 0.f, acc[PD];
+        for (short i = 0; i < PD; ++i) acc[i] = 0.f;
+        for (short k = 0; k < NSG; ++k) {
+            threadgroup const float * pk = shm + (k * G + hh) * (D + 2);
+            const float w = pk[D] == -INFINITY ? 0.f : exp(pk[D] - M);
+            L += pk[D + 1] * w;
+            for (short i = 0; i < PD; ++i) acc[i] += pk[lane * PD + i] * w;
+        }
+        const uint row = (g * G + hh) * a.nsplit + c;
+        for (short i = 0; i < PD; ++i) part[row * D + lane * PD + i] = acc[i];
+        if (lane == 0) { ml[row * 2] = M; ml[row * 2 + 1] = L; }
+    }
+}
+
+// G, the query heads a KV head, a constant: the per-head arrays stay in registers
+typedef decltype(dn_attend_split<64, 1>) dn_split_t;
+#define DN_SPLIT(D, G) template [[host_name("dn_attend_split" #D "_" #G)]] kernel dn_split_t dn_attend_split<D, G>;
+DN_SPLIT(64, 1) DN_SPLIT(64, 2) DN_SPLIT(64, 4) DN_SPLIT(64, 6) DN_SPLIT(64, 7) DN_SPLIT(64, 8)
+DN_SPLIT(128, 1) DN_SPLIT(128, 2) DN_SPLIT(128, 4) DN_SPLIT(128, 6) DN_SPLIT(128, 7) DN_SPLIT(128, 8)
+
+struct dn_merge_args { uint nsplit; uint d; };
+
+// OUT's head H (grid x) = its chunks weighed together; threads D
+kernel void dn_attend_merge(constant dn_merge_args & a [[buffer(0)]],
+                            device const float * part [[buffer(1)]], device const float * ml [[buffer(2)]],
+                            device float * out [[buffer(3)]],
+                            uint h [[threadgroup_position_in_grid]], uint i [[thread_index_in_threadgroup]]) {
+    device const float * mh = ml + h * a.nsplit * 2;
+    float M = -INFINITY;
+    for (uint c = 0; c < a.nsplit; ++c) M = max(M, mh[2 * c]);
+    float L = 0.f, o = 0.f;
+    for (uint c = 0; c < a.nsplit; ++c) {
+        const float w = exp(mh[2 * c] - M);
+        L += mh[2 * c + 1] * w;
+        o += part[(h * a.nsplit + c) * a.d + i] * w;
+    }
+    out[h * a.d + i] = o / L;
 }

@@ -197,7 +197,9 @@ KV cache in halves, a flash attention on the half simdgroup matrices
 | Qwen2.5-0.5B Q8_0, prefill | 6,724 | 7,782 |
 | Qwen2.5-0.5B Q8_0, decode | 262 | 265 |
 | Qwen3-4B Q4_K_M, prefill | 822 | 843 |
-| Qwen3-4B Q4_K_M, decode | 73.4 | 80.4 |
+| Qwen3-4B Q4_K_M, decode | 77.3 | 80.6 |
+| Qwen3-4B Q4_K_M, decode at 4096 tokens of context | 63.6 | 66.2 |
+| Qwen2.5-0.5B Q8_0, decode at 4096 tokens of context | 217 | 243 |
 
 All three give the CPU path's top token after a 591-token prompt and its
 first 32 greedy tokens.  Q8_0, Q4_K and Q6_K matrices so far.
