@@ -366,6 +366,17 @@
             (launch dev "quant_q8" (ceiling (* n qd) 256) 256
                     (list (cctx-att st) xq xs xsum (list :i64 (floor (* n qd) 32)))))))))
 
+(defvar *after-embed* nil
+  "A function called with (X POS0 N) once CUDA-FORWARD-N has embedded its N
+   tokens into device buffer X (rows of the model's width; the first at
+   sequence position POS0), before the first layer; or NIL.  A caller that
+   puts other rows there (a picture's, for a vision-language model) does so.")
+
+(defvar *after-layer* nil
+  "A function called with (LAYER X POS0 N) after each layer of
+   CUDA-FORWARD-N, X its rows as the next layer will read them; or NIL
+   (Qwen3-VL's deepstack adds a picture's features to its rows there).")
+
 (defun cuda-forward-n (ctx tokens logits)
   "TOKENS (at most *CUDA-CHUNK*) at the next positions; the logits, if
    LOGITS, are the last token's."
@@ -384,6 +395,7 @@
       (cuda-current dev)
       (cuda-upload-vector (cctx-tokens st) (coerce tokens '(simple-array (signed-byte 32) (*))))
       (embed dev (cmat-of cm (model-token-embd m)) (cctx-tokens st) x n d)
+      (when *after-embed* (funcall *after-embed* x pos0 n))
       (loop for li below (model-n-layer m)
             for l = (svref (model-layers m) li)
             do (rmsnorm-q8 dev x (cvec-of cm (layer-attn-norm l)) xq xs xsum d eps n)
@@ -408,7 +420,8 @@
                    (let ((y (steer-buffer dev st n d)))
                      (cmat-mul dev (cmat-of cm (layer-wdown l)) xq xs y n :xsum xsum)
                      (cuda-steer dev y li :ffn n d :add x))
-                   (cmat-mul dev (cmat-of cm (layer-wdown l)) xq xs x n :acc t :xsum xsum)))
+                   (cmat-mul dev (cmat-of cm (layer-wdown l)) xq xs x n :acc t :xsum xsum))
+               (when *after-layer* (funcall *after-layer* li x pos0 n)))
       (when logits
         (rmsnorm-q8 dev (cons x (* 4 (1- n) d)) (cvec-of cm (model-output-norm m)) xq xs xsum d eps 1)
         (cmat-mul dev (cmat-of cm (model-output m)) xq xs (cctx-logits st) 1 :xsum xsum)
