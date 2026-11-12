@@ -53,6 +53,15 @@
         do (setf obj (gethash k obj))
         finally (return (if (eq obj 'null) nil obj))))
 
+(defun message-reasoning (m)
+  "M's reasoning_content, NIL when it has none -- or only whitespace: a
+   client that must echo reasoning (the DeepSeek API rejects an empty one)
+   sends a turn that had none as \" \", and that space rendered would put
+   a token in the prompt the model never sampled, so the cached prefix no
+   longer matches and the whole conversation is prefilled again (ds4's fix)."
+  (let ((r (jget m "reasoning_content")))
+    (and (stringp r) (notevery (lambda (c) (member c '(#\Space #\Tab #\Newline #\Return #\Page))) r) r)))
+
 (defvar *image-parts* nil
   "While a prompt renders: an adjustable vector its messages' pictures go
    into (their bytes), each leaving a marker where it stood (PROMPT-IDS).")
@@ -269,7 +278,7 @@
                     ;; llama-server splits reasoning out of earlier turns, not
                     ;; out of a final (prefill) one, which it leaves as sent
                     (multiple-value-bind (reasoning body)
-                        (let ((rc (jget m "reasoning_content")))
+                        (let ((rc (message-reasoning m)))
                           (cond ((stringp rc) (values rc content))
                                 ((null rest) (values "" content))
                                 (t (split-reasoning content))))
@@ -764,7 +773,7 @@
                       (when pending-assistant
                         (write-string "<｜Assistant｜>" o)
                         (if (and thinking (or tool-context (> i last-user)))
-                            (format o "<think>~A</think>" (or (jget m "reasoning_content") ""))
+                            (format o "<think>~A</think>" (or (message-reasoning m) ""))
                             (write-string "</think>" o)))
                       (write-string (content-string (jget m "content")) o)
                       (let ((calls (jget m "tool_calls")))
@@ -825,7 +834,7 @@
                       (when pending
                         (write-string "<｜Assistant｜>" o)
                         (when (and thinking (or keep-reasoning (> i last-user)))
-                          (format o "<think>~A" (or (jget m "reasoning_content") "")))
+                          (format o "<think>~A" (or (message-reasoning m) "")))
                         (write-string "</think>" o))
                       (write-string (content-string (jget m "content")) o)
                       (let ((calls (jget m "tool_calls")))
@@ -964,7 +973,7 @@
                      ((equal role "assistant")
                       (let* ((content (content-string (jget m "content")))
                              (close (search "</think>" content))
-                             (reasoning (or (jget m "reasoning_content")
+                             (reasoning (or (message-reasoning m)
                                             (and close (let ((open (search "<think>" content :end2 close :from-end t)))
                                                          (subseq content (if open (+ open 7) 0) close)))))
                              (content (if close (subseq content (+ close 8)) content))

@@ -171,6 +171,10 @@
 (defun error-object (message &optional (type "invalid_request_error"))
   (hobj "error" (hobj "message" message "type" type)))
 
+(defun engine-sees-p (engine)
+  "Whether ENGINE's model takes pictures: a vision encoder loaded, for a model it serves."
+  (and *vision* (equal (model-arch (engine-model engine)) "deepseek41") t))
+
 (defun models-object (engine)
   (let ((m (engine-model engine)))
     (hobj "object" "list"
@@ -181,6 +185,9 @@
                                ;; this context's size, not the model's training length
                                "context_length" (context-n-ctx (engine-context engine))
                                "status" (hobj "value" "loaded")
+                               ;; what it reads and writes, as OpenRouter's model list says it
+                               "architecture" (hobj "input_modalities" (if (engine-sees-p engine) #("text" "image") #("text"))
+                                                    "output_modalities" #("text"))
                                "meta" (hobj "n_ctx_train" (model-context-length m)
                                             "n_vocab" (model-n-vocab m)))
                          *more-models*))))
@@ -191,7 +198,7 @@
   (hobj "model_path" (model-name (engine-model engine))
         "build_info" "illatio"
         "n_ctx" (context-n-ctx (engine-context engine))
-        "modalities" (hobj "vision" (and *vision* (equal (model-arch (engine-model engine)) "deepseek41") t) "audio" nil)))
+        "modalities" (hobj "vision" (engine-sees-p engine) "audio" nil)))
 
 ;;; --- streaming --------------------------------------------------------------
 ;;; The chunks come from CHAT-COMPLETION-CHUNKS; here they only become SSE.
