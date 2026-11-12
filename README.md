@@ -316,12 +316,16 @@ after).  With a 4B chat model on the 3090, a 1024² picture took 15-17 s
 On a Mac the memory is one, but Metal's working set is not: what the
 pictures don't use is released from it (a mapped file's buffer unwrapped,
 a buffer of their own copied aside), and the same between chat requests
-for the chat model.  With DeepSeek V4 Flash as the chat model on the 48 GB
-M4 Pro, a picture costs about 10 s more than alone: 1 s to give the GPU up
-(its 22 GB expert pool freed, 8 GB of weights parked), 2.4 s to bring
-Qwen-Image back, 6.7 s to put DeepSeek back (the pool read again from the
-SSD with the experts it held, so decode goes on warm: 9.1 tok/s just
-before a picture, 8.1 just after).
+for the chat model.  A DeepSeek model gives up what it read from its file
+instead -- its expert pool and its resident weights, 29.7 GB -- and reads
+them again after (copied aside, they would only move within the same
+memory).  With DeepSeek V4 Flash as the chat model on the 48 GB M4 Pro, a
+picture costs about 15 s more than alone: 0.4 s to give the GPU up, 7.6 s
+to bring Qwen-Image back (its files' pages, which DeepSeek's reads pushed
+out of memory, read in again), 6.5 s to put DeepSeek back, warm: decode
+at 9.1 tok/s just before a picture, 8.4 just after.  An edit's source
+picture is taken at a megapixel of its shape, whatever size is asked for:
+a 512x512 edit takes about 40 s on the GPU.
 
 **Steering.** Directional steering, as ds4 does it: one direction per layer,
 taken out of each layer's FFN output (and, if asked, its attention output),

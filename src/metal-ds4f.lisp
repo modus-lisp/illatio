@@ -189,25 +189,38 @@
   xc)
 
 (defun ds4f-gpu-lend (m)
-  "Free DS4F M's expert pool for another program's use of the GPU: (values
-   thunk bytes), THUNK making it again with the experts it held (read from
-   the file), so decode goes on warm.  Reads in flight finish first; nothing
-   may run on M until THUNK has."
-  (let* ((st (getf (ds4f-gpu-plist m) :gpu)) (xc (and st (getf (d4gpu-plist* st) :xcache))))
-    (if (or (null xc) (null (dx-buf xc)))
-        (values (lambda ()) 0)
-        (let ((r (getf (d4gpu-plist* st) :reader)) (pending (dx-pending xc)))
-          (declare (type (simple-array fixnum (*)) pending))
-          (when r
-            (sb-thread:with-mutex ((dr-mutex r))
-              (loop while (some #'plusp pending) do (sb-thread:condition-wait (dr-cv r) (dr-mutex r)))))
-          (let ((owners (copy-seq (dx-owner xc))) (bytes (gbuf-bytes (dx-buf xc))))
-            (gpu-free (dx-buf xc))
-            (setf (dx-buf xc) nil)
-            (values (lambda ()
-                      (setf (dx-buf xc) (lock-buffer (gpu-buffer (d4gpu-gpu st) bytes) "expert pool"))
-                      (reread-experts m xc owners))
-                    bytes))))))
+  "Free what DS4F M's GPU state keeps of the file -- its expert pool and its
+   Q8_0 and F16 weights -- for another program's use of the GPU and of the
+   memory: (values thunk bytes), THUNK reading them again (the pool with the
+   experts it held, so decode goes on warm).  On unified memory parking a
+   buffer would only move it; these are read again from the SSD.  Reads in
+   flight finish first; nothing may run on M until THUNK has."
+  (let* ((st (getf (ds4f-gpu-plist m) :gpu)) (xc (and st (getf (d4gpu-plist* st) :xcache)))
+         (bytes 0) (owners nil) (pool-bytes 0) (weights '()))
+    (when (and xc (dx-buf xc))
+      (let ((r (getf (d4gpu-plist* st) :reader)) (pending (dx-pending xc)))
+        (declare (type (simple-array fixnum (*)) pending))
+        (when r
+          (sb-thread:with-mutex ((dr-mutex r))
+            (loop while (some #'plusp pending) do (sb-thread:condition-wait (dr-cv r) (dr-mutex r)))))
+        (setf owners (copy-seq (dx-owner xc)) pool-bytes (gbuf-bytes (dx-buf xc)))
+        (incf bytes pool-bytes)
+        (gpu-free (dx-buf xc))
+        (setf (dx-buf xc) nil)))
+    (dolist (key '(:weights :f16))                ; made again from the file when next asked for
+      (let ((e (getf (ds4f-gpu-plist m) key)))
+        (when e
+          (push key weights)
+          (incf bytes (gbuf-bytes (car e)))
+          (gpu-free (car e))
+          (remf (ds4f-gpu-plist m) key))))
+    (values (lambda ()
+              (when (member :weights weights) (ds4f-gpu-weights m))
+              (when (member :f16 weights) (ds4f-gpu-f16 m))
+              (when owners
+                (setf (dx-buf xc) (lock-buffer (gpu-buffer (d4gpu-gpu st) pool-bytes) "expert pool"))
+                (reread-experts m xc owners)))
+            bytes)))
 
 (defun reread-experts (m xc owners)
   "Each slot of XC's pool read again from the file with the expert OWNERS gives it."

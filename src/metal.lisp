@@ -197,9 +197,9 @@
 ;;; them all (GPU-PARK) and make them again (GPU-UNPARK), in the same GBUFs,
 ;;; so whatever holds them holds them still.  A wrapped buffer (a mapped
 ;;; file's) is just released and wrapped again; one of its own is copied out
-;;; to host memory first and back after -- once for a CONST one (weights),
-;;; every time for the rest (scratch, caches).  The owner must not run while
-;;; parked.
+;;; to host memory first and back after, every time: kept, the copy would be
+;;; the same RAM held twice (CUDA keeps a CONST one's, in host memory to
+;;; spare).  The owner must not run while parked.
 
 (defstruct (parking (:constructor make-parking (&optional name)))
   name
@@ -272,8 +272,35 @@
       (incf (parking-bytes parking) (gbuf-bytes b)))
     (parking-bytes parking)))
 
+(defun prefetch-pages (ranges &key (threads 8))
+  "The pages of RANGES, ((sap . bytes) ...), read into memory now: a mapped
+   file's, which the system may have dropped while its buffer was parked,
+   would otherwise come back a fault at a time under the GPU (after a
+   DeepSeek model's turn, 20 GB of a picture's were).  The kernel is asked to read
+   the ranges ahead, and THREADS threads touch a page each in turn."
+  (let ((page 16384) (total 0))
+    (dolist (r ranges)
+      (sb-alien:alien-funcall
+       (sb-alien:extern-alien "madvise" (function sb-alien:int sb-sys:system-area-pointer sb-alien:unsigned-long sb-alien:int))
+       (car r) (cdr r) 3)                                                     ; MADV_WILLNEED
+      (incf total (cdr r)))
+    (when (plusp total)
+      (let ((workers
+              (loop for k below threads
+                    collect (let ((k k))
+                              (sb-thread:make-thread
+                               (lambda ()
+                                 (let ((sum 0))
+                                   (dolist (r ranges sum)
+                                     (loop for off from (* k page) below (cdr r) by (* threads page)
+                                           do (incf sum (sb-sys:sap-ref-8 (car r) off))))))
+                               :name "illatio page prefetch")))))
+        (mapc #'sb-thread:join-thread workers)))
+    total))
+
 (defun gpu-unpark (parking)
-  "PARKING's buffers made again, as they were."
+  "PARKING's buffers made again, as they were (a wrapped one's pages read in
+   first, PREFETCH-PAGES)."
   (let ((done '()))
     (handler-bind ((error (lambda (e) (declare (ignore e))     ; out of memory: leave it all parked
                             (dolist (b done) (gpu-free b) (unless (gbuf-wrapped b) (setf (gbuf-sap b) nil))))))
@@ -283,11 +310,13 @@
             (let ((obj (new-buffer-object (gbuf-device b) (gbuf-bytes b))))
               (setf (gbuf-obj b) obj (gbuf-sap b) (with-metal (msg ptr obj "contents")))
               (copy-bytes-sap (gbuf-sap b) (gethash b (parking-host parking)) (gbuf-bytes b))
-              (unless (gethash b (parking-const parking))      ; scratch's copy: not kept
-                (host-free (gethash b (parking-host parking)))
-                (remhash b (parking-host parking)) (remhash b (parking-saved parking)))))
+              ;; the copy not kept, a CONST one's either: the same RAM as the buffer, twice
+              (host-free (gethash b (parking-host parking)))
+              (remhash b (parking-host parking)) (remhash b (parking-saved parking))))
         (when (gbuf-locked b) (mlock-bytes (gbuf-sap b) (gbuf-bytes b)))
-        (push b done))))
+        (push b done))
+      (prefetch-pages (loop for b in (parking-parked parking)
+                            when (gbuf-wrapped b) collect (cons (gbuf-sap b) (gbuf-bytes b))))))
   (setf (parking-parked parking) '())
   parking)
 
