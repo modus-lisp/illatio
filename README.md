@@ -220,9 +220,10 @@ the same 512-token prefill, except its 1-thread one, on 96):
 | prefill, 1 thread | 5.0 | 3.15 |
 | decode, 10 threads | 9.3 | 6.9 |
 | prefill, 10 threads | 35.5 | 22.8 |
-| decode, Metal GPU | 11.1 | 10.2 |
-| prefill, Metal GPU | 121 | 121 |
-| prefill at 4096 tokens, Metal GPU | 121 | 106 |
+| decode, Metal GPU | 11.1 | 10.1 |
+| prefill, Metal GPU | 127 | 115 |
+| decode at 4096 tokens of context, Metal GPU | 10.3 | 9.8 |
+| prefill at 4096 tokens of context, Metal GPU | 109 | 106 |
 
 Loading takes 2.8 s on the CPU and 0.3 s on the GPU (the file is mapped and
 read in place).  The tokenizer gives llama.cpp's ids on every test prompt,

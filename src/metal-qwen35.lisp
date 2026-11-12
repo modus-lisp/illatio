@@ -44,7 +44,8 @@
            ;; the kernels' fixed shapes (src/metal/qwen35.metal)
            (assert (= (model-ssm-k-dim m) 128) () "q35_delta is written for 128-wide K heads")
            (assert (zerop (mod (model-ssm-v-dim m) 32)) () "q35_delta takes values 32 at a time")
-           (assert (= (model-head-dim m) 256) () "attend_fa is written for 256-wide heads"))
+           (assert (= (model-head-dim m) 256) () "attend_fa is written for 256-wide heads")
+           (assert (<= (floor (model-n-head m) (model-n-kv-head m)) 8) () "attend_split takes at most 8 query heads a KV head"))
           ((member (model-arch m) +dense-archs+ :test #'equal) (dense-gpu-check m))
           (t (error "the GPU path runs qwen35 and dense models (~{~A~^, ~}); this is ~A"
                     +dense-archs+ (model-arch m))))
@@ -68,6 +69,7 @@
 
 (defstruct (gctx (:constructor %make-gctx))
   x h qkv z alpha beta c o qg q gate k v att fa fb logits rope
+  part ml                               ; decode's attention, split: chunks' outputs, their maxima and sums
   kc vc conv ssm)                       ; per layer (NIL where the kind has none)
 
 (defun gpu-zero (b)
@@ -100,6 +102,8 @@
                             :gate (fb (* n qd)) :k (fb (* n kvd)) :v (fb (* n kvd)) :att (fb (* (+ n 8) qd))
                             :fa (fb (* n f)) :fb (fb (* n f))
                             :logits (fb (model-n-vocab m)) :rope (fb (* n (model-rope-dims m)))
+                            :part (fb (* (model-n-head m) (ceiling n-ctx *split-chunk*) (model-head-dim m)))
+                            :ml (fb (* (model-n-head m) (ceiling n-ctx *split-chunk*) 2))
                             ;; 32 positions of zeros past the end: ATTEND_FA reads keys 32 at a time
                             :kc (per-layer :full (* (+ n-ctx 32) kvd)) :vc (per-layer :full (* (+ n-ctx 32) kvd))
                             :conv (per-layer :linear (* ch (1- (model-ssm-conv m))))
@@ -133,9 +137,13 @@
 
 (defvar *flash* t "Whether a prefill's attention is ATTEND_FA (flash style).")
 
-(defvar *flash-decode-from* 4096
-  "Decode attends with ATTEND_FA past this many positions (ATTEND's scores
-   live in threadgroup memory, room for about 8000).")
+(defvar *split-decode* t
+  "Whether one token's attention is split over the keys (ATTEND_SPLIT and
+   ATTEND_MERGE) rather than a threadgroup a head (ATTEND).")
+
+(defparameter *split-chunk* 64
+  "Positions a threadgroup of decode's attention takes (ATTEND_SPLIT): the
+   keys cut so the whole GPU reads them, not a threadgroup a head.")
 
 (defvar *mm-64* t "Whether a prefill's products take 64-token tiles (MM_Q6K_64).")
 
@@ -211,15 +219,26 @@
                                      (gctx-rope st) (gctx-q st) (gctx-gate st)
                                      (svref (gctx-kc st) li) (svref (gctx-vc st) li))
                                (list (+ nh nkv) n) hd)
-                     ;; decode's ATTEND keeps a score per position in threadgroup
-                     ;; memory (32 KB), so a long context goes the flash way too
-                     (if (and *flash* (or (> n 1) (> (+ pos0 n) *flash-decode-from*)))
+                     ;; a prefill's attention flash style; one token's split over the
+                     ;; keys (a threadgroup a KV head and chunk), then merged
+                     (cond
+                       ((> n 1)
                          (dispatch gpu e "attend_fa" (list nh nkv n (/ 1f0 (sqrt (coerce hd 'single-float))) pos0)
                                    (list (gctx-q st) (svref (gctx-kc st) li) (svref (gctx-vc st) li) (gctx-att st))
-                                   (list nh (ceiling n 8)) 32 :shared (* 4 (+ (* 8 256) (* 8 32) 64)))
-                         (dispatch gpu e "attend" (list nh nkv hd (1+ pos0) (/ 1f0 (sqrt (coerce hd 'single-float))))
-                                   (list (gctx-q st) (svref (gctx-kc st) li) (svref (gctx-vc st) li) (gctx-att st))
-                                   (list nh n) 256 :shared (* 4 (max 4 (+ pos0 n)))))
+                                   (list nh (ceiling n 8)) 32 :shared (* 4 (+ (* 8 256) (* 8 32) 64))))
+                       ((not *split-decode*)
+                        (dispatch gpu e "attend" (list nh nkv hd (1+ pos0) (/ 1f0 (sqrt (coerce hd 'single-float))))
+                                  (list (gctx-q st) (svref (gctx-kc st) li) (svref (gctx-vc st) li) (gctx-att st))
+                                  (list nh n) 256 :shared (* 4 (max 4 (+ pos0 n)))))
+                       (t
+                         (let* ((len (1+ pos0)) (nsplit (ceiling len *split-chunk*)) (grp (floor nh nkv)))
+                           (dispatch gpu e "attend_split"
+                                     (list nkv grp len *split-chunk* nsplit (/ 1f0 (sqrt (coerce hd 'single-float))))
+                                     (list (gctx-q st) (svref (gctx-kc st) li) (svref (gctx-vc st) li)
+                                           (gctx-part st) (gctx-ml st))
+                                     (list nkv nsplit) hd :shared (* 4 grp *split-chunk*))
+                           (dispatch gpu e "attend_merge" (list nsplit) (list (gctx-part st) (gctx-ml st) (gctx-att st))
+                                     nh hd))))
                      (dispatch gpu e "gate_mul" (list (* n qd)) (list (gctx-att st) (gctx-gate st))
                                (ceiling (* n qd) 256) 256)
                      (mat gm e (layer-wo l) (gctx-att st) h n)))

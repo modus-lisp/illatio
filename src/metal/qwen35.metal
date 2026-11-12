@@ -766,3 +766,83 @@ kernel void attend_fa(constant fa_args & a [[buffer(0)]],
         simdgroup_store(o[c], ob + c * 8, qd);
     }
 }
+
+// --- decode attention, split over the keys --------------------------------------
+//
+// One token's attention (FA_D-wide heads, the caches in floats) as flash
+// decoding: a threadgroup per KV head and chunk of CHUNK positions, its
+// GRP query heads (those sharing the KV head) at once, so K and V are read
+// once for all of them.  Each writes, per query head, its chunk's unnormalized
+// output, max and sum (PART, ML); ATTEND_MERGE weighs the chunks together.
+// grid (nkv, nsplit), threads FA_D, shared GRP * CHUNK floats.
+
+struct split_args { uint nkv; uint grp; uint n; uint chunk; uint nsplit; float scale; };
+
+#define SPLIT_MAXG 8
+kernel void attend_split(constant split_args & a [[buffer(0)]],
+                         device const float * q [[buffer(1)]],
+                         device const float * kc [[buffer(2)]], device const float * vc [[buffer(3)]],
+                         device float * part [[buffer(4)]], device float * ml [[buffer(5)]],
+                         threadgroup float * sc [[threadgroup(0)]],
+                         uint2 tgp [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]],
+                         ushort sg [[simdgroup_index_in_threadgroup]], ushort lane [[thread_index_in_simdgroup]]) {
+    const uint g = tgp.x, c = tgp.y, p0 = c * a.chunk, p1 = min(p0 + a.chunk, a.n), len = p1 - p0;
+    const uint kvd = a.nkv * FA_D, nsg = FA_D / 32;
+    // this lane's 8 dimensions of each query head of the group
+    float4 qa[SPLIT_MAXG], qb[SPLIT_MAXG];
+    for (uint hh = 0; hh < a.grp; ++hh) {
+        device const float4 * qp = (device const float4 *)(q + (g * a.grp + hh) * FA_D + lane * 8);
+        qa[hh] = qp[0]; qb[hh] = qp[1];
+    }
+    // the scores: a simdgroup a position
+    for (uint p = p0 + sg; p < p1; p += nsg) {
+        device const float4 * kr = (device const float4 *)(kc + (ulong)p * kvd + g * FA_D + lane * 8);
+        const float4 k0 = kr[0], k1 = kr[1];
+        for (uint hh = 0; hh < a.grp; ++hh) {
+            const float s = simd_sum(dot(k0, qa[hh]) + dot(k1, qb[hh]));
+            if (lane == 0) sc[hh * a.chunk + (p - p0)] = s * a.scale;
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    // each query head's softmax over the chunk: a simdgroup a head
+    for (uint hh = sg; hh < a.grp; hh += nsg) {
+        float m = -INFINITY;
+        for (uint j = lane; j < len; j += 32) m = max(m, sc[hh * a.chunk + j]);
+        m = simd_max(m);
+        float l = 0.f;
+        for (uint j = lane; j < len; j += 32) { const float e = exp(sc[hh * a.chunk + j] - m); sc[hh * a.chunk + j] = e; l += e; }
+        l = simd_sum(l);
+        if (lane == 0) {
+            const uint o = ((g * a.grp + hh) * a.nsplit + c) * 2;
+            ml[o] = m; ml[o + 1] = l;
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    // O = P V: a thread a dimension, V read once for the group
+    float acc[SPLIT_MAXG];
+    for (uint hh = 0; hh < a.grp; ++hh) acc[hh] = 0.f;
+    for (uint j = 0; j < len; ++j) {
+        const float v = vc[(ulong)(p0 + j) * kvd + g * FA_D + tid];
+        for (uint hh = 0; hh < a.grp; ++hh) acc[hh] += sc[hh * a.chunk + j] * v;
+    }
+    for (uint hh = 0; hh < a.grp; ++hh) part[((g * a.grp + hh) * a.nsplit + c) * FA_D + tid] = acc[hh];
+}
+
+struct merge_args { uint nsplit; };
+
+// OUT's head H (grid x) = its chunks' outputs, each weighed by exp(m - M), over their sums so weighed
+kernel void attend_merge(constant merge_args & a [[buffer(0)]],
+                         device const float * part [[buffer(1)]], device const float * ml [[buffer(2)]],
+                         device float * out [[buffer(3)]],
+                         uint h [[threadgroup_position_in_grid]], uint i [[thread_index_in_threadgroup]]) {
+    device const float * mh = ml + h * a.nsplit * 2;
+    float M = -INFINITY;
+    for (uint c = 0; c < a.nsplit; ++c) M = max(M, mh[2 * c]);
+    float L = 0.f, o = 0.f;
+    for (uint c = 0; c < a.nsplit; ++c) {
+        const float w = exp(mh[2 * c] - M);
+        L += mh[2 * c + 1] * w;
+        o += part[(h * a.nsplit + c) * FA_D + i] * w;
+    }
+    out[h * FA_D + i] = o / L;
+}
