@@ -356,11 +356,31 @@
                (dolist (p pieces) (push (append p (list s)) jobs))))
     (enqueue-reads r (nreverse jobs) urgent)))
 
+(defvar *ds4f-keep-warm* t
+  "Whether the GPU is kept busy while decode waits for an expert from the
+   SSD (KEEP-GPU-WARM).  Left idle a millisecond or more while reads go on,
+   the GPU slows down, and the layer after the wait runs slower than the
+   wait alone accounts for: with it, 74 -> 65 ms of GPU a token, and 6%
+   more tokens a second, on a 48 GB M4 Pro.")
+
+(defun keep-gpu-warm (m)
+  "A small job on the GPU (32 MB of Q8_0 matvecs into scratch: some 0.15
+   ms), run to its end -- something for it to do while the CPU waits."
+  (let* ((st (ds4f-gpu-state m)) (gpu (d4gpu-gpu st)) (cols 4096) (rows 1024) (rb (* 34 (floor cols 32)))
+         (w (d4gpu-buf st :warm-w (* rows rb))) (x (d4gpu-buf st :warm-x (* 4 cols)))
+         (y (d4gpu-buf st :warm-y (* 4 rows))))
+    (with-gpu-work (e gpu)
+      (dotimes (i 8)
+        (dispatch gpu e "d4_mv_q8_0" (list cols rows rb rows 0) (list w x y) (ceiling rows 8) 64)))))
+
 (defun cache-wait (m xc slots)
-  "Wait until none of SLOTS is being read."
+  "Wait until none of SLOTS is being read (the GPU kept warm meanwhile)."
   (let ((pending (dx-pending xc)))
     (declare (type (simple-array fixnum (*)) pending))
     (when (some (lambda (s) (plusp (aref pending s))) slots)
+      (when *ds4f-keep-warm*
+        (loop while (some (lambda (s) (plusp (aref pending s))) slots)
+              do (keep-gpu-warm m)))
       (let ((r (ds4f-reader m xc)))
         (incf (dx-waited xc))
         (sb-thread:with-mutex ((dr-mutex r))

@@ -331,15 +331,41 @@
 
 ;;; --- encoding work --------------------------------------------------------------
 
+;;; A command buffer's one encoder dispatches concurrently, with a barrier
+;;; before each dispatch -- as a serial encoder runs, at the same cost -- but
+;;; for the ones in a TOGETHER, which wait for what came before and run side
+;;; by side: a dependent chain of small dispatches costs some microseconds a
+;;; step however little each does, so the independent ones (projections of
+;;; the same input) are one step, not several.  (ds4's concurrent FFN.)
+
 (defstruct (batch-enc (:conc-name enc-) (:constructor %make-enc))
   cb enc
+  (group nil)             ; NIL: a barrier before each dispatch; :FIRST, :IN: in a TOGETHER
+  (started nil)           ; whether anything is dispatched yet (no barrier before the first)
   (args (make-array 64 :element-type '(unsigned-byte 32)))
   (sizes (make-array 6 :element-type '(unsigned-byte 64))))
 
 (defun begin-work (gpu)
   (let* ((cb (msg ptr (gpu-queue gpu) "commandBuffer"))
-         (enc (msg ptr cb "computeCommandEncoder")))
+         (enc (msg ptr cb "computeCommandEncoderWithDispatchType:" (sb-alien:unsigned-long 1)))) ; concurrent
     (%make-enc :cb cb :enc enc)))
+
+(defmacro together ((e) &body body)
+  "BODY's dispatches into E, independent of each other: after what came
+   before them, side by side, and before what comes after."
+  (let ((was (gensym)))
+    `(let ((,was (enc-group ,e)))
+       (unless ,was (setf (enc-group ,e) :first))
+       (multiple-value-prog1 (progn ,@body)
+         (setf (enc-group ,e) ,was)))))
+
+(defun dispatch-barrier (e)
+  "Before a dispatch into E: wait for the ones before it, unless it joins a TOGETHER."
+  (case (enc-group e)
+    ((nil) (when (enc-started e) (msg sb-alien:void (enc-enc e) "memoryBarrierWithScope:" (sb-alien:unsigned-long 1))))
+    (:first (when (enc-started e) (msg sb-alien:void (enc-enc e) "memoryBarrierWithScope:" (sb-alien:unsigned-long 1)))
+     (setf (enc-group e) :in)))
+  (setf (enc-started e) t))
 
 (defun commit-work (e)
   "Finish encoding and start it running."
@@ -367,6 +393,7 @@
    of up to three).  ARGS, 32-bit words (integers or floats), go in buffer 0;
    BUFFERS are (gbuf . byte-offset) or gbufs, from buffer 1.  SHARED bytes of
    threadgroup memory at index 0."
+  (dispatch-barrier e)
   (let ((enc (enc-enc e)) (a (enc-args e)) (sz (enc-sizes e)))
     (msg sb-alien:void enc "setComputePipelineState:" (ptr (pipeline gpu kernel)))
     (loop for x in args for i from 0 do (setf (aref a i) (arg-word x)))
@@ -401,7 +428,7 @@
         (t1 (msg double-float (enc-cb e) "GPUEndTime")))
     (incf (gethash kernel *gpu-profile* 0d0) (- t1 t0)))
   (let ((fresh (begin-work gpu)))
-    (setf (enc-cb e) (enc-cb fresh) (enc-enc e) (enc-enc fresh))))
+    (setf (enc-cb e) (enc-cb fresh) (enc-enc e) (enc-enc fresh) (enc-started e) nil)))
 
 (defmacro with-gpu-work ((e gpu) &body body)
   "Encode BODY's dispatches into one command buffer, then run it and wait."
