@@ -137,6 +137,9 @@
 
 (defstruct (d4xcache (:conc-name dx-)) buf (n 0) slot-of owner used pending pin fresh (frees '())
   (tick 0) (free 0) (decode-pins '())
+  ready                 ; a GPU buffer: each key's slot, its read done, or -1 (decode's D4_SLOTS)
+  (ne 1)                ; experts a layer (a key is layer * NE + expert)
+  (guard nil)           ; (first . last) layers whose slots no new expert may take, or NIL
   (hits 0) (misses 0) (read-time 0) (prefetched 0) (waited 0))
 
 (defun ds4f-expert-cache (m)
@@ -148,6 +151,7 @@
           (setf (getf (d4gpu-plist* st) :xcache)
                 (seed-expert-cache
                  m (make-d4xcache :buf (lock-buffer (gpu-buffer (d4gpu-gpu st) (* n sb)) "expert pool") :n n
+                                  :ready (gpu-buffer (d4gpu-gpu st) (* 4 keys)) :ne (ds4f-n-expert m)
                                   :slot-of (make-array keys :element-type 'fixnum :initial-element -1)
                                   :owner (make-array n :element-type 'fixnum :initial-element -1)
                                   :used (make-array n :element-type 'fixnum :initial-element 0)
@@ -186,6 +190,7 @@
             (read-experts-pieces m (svref (ds4f-layers m) li) (mapcar #'car v)
                                  (mapcar (lambda (x) (* (cdr x) sb)) v) (dx-buf xc)))))
       (setf (dx-free xc) k)))
+  (sync-ready xc)
   xc)
 
 (defun ds4f-gpu-lend (m)
@@ -312,29 +317,51 @@
                                        (pread-into fd (sb-sys:sap+ (gbuf-sap (dx-buf xc)) dst) src bytes)
                                        (sb-thread:with-mutex ((dr-mutex r))
                                          (when (zerop (decf (aref pending slot)))
+                                           ;; read: the GPU may use it (a slot being read keeps its owner)
+                                           (let ((o (aref (dx-owner xc) slot)))
+                                             (when (>= o 0) (set-ready xc o slot)))
                                            (sb-thread:condition-broadcast (dr-cv r))))))))
                                :name "illatio expert reads")))
           (setf (getf (d4gpu-plist* st) :reader) r)))))
 
 (defun cache-victim (xc)
   "A slot for a new expert: one given back, else one never used, else the
-   least recently used that no work holds (pinned) or is reading."
+   least recently used that no work holds (pinned) or is reading, nor
+   holds an expert of the GUARD's layers (the GPU may be looking them up)."
   (cond ((dx-frees xc) (pop (dx-frees xc)))
         ((< (dx-free xc) (dx-n xc)) (prog1 (dx-free xc) (incf (dx-free xc))))
         (t (let ((used (dx-used xc)) (pending (dx-pending xc)) (pin (dx-pin xc))
                  (best -1) (bu most-positive-fixnum))
              (declare (type (simple-array fixnum (*)) used pending pin) (type fixnum best bu))
-             (dotimes (j (dx-n xc))
-               (when (and (< (aref used j) bu) (zerop (aref pending j)) (zerop (aref pin j)))
-                 (setf best j bu (aref used j))))
+             (let ((owner (dx-owner xc)) (ne (dx-ne xc))
+                   (g0 (if (dx-guard xc) (car (dx-guard xc)) -1)) (g1 (if (dx-guard xc) (cdr (dx-guard xc)) -2)))
+               (declare (type (simple-array fixnum (*)) owner) (type fixnum ne g0 g1))
+               (dotimes (j (dx-n xc))
+                 (when (and (< (aref used j) bu) (zerop (aref pending j)) (zerop (aref pin j))
+                            (let ((o (aref owner j))) (or (< o 0) (not (<= g0 (floor o ne) g1)))))
+                   (setf best j bu (aref used j)))))
              (assert (>= best 0) () "every expert slot is held by work in flight")
              best))))
 
+(defun set-ready (xc key slot)
+  "The GPU's view of KEY: in SLOT, read (or -1: not to be used)."
+  (setf (sb-sys:sap-ref-32 (gbuf-sap (dx-ready xc)) (* 4 key)) (ldb (byte 32 0) slot)))
+
+(defun sync-ready (xc)
+  "XC's ready table made again from its slots: those holding an expert
+   that is not being read."
+  (let ((slot-of (dx-slot-of xc)) (pending (dx-pending xc)))
+    (declare (type (simple-array fixnum (*)) slot-of pending))
+    (dotimes (key (length slot-of) xc)
+      (let ((s (aref slot-of key)))
+        (set-ready xc key (if (and (>= s 0) (zerop (aref pending s))) s -1))))))
+
 (defun cache-claim (xc key tick)
-  "A slot of XC for KEY, its old expert forgotten."
+  "A slot of XC for KEY, its old expert forgotten (by the GPU's table first)."
   (let ((s (cache-victim xc)) (owner (dx-owner xc)) (slot-of (dx-slot-of xc)))
     (declare (type (simple-array fixnum (*)) owner slot-of))
-    (when (>= (aref owner s) 0) (setf (aref slot-of (aref owner s)) -1))
+    (set-ready xc key -1)
+    (when (>= (aref owner s) 0) (set-ready xc (aref owner s) -1) (setf (aref slot-of (aref owner s)) -1))
     (setf (aref owner s) key (aref slot-of key) s (aref (dx-used xc) s) tick (aref (dx-fresh xc) s) 0)
     s))
 
@@ -342,7 +369,7 @@
   "Give slot S back: its expert forgotten, the slot first to be taken."
   (let ((owner (dx-owner xc)))
     (declare (type (simple-array fixnum (*)) owner))
-    (when (>= (aref owner s) 0) (setf (aref (dx-slot-of xc) (aref owner s)) -1))
+    (when (>= (aref owner s) 0) (set-ready xc (aref owner s) -1) (setf (aref (dx-slot-of xc) (aref owner s)) -1))
     (setf (aref owner s) -1 (aref (dx-used xc) s) 0 (aref (dx-fresh xc) s) 0)
     (push s (dx-frees xc))))
 

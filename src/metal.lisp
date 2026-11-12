@@ -342,6 +342,8 @@
   cb enc
   (group nil)             ; NIL: a barrier before each dispatch; :FIRST, :IN: in a TOGETHER
   (started nil)           ; whether anything is dispatched yet (no barrier before the first)
+  (gate nil)              ; GATE-WORK's (src . dst) grid tables, or NIL
+  (ngated 0)              ; dispatches through them so far
   (args (make-array 64 :element-type '(unsigned-byte 32)))
   (sizes (make-array 6 :element-type '(unsigned-byte 64))))
 
@@ -358,6 +360,21 @@
        (unless ,was (setf (enc-group ,e) :first))
        (multiple-value-prog1 (progn ,@body)
          (setf (enc-group ,e) ,was)))))
+
+;;; A gated command buffer runs only if a flag the GPU wrote before it says
+;;; so: its dispatches are indirect, their grids copied from a table the CPU
+;;; fills (SRC) into the one they read (DST) by a first dispatch, d4_gate,
+;;; as they are or as zeros -- so work can be queued before it is known to
+;;; be wanted, and cost nothing when it is not.
+
+(defconstant +gate-max+ 256 "Dispatches a gated command buffer may hold.")
+
+(defun gate-work (gpu e ok src dst)
+  "Gate E on the u32 at OK ((buffer . offset)): its dispatches from here run
+   if it is not zero.  SRC and DST, buffers of +GATE-MAX+ grids (12 bytes
+   each), are E's own while it runs."
+  (dispatch gpu e "d4_gate" (list (* 3 +gate-max+)) (list ok src dst) (ceiling (* 3 +gate-max+) 256) 256)
+  (setf (enc-gate e) (cons src dst) (enc-ngated e) 0))
 
 (defun dispatch-barrier (e)
   "Before a dispatch into E: wait for the ones before it, unless it joins a TOGETHER."
@@ -412,8 +429,16 @@
                (let ((l (if (listp x) x (list x))))
                  (dotimes (k 3) (setf (aref sz (+ o k)) (or (nth k l) 1))))))
         (size3 groups 0) (size3 threads 3))
-      (msg sb-alien:void enc "dispatchThreadgroups:threadsPerThreadgroup:"
-           (ptr (sb-sys:vector-sap sz)) (ptr (sb-sys:sap+ (sb-sys:vector-sap sz) 24))))
+      (if (enc-gate e)
+          (let ((i (enc-ngated e)) (src (gbuf-sap (car (enc-gate e)))))
+            (assert (< i +gate-max+) () "a gated command buffer holds at most ~D dispatches" +gate-max+)
+            (dotimes (k 3) (setf (sb-sys:sap-ref-32 src (+ (* 12 i) (* 4 k))) (aref sz k)))
+            (setf (enc-ngated e) (1+ i))
+            (msg sb-alien:void enc "dispatchThreadgroupsWithIndirectBuffer:indirectBufferOffset:threadsPerThreadgroup:"
+                 (ptr (gbuf-obj (cdr (enc-gate e)))) (sb-alien:unsigned-long (* 12 i))
+                 (ptr (sb-sys:sap+ (sb-sys:vector-sap sz) 24))))
+          (msg sb-alien:void enc "dispatchThreadgroups:threadsPerThreadgroup:"
+               (ptr (sb-sys:vector-sap sz)) (ptr (sb-sys:sap+ (sb-sys:vector-sap sz) 24)))))
     (when *gpu-profile* (profile-dispatch gpu e kernel))))
 
 (defvar *gpu-profile* nil

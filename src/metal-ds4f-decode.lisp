@@ -44,11 +44,15 @@
 
 ;;; --- a per-command-buffer arena for small inputs (RoPE tables, counts) ----------------
 
-(defun arena-reset (st) (setf (getf (d4gpu-plist* st) :arena-at) 0))
+(defun arena-reset (st &optional (which 0))
+  "Start arena WHICH (0 or 1: a command buffer may be encoded while the one
+   before it runs) over."
+  (setf (getf (d4gpu-plist* st) :arena-key) (if (zerop which) :arena :arena1)
+        (getf (d4gpu-plist* st) :arena-at) 0))
 
 (defun arena-put (st words &key float)
   "WORDS (a sequence of floats, or of u32s) into ST's arena: (buffer . offset)."
-  (let* ((buf (d4gpu-buf st :arena (* 1024 1024)))
+  (let* ((buf (d4gpu-buf st (getf (d4gpu-plist* st) :arena-key :arena) (* 1024 1024)))
          (at (getf (d4gpu-plist* st) :arena-at 0)) (sap (gbuf-sap buf)))
     (assert (< (+ at (* 4 (length words))) (gbuf-bytes buf)))
     (let ((i 0))
@@ -241,39 +245,57 @@
     (q8mv-enc m gpu e li "attn_output_b.weight" low aout)
     (enc-hc-post m gpu e aout sa pca sb 1 (cons li :attn))))
 
-(defun enc-ffn-head (m gpu e st l li sb)
-  "Layer LI's FFN up to the routing: HC pre of SB, the norm, the router's
-   logits (and the next layer's, its guess).  The shared expert waits for
-   the routed ones (ENC-FFN-TAIL), to run beside them."
-  (let* ((d (ds4f-d m)) (ne (ds4f-n-expert m))
-         (cur (d4gpu-buf st :g-cur (* 4 d))) (norm2 (d4gpu-buf st :g-norm2 (* 4 d)))
-         (pcf (d4gpu-buf st :g-pcf (* 4 32))) (logits (d4gpu-buf st :g-logits (* 4 ne))))
-    (enc-hc-pre m gpu e st (lname li "hc_ffn_fn.weight") (dl-hc-ffn-scale l) (dl-hc-ffn-base l) sb cur pcf)
-    (enc-rms gpu e cur (gpu-vector m (dl-ffn-norm l)) norm2 d 1 (ds4f-eps m))
-    (together (e)
-      (enc-mv16 m gpu e (lname li "ffn_gate_inp.weight") norm2 logits)
-      ;; the next layer's router on this input: the guess at its experts (read ahead)
-      (when (and (< (1+ li) (ds4f-n-layer m)) (null (dl-tid2eid (svref (ds4f-layers m) (1+ li)))))
-        (enc-mv16 m gpu e (lname (1+ li) "ffn_gate_inp.weight") norm2 (d4gpu-buf st :g-plogits (* 4 ne)))))))
+(defun route-bufs (m st)
+  "Decode's routing results, a row a layer: (values sel w bo ok plogits)."
+  (let ((nl (ds4f-n-layer m)) (nu (ds4f-n-used m)) (ne (ds4f-n-expert m)))
+    (values (d4gpu-buf st :g-sel (* 4 nl nu)) (d4gpu-buf st :g-w (* 4 nl nu))
+            (d4gpu-buf st :g-bo (* 8 2 nl nu)) (d4gpu-buf st :g-ok (* 4 nl))
+            (d4gpu-buf st :g-plogits (* 4 nl ne)))))
 
-(defun enc-ffn-tail (m gpu e st l li slots w sb sa)
-  "Layer LI's routed experts (cache SLOTS, weights W) on its FFN input and
-   the shared expert beside them, summed, and its FFN's HC post: streams SB
-   into SA."
-  (let* ((d (ds4f-d m)) (ff (ds4f-ff-exp m)) (k (length slots)) (clamp (svref (ds4f-clamps m) li))
-         (xc (ds4f-expert-cache m)) (sbytes (d4gpu-slot-bytes st)) (gb (d4gpu-gate-bytes st))
-         (norm2 (d4gpu-buf st :g-norm2 (* 4 d))) (bo (arena-put st (make-list (* 4 k) :initial-element 0)))
-         (bw (arena-put st (coerce w 'list) :float t))
+(defun enc-ffn-head (m gpu e st l li sb token)
+  "Layer LI's FFN up to the routing, and the routing: HC pre of SB, the
+   norm, the router's logits (and the next layer's, its guess), the experts
+   chosen (D4_ROUTE) and looked up in the expert pool (D4_SLOTS), into the
+   layer's rows of ROUTE-BUFS.  The shared expert waits for the routed ones
+   (ENC-FFN-TAIL), to run beside them."
+  (let* ((d (ds4f-d m)) (ne (ds4f-n-expert m)) (nu (ds4f-n-used m)) (xc (ds4f-expert-cache m))
+         (cur (d4gpu-buf st :g-cur (* 4 d))) (norm2 (d4gpu-buf st :g-norm2 (* 4 d)))
+         (pcf (d4gpu-buf st :g-pcf (* 4 32))) (logits (d4gpu-buf st :g-logits (* 4 ne)))
+         (bias (if (and (dl-probs-b-vl l) (or *d4-vision-position* (image-token-p token)))
+                   (dl-probs-b-vl l)
+                   (dl-probs-b l))))
+    (multiple-value-bind (gsel gw gbo gok gpl) (route-bufs m st)
+      (enc-hc-pre m gpu e st (lname li "hc_ffn_fn.weight") (dl-hc-ffn-scale l) (dl-hc-ffn-base l) sb cur pcf)
+      (enc-rms gpu e cur (gpu-vector m (dl-ffn-norm l)) norm2 d 1 (ds4f-eps m))
+      (together (e)
+        (enc-mv16 m gpu e (lname li "ffn_gate_inp.weight") norm2 logits)
+        ;; the next layer's router on this input: the guess at its experts (read ahead)
+        (when (and (< (1+ li) (ds4f-n-layer m)) (null (dl-tid2eid (svref (ds4f-layers m) (1+ li)))))
+          (enc-mv16 m gpu e (lname (1+ li) "ffn_gate_inp.weight") norm2 (cons gpl (* 4 ne (1+ li))))))
+      (dispatch gpu e "d4_route" (list ne nu (if (dl-tid2eid l) 1 0) (ds4f-expert-scale m) (if bias 1 0))
+                (list logits (if bias (gpu-vector m bias) logits)
+                      (if (dl-tid2eid l) (tid2eid-buffer m st li l) logits) (arena-put st (list token))
+                      (cons gsel (* 4 nu li)) (cons gw (* 4 nu li)))
+                1 ne :shared (* 4 (+ (* 2 ne) 64 nu)))
+      (dispatch gpu e "d4_slots" (list nu (* li ne) (d4gpu-slot-bytes st) (d4gpu-gate-bytes st))
+                (list (cons gsel (* 4 nu li)) (dx-ready xc) (cons gbo (* 16 nu li)) (cons gok (* 4 li)))
+                1 32))))
+
+(defun enc-ffn-tail (m gpu e st l li sb sa)
+  "Layer LI's routed experts (its rows of ROUTE-BUFS: their offsets in the
+   pool, their weights) on its FFN input and the shared expert beside them,
+   summed, and its FFN's HC post: streams SB into SA."
+  (let* ((d (ds4f-d m)) (ff (ds4f-ff-exp m)) (k (ds4f-n-used m)) (clamp (svref (ds4f-clamps m) li))
+         (xc (ds4f-expert-cache m)) (gb (d4gpu-gate-bytes st))
+         (norm2 (d4gpu-buf st :g-norm2 (* 4 d)))
+         (bo (multiple-value-bind (gsel gw gbo) (route-bufs m st) (declare (ignore gsel gw)) (cons gbo (* 16 k li))))
+         (bw (multiple-value-bind (gsel gw) (route-bufs m st) (declare (ignore gsel)) (cons gw (* 4 k li))))
          (bgu (d4gpu-buf st :dgu (* 4 2 k ff))) (bm (d4gpu-buf st :dmid (* 4 k ff)))
          (bd (d4gpu-buf st :ddown (* 4 k d))) (moe (d4gpu-buf st :g-moe (* 4 d)))
          (sg (d4gpu-buf st :g-sg (* 4 ff))) (su (d4gpu-buf st :g-su (* 4 ff)))
          (smid (d4gpu-buf st :g-smid (* 4 ff))) (sout (d4gpu-buf st :g-sout (* 4 d)))
          (one (arena-put st (list 1f0) :float t))
          (grb (second (dl-gate-exps l))) (drb (second (dl-down-exps l))) (buf (dx-buf xc)))
-    ;; the experts' gate slots then their up slots (64-bit offsets)
-    (dotimes (i k)
-      (setf (sb-sys:sap-ref-64 (gbuf-sap (car bo)) (+ (cdr bo) (* 8 i))) (* (aref slots i) sbytes)
-            (sb-sys:sap-ref-64 (gbuf-sap (car bo)) (+ (cdr bo) (* 8 (+ k i)))) (+ (* (aref slots i) sbytes) gb)))
     (flet ((mv (kernel ncols nrows rb add x xs y z)
              (dispatch gpu e kernel (list ncols nrows rb add xs nrows) (list buf bo x y)
                        (list (ceiling nrows 8) 1 z) 64
@@ -294,41 +316,109 @@
 
 ;;; --- a token ---------------------------------------------------------------------------
 
+;;; A token's command buffers.  Buffer J runs layer J-1's routed experts,
+;;; then layer J's attention and its FFN up to the routing, which the GPU
+;;; does too, looking the experts up in the pool (ENC-FFN-HEAD); buffer N
+;;; (the layer count) runs the last layer's experts and the head.  Buffer
+;;; J+1 is queued before J is done, gated on J's lookup having found every
+;;; expert ready (GATE-WORK): the GPU goes from layer to layer without
+;;; waiting for the CPU.  When an expert was not there, J+1 does nothing;
+;;; the CPU reads the expert (CACHE-EXPERTS, as before) and queues J+1
+;;; again, its CPU-side counts set back first.  Meanwhile the CPU reads
+;;; ahead the next layer's guessed experts.  While it does, the experts of
+;;; the layers the GPU may be looking up stay where they are (the guard).
+
+(defvar *ds4f-gpu-ahead* t
+  "Whether decode queues a layer's command buffer before the one before it
+   is done (gated on its experts being there); NIL: each after the CPU has
+   looked at the one before, as it was (the GPU's routing all the same).")
+
+(defun dc-counts (c) (list (dc-raw-total c) (dc-n-raw c) (dc-n-comp c) (dc-n-ix c)))
+(defun (setf dc-counts) (v c)
+  (destructuring-bind (rt nr nc ni) v
+    (setf (dc-raw-total c) rt (dc-n-raw c) nr (dc-n-comp c) nc (dc-n-ix c) ni)))
+
+(defun note-gpu-hits (m li sel)
+  "Layer LI's experts SEL, all found in the pool by the GPU: noted as
+   CACHE-EXPERTS notes hits (used now, pinned until the next layer's)."
+  (let* ((xc (ds4f-expert-cache m)) (ne (ds4f-n-expert m)) (slot-of (dx-slot-of xc)) (used (dx-used xc))
+         (pin (dx-pin xc)) (tick (incf (dx-tick xc))))
+    (declare (type (simple-array fixnum (*)) slot-of used pin))
+    (dolist (s (dx-decode-pins xc)) (decf (aref pin s)))
+    (setf (dx-decode-pins xc) '())
+    (loop for e across sel
+          do (let ((s (aref slot-of (+ (* li ne) e))))
+               (assert (>= s 0) () "the GPU used layer ~D's expert ~D, which the pool does not hold" li e)
+               (setf (aref used s) tick) (incf (aref pin s)) (push s (dx-decode-pins xc)) (incf (dx-hits xc))))))
+
 (defun ds4f-gpu-forward (ctx token logits)
   "DS4F-FORWARD-1 on the GPU: TOKEN at the next position."
   (let* ((m (d4ctx-model ctx)) (st (ds4f-gpu-state m)) (gpu (d4gpu-gpu st))
          (d (ds4f-d m)) (n (ds4f-n-hc m)) (hcd (* n d)) (pos (d4ctx-pos ctx)) (wf (ds4f-file m))
-         (ne (ds4f-n-expert m)) (nl (ds4f-n-layer m))
+         (ne (ds4f-n-expert m)) (nu (ds4f-n-used m)) (nl (ds4f-n-layer m)) (xc (ds4f-expert-cache m))
          (sa (d4gpu-buf st :g-sa (* 4 hcd))) (sb (d4gpu-buf st :g-sb (* 4 hcd)))
-         (lg (f32vec ne)) (norm2 (f32vec d)) (pending nil))
+         (counts (make-array (1+ nl) :initial-element nil)))
     (declare (type u8vec wf))
     (ds4f-gpu-weights m)
+    (sync-ready xc)
     ;; the token's embedding into each stream
     (let ((o (+ (ds4f-embd-off m) (* token d 2))) (sap (gbuf-sap sa)))
       (dotimes (j d)
         (let ((v (f16-at wf (+ o (* 2 j)))))
           (dotimes (h n) (setf (sb-sys:sap-ref-single sap (* 4 (+ (* h d) j))) v)))))
-    (dotimes (li nl)
-      (let ((l (svref (ds4f-layers m) li)) (c (svref (d4ctx-caches ctx) li)))
-        (arena-reset st)
-        (with-gpu-work (e gpu)
-          (when pending (apply #'enc-ffn-tail m gpu e st (append pending (list sb sa))))
-          (enc-attention m gpu e st l li c pos sa sb)
-          (enc-ffn-head m gpu e st l li sb))
-        ;; the routing, on the CPU
-        (copy-floats-out lg (d4gpu-buf st :g-logits (* 4 ne)) ne)
-        (copy-floats-out norm2 (d4gpu-buf st :g-norm2 (* 4 d)) d)
-        (multiple-value-bind (sel w) (d4-route m l li norm2 token lg)
-          (let ((slots (cache-experts m l li sel)))
-            (when (and (plusp *ds4f-prefetch-k*) (< (1+ li) nl))
-              (let ((pl (f32vec ne)))
-                (copy-floats-out pl (d4gpu-buf st :g-plogits (* 4 ne)) ne)
-                (prefetch-cache-experts m (1+ li) (predict-experts m (1+ li) token *ds4f-prefetch-k* pl))))
-            (setf pending (list l li slots w))))))
-    (arena-reset st)
-    (with-gpu-work (e gpu)
-      (apply #'enc-ffn-tail m gpu e st (append pending (list sb sa)))
-      (when logits (enc-head m gpu e st sa)))
+    (multiple-value-bind (gsel gw gbo gok gpl) (route-bufs m st)
+      (declare (ignore gw))
+      (labels ((queue (j gated)
+                 ;; command buffer J, committed (retained: it outlives the autorelease pool)
+                 (let ((p (mod j 2)))
+                   (when (< j nl) (setf (svref counts j) (dc-counts (svref (d4ctx-caches ctx) j))))
+                   (arena-reset st p)
+                   (with-metal
+                     (with-autorelease
+                       (let ((e (begin-work gpu)))
+                         (msg ptr (enc-cb e) "retain")
+                         (when gated
+                           (gate-work gpu e (cons gok (* 4 (1- j)))
+                                      (d4gpu-buf st (if (zerop p) :gate-src0 :gate-src1) (* 12 +gate-max+))
+                                      (d4gpu-buf st (if (zerop p) :gate-dst0 :gate-dst1) (* 12 +gate-max+))))
+                         (when (plusp j)
+                           (enc-ffn-tail m gpu e st (svref (ds4f-layers m) (1- j)) (1- j) sb sa))
+                         (if (< j nl)
+                             (let ((l (svref (ds4f-layers m) j)))
+                               (enc-attention m gpu e st l j (svref (d4ctx-caches ctx) j) pos sa sb)
+                               (enc-ffn-head m gpu e st l j sb token))
+                             (when logits (enc-head m gpu e st sa)))
+                         (commit-work e)
+                         e)))))
+               (finish (e)
+                 (with-metal (wait-work e))
+                 (msg sb-alien:void (enc-cb e) "release")))
+        (let* ((ahead *ds4f-gpu-ahead*) (cur (queue 0 nil)) (next (and ahead (queue 1 t))))
+          (unwind-protect
+               (dotimes (j nl)
+                 (finish cur)
+                 (setf (dx-guard xc) (cons j (1+ j)))
+                 (let ((sel (make-array nu)))
+                   (dotimes (i nu) (setf (aref sel i) (sb-sys:sap-ref-32 (gbuf-sap gsel) (* 4 (+ (* nu j) i)))))
+                   (if (and next (/= 0 (sb-sys:sap-ref-32 (gbuf-sap gok) (* 4 j))))
+                       (note-gpu-hits m j sel)
+                       ;; an expert was missing: J+1 did nothing; read it, and queue J+1 again
+                       (let ((slots (progn (when next (finish next))
+                                           (when (and next (< (1+ j) nl))
+                                             (setf (dc-counts (svref (d4ctx-caches ctx) (1+ j))) (svref counts (1+ j))))
+                                           (cache-experts m (svref (ds4f-layers m) j) j sel)))
+                             (sbytes (d4gpu-slot-bytes st)) (gb (d4gpu-gate-bytes st)))
+                         (dotimes (i nu)
+                           (setf (sb-sys:sap-ref-64 (gbuf-sap gbo) (* 8 (+ (* 2 nu j) i))) (* (aref slots i) sbytes)
+                                 (sb-sys:sap-ref-64 (gbuf-sap gbo) (* 8 (+ (* 2 nu j) nu i))) (+ (* (aref slots i) sbytes) gb)))
+                         (setf next (queue (1+ j) nil)))))
+                 ;; the next layer's guessed experts read ahead
+                 (when (and (plusp *ds4f-prefetch-k*) (< (1+ j) nl))
+                   (let ((pl (gbuf-floats gpl ne (* ne (1+ j)))))
+                     (prefetch-cache-experts m (1+ j) (predict-experts m (1+ j) token *ds4f-prefetch-k* pl))))
+                 (setf cur next next (when (and ahead (<= (+ j 2) nl)) (queue (+ j 2) t))))
+            (setf (dx-guard xc) nil))
+          (finish cur))))
     (incf (d4ctx-pos ctx))
     (ds4f-steer-captured m)
     (when logits

@@ -44,6 +44,7 @@ On a 48 GB M4 Pro (Metal):
 | prefill, a 3,341-token prompt | **88.6 tok/s** | 80.2 tok/s |
 | decode, 600 tokens of raw text after a short prompt | 7.3 tok/s | **8.4 tok/s** |
 | decode, 600 tokens of a story (later, against ds4 of November 3) | 6.3 tok/s | **9.5 tok/s** |
+| decode, a 600-token chat answer (reasoning about Fresnel lenses) | **8.2-8.5 tok/s** | 8.2 tok/s |
 | the same system prompt again, a new question | only the question is prefilled | the same (its disk KV cache) |
 
 (November 12, 2026, against ds4 as it was then, both from a cold start:
@@ -55,8 +56,12 @@ state, every expert cached, the same layers take 46), the SSD's reads hold
 it up 34 and the CPU's routing between layers 15.  The GPU runs slow after
 waiting on the SSD -- a millisecond idle while reads go on and the next
 layer takes half again as long -- so decode keeps it busy while it waits
-(`*ds4f-keep-warm*`); routing on the GPU, so that layers whose experts
-are all cached need not wait for the CPU, is what is left (ds4's way).
+(`*ds4f-keep-warm*`).  And the GPU routes each layer itself and looks its
+experts up in the pool, so the next layer is queued before this one is
+done, to run if they were all there (`*ds4f-gpu-ahead*`): about half the
+layers go by without the CPU, and decode is 8% faster (7.75 -> 8.4 tok/s
+over two chat answers).  The rest wait on an expert from the SSD -- most
+of them for one being read ahead, guessed a layer too late.
 
 It chats, reasons and calls tools through the CLI and the OpenAI endpoint,
 with ds4's tokenizer and chat format (DSML tool calls, thinking).  Get the

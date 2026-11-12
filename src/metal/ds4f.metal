@@ -1318,6 +1318,37 @@ kernel void d4_route(constant d4_route_args & a [[buffer(0)]],
     }
 }
 
+// Decode's routing on the GPU, so the next layer need not wait for the CPU:
+// the experts D4_ROUTE picked looked up in READY (a key's slot in the
+// expert pool, its read done; -1 if not), their gate and up offsets into
+// BO as the routed matvecs take them, and OK whether all were there.
+struct d4_slots_args { uint nu; uint key0; uint slot_bytes; uint gate_bytes; };
+
+kernel void d4_slots(constant d4_slots_args & a [[buffer(0)]],
+                     device const uint * sel [[buffer(1)]], device const int * ready [[buffer(2)]],
+                     device ulong * bo [[buffer(3)]], device uint * ok [[buffer(4)]],
+                     uint t [[thread_position_in_grid]]) {
+    if (t != 0) return;
+    uint all = 1;
+    for (uint i = 0; i < a.nu; ++i) {
+        int s = ready[a.key0 + sel[i]];
+        if (s < 0) { all = 0; s = 0; }
+        bo[i] = (ulong)s * a.slot_bytes;
+        bo[a.nu + i] = (ulong)s * a.slot_bytes + a.gate_bytes;
+    }
+    ok[0] = all;
+}
+
+// A gated command buffer's first dispatch: the grids its dispatches read,
+// SRC's if OK, else zeros (GATE-WORK).
+struct d4_gate_args { uint n; };
+
+kernel void d4_gate(constant d4_gate_args & a [[buffer(0)]],
+                    device const uint * ok [[buffer(1)]], device const uint * src [[buffer(2)]],
+                    device uint * dst [[buffer(3)]], uint i [[thread_position_in_grid]]) {
+    if (i < a.n) dst[i] = ok[0] ? src[i] : 0u;
+}
+
 // The chunk's (token, slot) rows grouped by expert: each one's rank among
 // its expert's (COUNT, atomically), the experts' first rows (SCAN), then each
 // row's token and weight, and the way back from (token, slot) (SCATTER).
