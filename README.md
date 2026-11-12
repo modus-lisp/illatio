@@ -196,9 +196,11 @@ KV cache in halves, a flash attention on the half simdgroup matrices
 | Qwen3-4B Q8_0, decode | 49.8 | 53.4 |
 | Qwen2.5-0.5B Q8_0, prefill | 6,724 | 7,782 |
 | Qwen2.5-0.5B Q8_0, decode | 262 | 265 |
+| Qwen3-4B Q4_K_M, prefill | 822 | 843 |
+| Qwen3-4B Q4_K_M, decode | 73.4 | 80.4 |
 
-Both give the CPU path's top token after a 591-token prompt and its first 32
-greedy tokens.
+All three give the CPU path's top token after a 591-token prompt and its
+first 32 greedy tokens.  Q8_0, Q4_K and Q6_K matrices so far.
 
 Qwen3-4B in Q4_K_M (2.5 GB):
 
@@ -277,7 +279,7 @@ bin/illatio-server --gpu -m M --port 8081 \
 ```
 
 `--gpu` runs a `qwen35` model on the GPU, and on a Mac a dense one (`qwen2`,
-`qwen3`, `llama`) in Q8_0 too; DeepSeek V4 Flash always uses it on a Mac,
+`qwen3`, `llama`) in Q8_0, Q4_K or Q6_K too; DeepSeek V4 Flash always uses it on a Mac,
 and the DeepSeek models always use CUDA where it is.  Raw text ends with llama-simple's speed line, so a quick
 comparison is
 

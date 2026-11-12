@@ -138,6 +138,16 @@ void d4_deq_iq2_xxs(device const d4_block_iq2_xxs * xb, short il, thread half4x4
     for (int i = 0; i < 8; ++i) reg[2+i/4][i%4] = dl * grid[i] * (signs & kmask_iq2xs[i] ? -1.f : 1.f);
 }
 
+// Q4_K's weights IL*16 .. IL*16+15 of a block (dense.metal's dn_block_q4_K):
+// chunk IL/4 of 64, the low nibbles for IL%4 < 2, sub-block IL/2
+void d4_deq_q4_K(device const dn_block_q4_K * xb, short il, thread half4x4 & reg) {
+    device const uint8_t * q = xb->qs + (il / 4) * 32 + 16 * (il & 1);
+    const uchar2 sm = dn_q4k_scale(il / 2, xb->scales);
+    const float dl = (float)xb->d * sm[0], ml = (float)xb->dmin * sm[1];
+    const bool high = (il & 3) >= 2;
+    for (int i = 0; i < 16; ++i) reg[i/4][i%4] = dl * (high ? (q[i] >> 4) : (q[i] & 0xF)) - ml;
+}
+
 struct d4_mm_args { uint ncols; uint nrows; uint ntok; uint row_bytes; uint x_stride; uint y_stride; };
 
 // Y[t][r] = W[r] . X[t] for NTOK tokens (token t's X at t*X_STRIDE, its Y
@@ -258,6 +268,7 @@ typedef decltype(d4_mm<d4_block_q8_0, 2, d4_deq_q8_0>) d4_mm_t;
 template [[host_name("d4_mm_q8_0")]]    kernel d4_mm_t d4_mm<d4_block_q8_0, 2, d4_deq_q8_0>;
 template [[host_name("d4_mm_f16")]]     kernel d4_mm_t d4_mm<half4x4, 1, d4_deq_f16>;
 template [[host_name("d4_mm_q2_k")]]    kernel d4_mm_t d4_mm<d4_block_q2_K, 16, d4_deq_q2_K>;
+template [[host_name("d4_mm_q4_k")]]    kernel d4_mm_t d4_mm<dn_block_q4_K, 16, d4_deq_q4_K>;
 template [[host_name("d4_mm_iq2_xxs")]] kernel d4_mm_t d4_mm<d4_block_iq2_xxs, 16, d4_deq_iq2_xxs>;
 typedef decltype(d4_mm_id<d4_block_q2_K, 16, d4_deq_q2_K>) d4_mm_id_t;
 template [[host_name("d4_mm_id_q2_k")]]    kernel d4_mm_id_t d4_mm_id<d4_block_q2_K, 16, d4_deq_q2_K>;

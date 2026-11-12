@@ -7,6 +7,9 @@
 //   dn_qk_rope(...)                          a head of Q or K: RMSNorm (qwen3), RoPE; Q to halves,
 //                                            K and V to the cache (halves) at their positions
 //   dn_attend_h64, dn_attend_h128            causal attention over the cache, GQA, flash style
+//   dn_steer                                 directional steering of a layer's output rows
+//   dn_mv_q4_k, dn_row_q4_k                  Q4_K: one token's product, an embedding row
+//                                            (a prefill's products: ds4f.metal's d4_mm_q4_k)
 
 #include <metal_stdlib>
 using namespace metal;
@@ -264,4 +267,92 @@ kernel void dn_steer(constant dn_steer_args & a [[buffer(0)]], device float * y 
     for (uint i = tid; i < a.d; i += ntg) s += u[i] * row[i];
     const float k = a.scale * dn_tg_sum(s, sh, tid, ntg);
     for (uint i = tid; i < a.d; i += ntg) row[i] -= k * u[i];
+}
+
+// --- Q4_K: 256 weights a block in four chunks of 64 (the low nibbles of 32
+// bytes, then their high nibbles), eight sub-blocks of 32 each with a 6-bit
+// scale and min packed in 12 bytes: w = d sc q - dmin m ----------------------
+
+typedef struct { half d; half dmin; uint8_t scales[12]; uint8_t qs[128]; } dn_block_q4_K;
+
+// sub-block J's (scale, min), as ggml's get_scale_min_k4
+static inline uchar2 dn_q4k_scale(int j, device const uint8_t * q) {
+    return j < 4 ? uchar2(q[j] & 63, q[j + 4] & 63)
+                 : uchar2((q[j + 4] & 0xF) | ((q[j - 4] >> 6) << 4), (q[j + 4] >> 4) | ((q[j] >> 6) << 4));
+}
+
+struct dn_mv_args { uint ncols; uint nrows; };
+
+// Y = W X for one token, W's Q4_K rows, in ggml's layout (its
+// kernel_mul_mv_q4_K_f32): a simdgroup two rows, eight lanes a block, four
+// blocks a step.  Lane (IQ, IR) of a block takes 8 bytes of chunk IQ and 8
+// of chunk IQ+2 at 8 IR, both nibbles of each: 32 weights of sub-blocks 2IQ,
+// 2IQ+1, 2IQ+4, 2IQ+5, whose scales and mins come out of three 16-bit words
+// by masks.  X's 32 floats a lane are shared by the two rows.
+// grid ceil(rows/4), threads 64.
+#define DN_NR 2
+kernel void dn_mv_q4_k(constant dn_mv_args & a [[buffer(0)]], device const char * w [[buffer(1)]],
+                       device const float * x [[buffer(2)]], device float * y [[buffer(3)]],
+                       uint tg [[threadgroup_position_in_grid]], ushort sg [[simdgroup_index_in_threadgroup]],
+                       ushort lane [[thread_index_in_simdgroup]]) {
+    const uint r0 = (tg * 2 + sg) * DN_NR;
+    if (r0 >= a.nrows) return;
+    const uint nb = a.ncols / 256;
+    const ulong row_bytes = (ulong)nb * sizeof(dn_block_q4_K);
+    const ushort ix = lane / 8, it = lane % 8, iq = it / 4, ir = it % 4;
+    float s[DN_NR];
+    for (short rr = 0; rr < DN_NR; ++rr) s[rr] = 0.f;
+    float yl[16], yh[16];
+    for (uint b = ix; b < nb; b += 4) {
+        device const float * y4 = x + b * 256 + 64 * iq + 8 * ir;
+        float4 sumy = 0.f;
+        for (short i = 0; i < 8; ++i) {
+            yl[i] = y4[i];        sumy[0] += yl[i];
+            yl[i + 8] = y4[i + 32];  sumy[1] += yl[i + 8];
+            yh[i] = y4[i + 128];  sumy[2] += yh[i];
+            yh[i + 8] = y4[i + 160]; sumy[3] += yh[i + 8];
+        }
+        for (short rr = 0; rr < DN_NR; ++rr) {
+            if (r0 + rr >= a.nrows) break;
+            device const dn_block_q4_K * blk = (device const dn_block_q4_K *)(w + (r0 + rr) * row_bytes) + b;
+            device const ushort * sc = (device const ushort *)blk->scales + iq;
+            const ushort A = sc[0], B = sc[2], C = sc[4];
+            ushort s16[4];
+            s16[0] = A & 0x3f3f;                                     // scales of sub-blocks 2IQ, 2IQ+1
+            s16[1] = B & 0x3f3f;                                     // their mins
+            s16[2] = (C & 0x0f0f) | ((A & 0xc0c0) >> 2);             // scales of 2IQ+4, 2IQ+5
+            s16[3] = ((C >> 4) & 0x0f0f) | ((B & 0xc0c0) >> 2);      // their mins
+            thread const uchar * s8 = (thread const uchar *)s16;
+            const uint2 q1 = *(device const uint2 *)(blk->qs + 32 * iq + 8 * ir);
+            const uint2 q2 = *(device const uint2 *)(blk->qs + 32 * iq + 64 + 8 * ir);
+            const float4 l1a = float4(as_type<uchar4>(q1.x & 0x0F0F0F0Fu)), l1b = float4(as_type<uchar4>(q1.y & 0x0F0F0F0Fu));
+            const float4 h1a = float4(as_type<uchar4>((q1.x >> 4) & 0x0F0F0F0Fu)), h1b = float4(as_type<uchar4>((q1.y >> 4) & 0x0F0F0F0Fu));
+            const float4 l2a = float4(as_type<uchar4>(q2.x & 0x0F0F0F0Fu)), l2b = float4(as_type<uchar4>(q2.y & 0x0F0F0F0Fu));
+            const float4 h2a = float4(as_type<uchar4>((q2.x >> 4) & 0x0F0F0F0Fu)), h2b = float4(as_type<uchar4>((q2.y >> 4) & 0x0F0F0F0Fu));
+            const float lo1 = dot(l1a, float4(yl[0], yl[1], yl[2], yl[3])) + dot(l1b, float4(yl[4], yl[5], yl[6], yl[7]));
+            const float hi1 = dot(h1a, float4(yl[8], yl[9], yl[10], yl[11])) + dot(h1b, float4(yl[12], yl[13], yl[14], yl[15]));
+            const float lo2 = dot(l2a, float4(yh[0], yh[1], yh[2], yh[3])) + dot(l2b, float4(yh[4], yh[5], yh[6], yh[7]));
+            const float hi2 = dot(h2a, float4(yh[8], yh[9], yh[10], yh[11])) + dot(h2b, float4(yh[12], yh[13], yh[14], yh[15]));
+            const half2 dd = *(device const half2 *)blk;
+            s[rr] += (float)dd[0] * (s8[0] * lo1 + s8[1] * hi1 + s8[4] * lo2 + s8[5] * hi2)
+                   - (float)dd[1] * (s8[2] * sumy[0] + s8[3] * sumy[1] + s8[6] * sumy[2] + s8[7] * sumy[3]);
+        }
+    }
+    for (short rr = 0; rr < DN_NR; ++rr) {
+        const float t = simd_sum(s[rr]);
+        if (lane == 0 && r0 + rr < a.nrows) y[r0 + rr] = t;
+    }
+}
+
+struct dn_rowk_args { uint cols; uint row_bytes; uint token; };
+
+// OUT = row TOKEN of a Q4_K matrix, as floats (an embedding): a thread a weight
+kernel void dn_row_q4_k(constant dn_rowk_args & a [[buffer(0)]], device const char * w [[buffer(1)]],
+                        device float * out [[buffer(2)]], uint j [[thread_position_in_grid]]) {
+    if (j >= a.cols) return;
+    device const dn_block_q4_K * blk = (device const dn_block_q4_K *)(w + (ulong)a.token * a.row_bytes) + j / 256;
+    const uint k = j % 256, c = k / 64, pos = k % 64;
+    const uint8_t q = blk->qs[c * 32 + (pos % 32)];
+    const uchar2 sm = dn_q4k_scale(k / 32, blk->scales);
+    out[j] = (float)blk->d * sm[0] * (float)(pos >= 32 ? (q >> 4) : (q & 0xF)) - (float)blk->dmin * sm[1];
 }

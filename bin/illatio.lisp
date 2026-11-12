@@ -44,7 +44,7 @@ flags:
   -c, --ctx N         context size in tokens (default 8192)
   -t, --threads N     worker threads (default: the performance cores)
   --gpu               run the model on the GPU: on Metal a qwen35 model, or a
-                      qwen2, qwen3 or llama one in Q8_0 (DeepSeek V4 Flash
+                      qwen2, qwen3 or llama one in Q8_0, Q4_K or Q6_K (DeepSeek V4 Flash
                       always uses it on a Mac); on CUDA qwen2, qwen3 and llama
   --device N          the CUDA device to run on (implies --gpu; default 0)
   -s, --system TEXT   system prompt for --chat

@@ -1,10 +1,11 @@
 ;;;; metal-dense.lisp — the dense models (qwen2, qwen3, qwen3vl's text model,
-;;;; llama) on the GPU, their matrices Q8_0 (src/metal/dense.metal).
+;;;; llama) on the GPU, their matrices Q8_0, Q4_K or Q6_K (src/metal/dense.metal).
 ;;;
 ;;; As metal-qwen35.lisp: the GGUF mapped and wrapped as one buffer, every
-;;; matrix multiplied where it lies (d4_mm_q8_0 for a prefill's tokens, half
-;;; products summed in floats; d4_mv_q8_0 for one), a pass one command
-;;; buffer.  The KV cache is halves, read by a flash attention on the half
+;;; matrix multiplied where it lies (a prefill's tokens by the tiled products,
+;;; half products summed in floats: d4_mm_q8_0, d4_mm_q4_k, mm_q6k_64; one
+;;; token by the matrix-vector ones: d4_mv_q8_0, dn_mv_q4_k, mv_q6k), a pass
+;;; one command buffer.  The KV cache is halves, read by a flash attention on the half
 ;;; simdgroup matrices.  A caller may put rows into the stream after the
 ;;; embedding and after each layer (*GPU-AFTER-EMBED*, *GPU-AFTER-LAYER*, as
 ;;; cuda-dense.lisp's hooks: a vision model's picture), and may replace the
@@ -31,11 +32,11 @@
                      (loop for l across (model-layers m)
                            append (list (layer-wq l) (layer-wk l) (layer-wv l) (layer-wo l)
                                         (layer-wgate l) (layer-wup l) (layer-wdown l)))))
-      (unless (eq (gmat-type w) :q8_0)
-        (error "the GPU runs dense models' Q8_0 matrices so far; ~A is ~A" (gmat-name w) (gmat-type w))))
+      (unless (member (gmat-type w) '(:q8_0 :q4_k :q6_k))
+        (error "the GPU runs dense models' Q8_0, Q4_K and Q6_K matrices; ~A is ~A" (gmat-name w) (gmat-type w))))
     (let ((out (model-output m)))
-      (unless (eq (gmat-type out) :q8_0)
-        (error "the GPU runs dense models' Q8_0 matrices so far; the output is ~A" (gmat-type out))))))
+      (unless (member (gmat-type out) '(:q8_0 :q4_k :q6_k))
+        (error "the GPU runs dense models' Q8_0, Q4_K and Q6_K matrices; the output is ~A" (gmat-type out))))))
 
 ;;; --- per-context state ------------------------------------------------------------
 
@@ -116,13 +117,26 @@
 ;;; --- a pass ---------------------------------------------------------------------------
 
 (defun mat-q8 (gm e w x y n)
-  "Y = W X for N tokens (token t's X at t*cols, its Y at t*rows), W a Q8_0 GMAT."
+  "Y = W X for N tokens (token t's X at t*cols, its Y at t*rows), W a GMAT
+   in Q8_0, Q4_K or Q6_K."
   (let ((wb (cons (gmodel-file gm) (gmat-offset w))) (gpu (gmodel-gpu gm))
         (rows (gmat-rows w)) (cols (gmat-cols w)) (rbytes (gmat-row-bytes w)))
-    (if (= n 1)
-        (dispatch gpu e "d4_mv_q8_0" (list cols rows rbytes rows 0) (list wb x y) (ceiling rows 8) 64)
-        (dispatch gpu e "d4_mm_q8_0" (list cols rows n rbytes cols rows) (list wb x y)
-                  (list (ceiling n 64) (ceiling rows 64) 1) 128 :shared 16384))))
+    (ecase (gmat-type w)
+      (:q8_0
+       (if (= n 1)
+           (dispatch gpu e "d4_mv_q8_0" (list cols rows rbytes rows 0) (list wb x y) (ceiling rows 8) 64)
+           (dispatch gpu e "d4_mm_q8_0" (list cols rows n rbytes cols rows) (list wb x y)
+                     (list (ceiling n 64) (ceiling rows 64) 1) 128 :shared 16384)))
+      (:q4_k
+       (if (= n 1)
+           (dispatch gpu e "dn_mv_q4_k" (list cols rows) (list wb x y) (ceiling rows 4) 64)
+           (dispatch gpu e "d4_mm_q4_k" (list cols rows n rbytes cols rows) (list wb x y)
+                     (list (ceiling n 64) (ceiling rows 64) 1) 128 :shared 16384)))
+      (:q6_k
+       (if (= n 1)
+           (dispatch gpu e "mv_q6k" (list cols rows rbytes 0 0) (list wb x y) (ceiling rows 4) 64)
+           (dispatch gpu e "mm_q6k_64" (list cols rows n rbytes) (list wb x y)
+                     (list (ceiling n 64) (ceiling rows 64) 1) 128 :shared 16384))))))
 
 (defun dense-forward-n (ctx tokens logits)
   "TOKENS (at most *GPU-CHUNK*) at the next positions through a dense model,
@@ -143,7 +157,8 @@
     (with-gpu-work (e gpu)
       (let ((emb (model-token-embd m)))
         (loop for tok in tokens for tk from 0
-              do (dispatch gpu e "dn_row_q8" (list (gmat-cols emb) (gmat-row-bytes emb) tok)
+              do (dispatch gpu e (ecase (gmat-type emb) (:q8_0 "dn_row_q8") (:q4_k "dn_row_q4_k") (:q6_k "row_q6k"))
+                           (list (gmat-cols emb) (gmat-row-bytes emb) tok)
                            (list (cons (gmodel-file gm) (gmat-offset emb)) (cons x (* 4 tk d)))
                            (ceiling d 256) 256)))
       (when *gpu-after-embed* (funcall *gpu-after-embed* e x pos0 n))
