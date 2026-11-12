@@ -1042,27 +1042,3 @@
 (defun delta-block-p (vd)
   "Whether Q35-DELTA! runs its heads sixteen values a call (%DELTA-BLOCK)."
   (and (neon-dot-p) (zerop (mod vd 16))))
-
-(defun delta-blocks! (S base c kq kk vv o oo vd kd decay b scale)
-  "Q35-DELTA!'s two passes for one head and token, sixteen values a call."
-  (declare (type f32vec S c o) (type fixnum base kq kk vv oo vd kd)
-           (type single-float decay b scale) (optimize speed (safety 0)))
-  (let ((desc (make-array 9 :element-type '(unsigned-byte 64))))
-    (declare (dynamic-extent desc))
-    (sb-sys:with-pinned-objects (S c o desc)
-      (let ((s0 (sb-sys:sap-int (sb-sys:vector-sap S)))
-            (c0 (sb-sys:sap-int (sb-sys:vector-sap c)))
-            (o0 (sb-sys:sap-int (sb-sys:vector-sap o)))
-            (dsap (sb-sys:vector-sap desc)))
-        (declare (type (unsigned-byte 64) s0 c0 o0))
-        (setf (aref desc 1) (+ c0 (* 4 kq))
-              (aref desc 2) (* 4 (- kk kq))
-              (aref desc 5) (* 4 vd)
-              (aref desc 6) (ldb (byte 32 0) (sb-kernel:single-float-bits decay))
-              (aref desc 7) (ldb (byte 32 0) (sb-kernel:single-float-bits b))
-              (aref desc 8) (ldb (byte 32 0) (sb-kernel:single-float-bits scale)))
-        (loop for v0 of-type fixnum from 0 below vd by 16
-              do (setf (aref desc 0) (+ s0 (* 4 (+ base v0)))
-                       (aref desc 3) (+ c0 (* 4 (+ vv v0)))
-                       (aref desc 4) (+ o0 (* 4 (+ oo v0))))
-                 (%delta-block dsap kd))))))

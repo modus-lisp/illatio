@@ -15,10 +15,11 @@
 ;;;; set less the mean over the contrast set, made a unit vector.  The
 ;;;; outputs are taken where the steering is applied (*STEER-CAPTURE*).
 ;;;;
-;;;; Where it applies: the dense models on the CPU, CUDA and Metal, DeepSeek
-;;;; V4, V4.1 and GLM-5.3 on CUDA (their attention and FFN outputs as they
-;;;; join the hyper-connection streams).  Not yet: the DeepSeek models on
-;;;; Metal or the CPU, Qwen3.5.
+;;;; Where it applies: the dense models on the CPU, CUDA and Metal; DeepSeek
+;;;; V4 on the CPU, CUDA and Metal, V4.1 and GLM-5.3 on CUDA (their attention
+;;;; and FFN outputs as they join the hyper-connection streams); Qwen3.5 on
+;;;; the CPU and Metal (its attention output either kind of layer's mixer,
+;;;; the gated delta net's or full attention's).  Not yet: Qwen3.5 on CUDA.
 
 (in-package #:illatio)
 

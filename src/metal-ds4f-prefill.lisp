@@ -214,7 +214,7 @@
           (enc-mm gpu e "d4_mm_q8_0" buf (+ woff (* g rank rbytes)) rbytes rank gdim heads low n
                   :x-stride (* nh hd) :y-stride (* groups rank) :xoff (* 4 g gdim) :yoff (* 4 g rank)))))
     (enc-q8mm m gpu e li "attn_output_b.weight" low aout n)
-    (enc-hc-post m gpu e aout sa pc sb n)))
+    (enc-hc-post m gpu e aout sa pc sb n (cons li :attn))))
 
 (defun enc-ffn-head-chunk (m gpu e st l li n sb)
   "The chunk's FFN up to its routing: HC pre, norm, router logits, shared expert."
@@ -280,7 +280,7 @@
           (mv "d4_mv_q2_k" ff drows drb (* 2 gb) 0 mid ff down rows)))
       (dispatch gpu e "d4_moe_sum_rows" (list d nu n) (list down smap (pbuf st :p-sout (* n d)) moe)
                 (ceiling (* n d) 256) 256)
-      (return-from enc-ffn-tail-chunk (enc-hc-post m gpu e moe sb (pbuf st :p-pcf (* n 32)) sa n)))
+      (return-from enc-ffn-tail-chunk (enc-hc-post m gpu e moe sb (pbuf st :p-pcf (* n 32)) sa n (cons li :ffn))))
     (dotimes (k ne)
       (let ((nt (aref counts k)) (b (aref bases k)) (s0 (* (aref slots k) sbytes)))
         (enc-mm gpu e "d4_mm_iq2_xxs" stage s0 grb grows d x g nt :xoff (* 4 b d) :yoff (* 4 b ff))
@@ -291,7 +291,7 @@
         (enc-mm gpu e "d4_mm_q2_k" stage (+ s0 (* 2 gb)) drb drows ff mid down nt :xoff (* 4 b ff) :yoff (* 4 b d))))
     (dispatch gpu e "d4_moe_sum_rows" (list d nu n) (list down smap (pbuf st :p-sout (* n d)) moe)
               (ceiling (* n d) 256) 256)
-    (enc-hc-post m gpu e moe sb (pbuf st :p-pcf (* n 32)) sa n)))
+    (enc-hc-post m gpu e moe sb (pbuf st :p-pcf (* n 32)) sa n (cons li :ffn))))
 
 (defun tid2eid-buffer (m st li l)
   "Layer LI's hash table (token -> its experts), in a GPU buffer."
@@ -335,7 +335,7 @@
       (mm-id "d4_mm_id_q2_k" ff drows drb (* 2 gb) mid down))
     (dispatch gpu e "d4_moe_sum_rows" (list d nu n) (list down smap (pbuf st :p-sout (* n d)) moe)
               (ceiling (* n d) 256) 256)
-    (enc-hc-post m gpu e moe sb (pbuf st :p-pcf (* n 32)) sa n)))
+    (enc-hc-post m gpu e moe sb (pbuf st :p-pcf (* n 32)) sa n (cons li :ffn))))
 
 (defun ds4f-gpu-prefill-1 (ctx tokens logits &key all-logits)
   "DS4F-PREFILL-1 on the GPU: the chunk TOKENS at the next positions.  With
@@ -420,6 +420,7 @@
               (enc-ffn-tail-chunk m gpu e st pl pli n ev users ws slots sb sa)))
           (done pending))))
     (incf (d4ctx-pos ctx) n)
+    (ds4f-steer-captured m)
     (cond (all-logits
            (let* ((nv (ds4f-n-vocab m)) (out (pbuf st :p-allout (* n nv))) (rows (f32vec (* n nv))))
              ;; a row at a time, by decode's own head: the same logits it would give

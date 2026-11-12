@@ -111,11 +111,28 @@
               (list mix (gpu-vector m scale) (gpu-vector m base) streams out pc)
               (ceiling d 256) 256 :shared (* 4 32))))
 
-(defun enc-hc-post (m gpu e block streams pc out &optional (ntok 1))
-  "HC post for NTOK tokens (each's BLOCK, STREAMS, PC and OUT a row)."
+(defun enc-hc-post (m gpu e block streams pc out &optional (ntok 1) steer)
+  "HC post for NTOK tokens (each's BLOCK, STREAMS, PC and OUT a row); BLOCK
+   first steered when STEER, (layer . kind), says which it is (steer.lisp):
+   its rows steered, the last captured (read after the pass, DS4F-STEER-CAPTURED)."
   (let ((d (ds4f-d m)) (n (ds4f-n-hc m)))
+    (when (and steer (steer-wants-p (car steer) (cdr steer)))
+      (let* ((li (car steer)) (kind (cdr steer)) (scale (steer-scale li kind))
+             (cap (d4gpu-buf (ds4f-gpu-state m) :steer-capture (* 4 2 (ds4f-n-layer m) d))))
+        (dispatch gpu e "dn_steer" (list d scale (1- ntok) (if *steer-capture* 1 0))
+                  (list block (if (zerop scale) block (cons (gpu-steer-dirs gpu) (* 4 li d)))
+                        (cons cap (* 4 d (+ (* 2 li) (if (eq kind :attn) 0 1)))))
+                  ntok 256)))
     (dispatch gpu e "d4_hc_post" (list d n ntok 1f-6) (list block streams pc out)
               (ceiling (* ntok n d) 256) 256)))
+
+(defun ds4f-steer-captured (m)
+  "After a pass with *STEER-CAPTURE*: each layer's captured rows given to it, in the CPU's order."
+  (when *steer-capture*
+    (let ((d (ds4f-d m)) (cap (d4gpu-buf (ds4f-gpu-state m) :steer-capture (* 4 2 (ds4f-n-layer m) (ds4f-d m)))))
+      (dotimes (li (ds4f-n-layer m))
+        (dolist (kind '(:attn :ffn))
+          (funcall *steer-capture* li kind (gbuf-floats cap d (* d (+ (* 2 li) (if (eq kind :attn) 0 1))))))))))
 
 (defun enc-compressor (m gpu e st l li c norm pos ratio wkv wgate ape normw rows-of n-of hd kind)
   "One compressor's step for the token at POS (its window in C), and on a
@@ -201,7 +218,7 @@
     (q8mv-enc m gpu e li "attn_output_a.weight" heads low :group-rows (ds4f-lora-o m)
                                                          :group-stride (* hd (floor nh (ds4f-out-groups m))))
     (q8mv-enc m gpu e li "attn_output_b.weight" low aout)
-    (enc-hc-post m gpu e aout sa pca sb)))
+    (enc-hc-post m gpu e aout sa pca sb 1 (cons li :attn))))
 
 (defun enc-ffn-head (m gpu e st l li sb)
   "Layer LI's FFN up to the routing: HC pre of SB, the norm, the router's
@@ -246,7 +263,7 @@
                 (ceiling (* k ff) 256) 256)
       (mv "d4_mv_q2_k" ff d drb (* 2 gb) bm ff bd k))
     (dispatch gpu e "d4_moe_sum" (list d k) (list bd (d4gpu-buf st :g-sout (* 4 d)) moe) (ceiling d 256) 256)
-    (enc-hc-post m gpu e moe sb (d4gpu-buf st :g-pcf (* 4 32)) sa)))
+    (enc-hc-post m gpu e moe sb (d4gpu-buf st :g-pcf (* 4 32)) sa 1 (cons li :ffn))))
 
 ;;; --- a token ---------------------------------------------------------------------------
 
@@ -286,6 +303,7 @@
       (apply #'enc-ffn-tail m gpu e st (append pending (list sb sa)))
       (when logits (enc-head m gpu e st sa)))
     (incf (d4ctx-pos ctx))
+    (ds4f-steer-captured m)
     (when logits
       (copy-floats-out (d4ctx-logits ctx) (d4gpu-buf st :g-out 0) (ds4f-n-vocab m)))
     ctx))

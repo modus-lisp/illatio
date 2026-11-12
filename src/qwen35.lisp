@@ -214,6 +214,35 @@
 #-(and sbcl arm64) (defun delta-block-p (vd) (declare (ignore vd)) nil)
 #-(and sbcl arm64) (defun delta-blocks! (&rest args) (declare (ignore args)) (error "no NEON delta kernel"))
 
+;;; The NEON one (neon-sbcl.lisp's %DELTA-BLOCK) is called here, not in that
+;;; file: a VOP is defined when its file is loaded, so a caller compiled in
+;;; the same file makes a full call, to a function that does not exist.
+#+(and sbcl arm64)
+(defun delta-blocks! (S base c kq kk vv o oo vd kd decay b scale)
+  "Q35-DELTA!'s two passes for one head and token, sixteen values a call."
+  (declare (type f32vec S c o) (type fixnum base kq kk vv oo vd kd)
+           (type single-float decay b scale) (optimize speed (safety 0)))
+  (let ((desc (make-array 9 :element-type '(unsigned-byte 64))))
+    (declare (dynamic-extent desc))
+    (sb-sys:with-pinned-objects (S c o desc)
+      (let ((s0 (sb-sys:sap-int (sb-sys:vector-sap S)))
+            (c0 (sb-sys:sap-int (sb-sys:vector-sap c)))
+            (o0 (sb-sys:sap-int (sb-sys:vector-sap o)))
+            (dsap (sb-sys:vector-sap desc)))
+        (declare (type (unsigned-byte 64) s0 c0 o0))
+        (setf (aref desc 1) (+ c0 (* 4 kq))
+              (aref desc 2) (* 4 (- kk kq))
+              (aref desc 5) (* 4 vd)
+              (aref desc 6) (ldb (byte 32 0) (sb-kernel:single-float-bits decay))
+              (aref desc 7) (ldb (byte 32 0) (sb-kernel:single-float-bits b))
+              (aref desc 8) (ldb (byte 32 0) (sb-kernel:single-float-bits scale)))
+        (loop for v0 of-type fixnum from 0 below vd by 16
+              do (setf (aref desc 0) (+ s0 (* 4 (+ base v0)))
+                       (aref desc 3) (+ c0 (* 4 (+ vv v0)))
+                       (aref desc 4) (+ o0 (* 4 (+ oo v0))))
+                 (%delta-block dsap kd))))))
+
+
 (defun q35-out-norm! (pool m l o z n)
   "O = rmsnorm(O)*ssm_norm * silu(Z), per V head of each token."
   (let ((w (layer-ssm-norm l)) (vd (model-ssm-v-dim m)) (eps (model-eps m)))
@@ -309,6 +338,7 @@
           for l = (svref (model-layers m) li)
           do (rmsnorm! x (layer-attn-norm l) h (model-eps m))
              (if (eq (layer-kind l) :linear) (q35-linear! ctx l li h) (q35-full! ctx l li h))
+             (when (steer-wants-p li :attn) (steer-rows! h li :attn 1 (model-d m)))   ; (either kind's mixer)
              (add! x h)
              (rmsnorm! x (layer-ffn-norm l) h (model-eps m))
              (quantize-act-par! pool h xq)
@@ -317,6 +347,7 @@
              (swiglu-par! pool (context-ffn-a ctx) (context-ffn-b ctx))
              (quantize-act-par! pool (context-ffn-a ctx) hq)
              (qmatvec! pool (layer-wdown l) hq h)
+             (when (steer-wants-p li :ffn) (steer-rows! h li :ffn 1 (model-d m)))
              (add! x h))
     (incf (context-pos ctx))
     (when logits
@@ -409,6 +440,7 @@
                    (q35-gate! att gate (* n qd))
                    (quantize-batch! att n ab pool)
                    (matmul! pool (layer-wo l) ab h)))
+             (when (steer-wants-p li :attn) (steer-rows! h li :attn n d))
              (add! x h (* n d))
              (dotimes (tk n) (rmsnorm! x (layer-ffn-norm l) h eps (* tk d)))
              (quantize-batch! h n xb pool)
@@ -417,6 +449,7 @@
              (swiglu-par! pool fa fb (* n f))
              (quantize-batch! fa n (q35-batch-fq b) pool)
              (matmul! pool (layer-wdown l) (q35-batch-fq b) h)
+             (when (steer-wants-p li :ffn) (steer-rows! h li :ffn n d))
              (add! x h (* n d)))
     (incf (context-pos ctx) n)
     (when logits

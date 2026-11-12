@@ -70,6 +70,7 @@
 (defstruct (gctx (:constructor %make-gctx))
   x h qkv z alpha beta c o qg q gate k v att fa fb logits rope
   part ml                               ; decode's attention, split: chunks' outputs, their maxima and sums
+  capture                               ; steering's capture: a row of D a layer and kind
   kc vc conv ssm)                       ; per layer (NIL where the kind has none)
 
 (defun gpu-zero (b)
@@ -80,6 +81,11 @@
   b)
 
 (defparameter *gpu-chunk* 512 "Tokens per GPU pass in a prefill.")
+
+(defparameter *split-chunk* 64
+  "Positions a threadgroup of decode's attention takes (ATTEND_SPLIT): the
+   keys cut so the whole GPU reads them, not a threadgroup a head.")
+
 
 (defun gpu-state (ctx)
   (or (getf (context-plist ctx) :gpu)
@@ -104,6 +110,7 @@
                             :logits (fb (model-n-vocab m)) :rope (fb (* n (model-rope-dims m)))
                             :part (fb (* (model-n-head m) (ceiling n-ctx *split-chunk*) (model-head-dim m)))
                             :ml (fb (* (model-n-head m) (ceiling n-ctx *split-chunk*) 2))
+                            :capture (fb (* 2 (model-n-layer m) d))
                             ;; 32 positions of zeros past the end: ATTEND_FA reads keys 32 at a time
                             :kc (per-layer :full (* (+ n-ctx 32) kvd)) :vc (per-layer :full (* (+ n-ctx 32) kvd))
                             :conv (per-layer :linear (* ch (1- (model-ssm-conv m))))
@@ -140,10 +147,6 @@
 (defvar *split-decode* t
   "Whether one token's attention is split over the keys (ATTEND_SPLIT and
    ATTEND_MERGE) rather than a threadgroup a head (ATTEND).")
-
-(defparameter *split-chunk* 64
-  "Positions a threadgroup of decode's attention takes (ATTEND_SPLIT): the
-   keys cut so the whole GPU reads them, not a threadgroup a head.")
 
 (defvar *mm-64* t "Whether a prefill's products take 64-token tiles (MM_Q6K_64).")
 
@@ -242,6 +245,8 @@
                      (dispatch gpu e "gate_mul" (list (* n qd)) (list (gctx-att st) (gctx-gate st))
                                (ceiling (* n qd) 256) 256)
                      (mat gm e (layer-wo l) (gctx-att st) h n)))
+               ;; either kind's mixer output is the layer's attention output, to steering
+               (when (steer-wants-p li :attn) (q35-steer gpu e st h li :attn n d))
                (dispatch gpu e "add" (list (* n d)) (list x h) (ceiling (* n d) 256) 256)
                (dispatch gpu e "rmsnorm" (list d eps 0)
                          (list x (gm-layer gm li "post_attention_norm.weight") h) n 1024)
@@ -249,14 +254,29 @@
                (mat gm e (layer-wup l) h (gctx-fb st) n)
                (dispatch gpu e "swiglu" (list (* n f)) (list (gctx-fa st) (gctx-fb st)) (ceiling (* n f) 256) 256)
                (mat gm e (layer-wdown l) (gctx-fa st) h n)
+               (when (steer-wants-p li :ffn) (q35-steer gpu e st h li :ffn n d))
                (dispatch gpu e "add" (list (* n d)) (list x h) (ceiling (* n d) 256) 256))
       (when logits
         (dispatch gpu e "rmsnorm" (list d eps 0)
                   (list (cons x (* 4 (1- n) d)) (gw gm "output_norm.weight") h) 1 1024)
         (mat gm e (model-output m) h (gctx-logits st) 1)))
     (incf (context-pos ctx) n)
+    (when *steer-capture*                 ; the last token's outputs, in the CPU's order
+      (dotimes (li (model-n-layer m))
+        (dolist (kind '(:attn :ffn))
+          (funcall *steer-capture* li kind
+                   (gbuf-floats (gctx-capture st) d (* d (+ (* 2 li) (if (eq kind :attn) 0 1))))))))
     (when logits
       (let ((out (context-logits ctx)) (sap (gbuf-sap (gctx-logits st))))
         (declare (type f32vec out))
         (dotimes (i (length out)) (setf (aref out i) (sb-sys:sap-ref-single sap (* 4 i))))))
     ctx))
+
+(defun q35-steer (gpu e st y li kind n d)
+  "Y's N rows of D steered for layer LI's KIND output (dense.metal's dn_steer),
+   the last first copied to the state's capture when capturing."
+  (let ((scale (steer-scale li kind)))
+    (dispatch gpu e "dn_steer" (list d scale (1- n) (if *steer-capture* 1 0))
+              (list y (if (zerop scale) y (cons (gpu-steer-dirs gpu) (* 4 li d)))
+                    (cons (gctx-capture st) (* 4 d (+ (* 2 li) (if (eq kind :attn) 0 1)))))
+              n 256)))

@@ -93,7 +93,7 @@
       (remf (context-plist ctx) :gpu-dense)))
   (let ((st (getf (context-plist ctx) :gpu)))
     (when st
-      (dolist (slot '(x h qkv z alpha beta c o qg q gate k v att fa fb logits rope part ml))
+      (dolist (slot '(x h qkv z alpha beta c o qg q gate k v att fa fb logits rope part ml capture))
         (let ((b (slot-value st slot))) (when b (gpu-free b))))
       (dolist (slot '(kc vc conv ssm))
         (loop for b across (slot-value st slot) when b do (gpu-free b)))
