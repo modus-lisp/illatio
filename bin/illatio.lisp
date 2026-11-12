@@ -347,7 +347,7 @@ flags:
          (state (sb-ext:seed-random-state 42))
          (vocab (illatio::model-n-vocab m))
          ;; on the GPU with --gpu, or a DeepSeek model, which uses it whenever it can
-         (gpu (or (getf opts :gpu) (and (illatio::ds4f-p m) (illatio::ds4f-gpu-p :decode)))))
+         (gpu (or (getf opts :gpu) (and (illatio::ds4f-p (illatio::model-impl m)) (illatio::ds4f-gpu-p :decode)))))
     (labels ((toks (k) (loop repeat k collect (random (min vocab 150000) state)))
              (secs (t0) (/ (- (get-internal-real-time) t0) internal-time-units-per-second))
              (one (kind k d)

@@ -41,10 +41,14 @@ On a 48 GB M4 Pro (Metal):
 
 | | illatio | ds4 (its own SSD streaming) |
 |---|---|---|
-| prefill, a 6,352-token prompt | **105 tok/s** (61 s) | 104 tok/s (61 s) |
-| decode, warm | **9.8 tok/s** | 4.2 tok/s |
-| decode at 6K tokens of context | 7.1 tok/s | |
+| prefill, a 3,341-token prompt | **88.6 tok/s** | 80.2 tok/s |
+| decode, 600 tokens of raw text after a short prompt | 7.3 tok/s | **8.4 tok/s** |
 | the same system prompt again, a new question | only the question is prefilled | the same (its disk KV cache) |
+
+(November 12, 2026, against ds4 as it was then, both from a cold start:
+`ds4 --ssd-streaming --nothink`.  Against the ds4 of October, illatio
+prefilled a 6,352-token prompt at 105 tok/s to its 104 and decoded at 9.8
+tok/s warm to its 4.2; ds4 has doubled its decode since.)
 
 It chats, reasons and calls tools through the CLI and the OpenAI endpoint,
 with ds4's tokenizer and chat format (DSML tool calls, thinking).  Get the
