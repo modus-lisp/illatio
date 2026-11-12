@@ -344,7 +344,9 @@ flags:
          (ps (getf opts :bench-p '(512))) (ns (getf opts :bench-n '(128)))
          (ds (getf opts :bench-d '(0))) (reps (getf opts :bench-r 3))
          (state (sb-ext:seed-random-state 42))
-         (vocab (illatio::model-n-vocab m)))
+         (vocab (illatio::model-n-vocab m))
+         ;; on the GPU with --gpu, or a DeepSeek model, which uses it whenever it can
+         (gpu (or (getf opts :gpu) (and (illatio::ds4f-p m) (illatio::ds4f-gpu-p :decode)))))
     (labels ((toks (k) (loop repeat k collect (random (min vocab 150000) state)))
              (secs (t0) (/ (- (get-internal-real-time) t0) internal-time-units-per-second))
              (one (kind k d)
@@ -373,8 +375,8 @@ flags:
               (format t "| ~A | ~,2F GiB | ~A | ~A | ~(~A~)~D~@[ @ d~D~] | ~,2F ± ~,2F |~%"
                       (illatio::model-name m)
                       (/ (with-open-file (s path :element-type '(unsigned-byte 8)) (file-length s)) (expt 2d0 30))
-                      (if (getf opts :gpu) #+darwin "Metal" #-darwin "CUDA" "CPU")
-                      (if (getf opts :gpu) "-" (illatio::pool-size (illatio::model-pool m)))
+                      (if gpu #+darwin "Metal" #-darwin "CUDA" "CPU")
+                      (if gpu "-" (illatio::pool-size (illatio::model-pool m)))
                       kind k (and (plusp d) d) mean sd)
               (force-output))))))))
 
