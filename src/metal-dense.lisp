@@ -28,15 +28,18 @@
   "Signal an error unless dense model M's shapes and formats are what the kernels take."
   (let ((hd (model-head-dim m)))
     (assert (member hd '(64 128)) () "the GPU's attention takes heads of 64 or 128, not ~D" hd)
+    (unless (member (gmat-type (model-token-embd m)) '(:q8_0 :q4_0 :q4_k :q6_k))
+      (error "the GPU looks up a dense model's embeddings in Q8_0, Q4_0, Q4_K or Q6_K; they are ~A"
+             (gmat-type (model-token-embd m))))
     (dolist (w (cons (model-token-embd m)
                      (loop for l across (model-layers m)
                            append (list (layer-wq l) (layer-wk l) (layer-wv l) (layer-wo l)
                                         (layer-wgate l) (layer-wup l) (layer-wdown l)))))
-      (unless (member (gmat-type w) '(:q8_0 :q4_k :q5_k :q6_k))
-        (error "the GPU runs dense models' Q8_0, Q4_K, Q5_K and Q6_K matrices; ~A is ~A" (gmat-name w) (gmat-type w))))
+      (unless (member (gmat-type w) '(:q8_0 :q4_0 :q4_1 :q4_k :q5_k :q6_k))
+        (error "the GPU runs dense models' Q8_0, Q4_0, Q4_1, Q4_K, Q5_K and Q6_K matrices; ~A is ~A" (gmat-name w) (gmat-type w))))
     (let ((out (model-output m)))
-      (unless (member (gmat-type out) '(:q8_0 :q4_k :q5_k :q6_k))
-        (error "the GPU runs dense models' Q8_0, Q4_K, Q5_K and Q6_K matrices; the output is ~A" (gmat-type out))))))
+      (unless (member (gmat-type out) '(:q8_0 :q4_0 :q4_1 :q4_k :q5_k :q6_k))
+        (error "the GPU runs dense models' Q8_0, Q4_0, Q4_1, Q4_K, Q5_K and Q6_K matrices; the output is ~A" (gmat-type out))))))
 
 ;;; --- per-context state ------------------------------------------------------------
 
@@ -122,7 +125,7 @@
 
 (defun mat-q8 (gm e w x y n)
   "Y = W X for N tokens (token t's X at t*cols, its Y at t*rows), W a GMAT
-   in Q8_0, Q4_K, Q5_K or Q6_K (or F32, a token at a time)."
+   in Q8_0, Q4_0, Q4_1, Q4_K, Q5_K or Q6_K (or F32, a token at a time)."
   (let ((wb (cons (gmodel-file gm) (gmat-offset w))) (gpu (gmodel-gpu gm))
         (rows (gmat-rows w)) (cols (gmat-cols w)) (rbytes (gmat-row-bytes w)))
     (ecase (gmat-type w)
@@ -135,6 +138,16 @@
        (if (= n 1)
            (dispatch gpu e "dn_mv_q4_k" (list cols rows) (list wb x y) (ceiling rows 4) 64)
            (dispatch gpu e "d4_mm_q4_k" (list cols rows n rbytes cols rows) (list wb x y)
+                     (list (ceiling n 64) (ceiling rows 64) 1) 128 :shared 16384)))
+      (:q4_0
+       (if (= n 1)
+           (dispatch gpu e "dn_mv_q4_0" (list cols rows) (list wb x y) (ceiling rows 4) 64)
+           (dispatch gpu e "d4_mm_q4_0" (list cols rows n rbytes cols rows) (list wb x y)
+                     (list (ceiling n 64) (ceiling rows 64) 1) 128 :shared 16384)))
+      (:q4_1
+       (if (= n 1)
+           (dispatch gpu e "dn_mv_q4_1" (list cols rows) (list wb x y) (ceiling rows 4) 64)
+           (dispatch gpu e "d4_mm_q4_1" (list cols rows n rbytes cols rows) (list wb x y)
                      (list (ceiling n 64) (ceiling rows 64) 1) 128 :shared 16384)))
       ;; small matrices only: a token at a time
       (:f32
@@ -171,7 +184,7 @@
     (with-gpu-work (e gpu)
       (let ((emb (model-token-embd m)))
         (loop for tok in tokens for tk from 0
-              do (dispatch gpu e (ecase (gmat-type emb) (:q8_0 "dn_row_q8") (:q4_k "dn_row_q4_k") (:q6_k "row_q6k"))
+              do (dispatch gpu e (ecase (gmat-type emb) (:q8_0 "dn_row_q8") (:q4_0 "dn_row_q4_0") (:q4_k "dn_row_q4_k") (:q6_k "row_q6k"))
                            (list (gmat-cols emb) (gmat-row-bytes emb) tok)
                            (list (cons (gmodel-file gm) (gmat-offset emb)) (cons x (* 4 tk d)))
                            (ceiling d 256) 256)))

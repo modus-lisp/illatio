@@ -169,7 +169,7 @@
 ;;; --- loading ----------------------------------------------------------------
 
 (defun load-f32 (g name)
-  "Tensor NAME as a flat single-float vector (F32, F16, BF16 or Q8_0 on disk)."
+  "Tensor NAME as a flat single-float vector (F32, F16, BF16, Q8_0 or Q4_0 on disk)."
   (let* ((ti (gguf-tensor g name))
          (n (tensor-elements ti))
          (v (f32vec n)))
@@ -194,7 +194,7 @@
                            for k from (floor start 2)
                            do (setf (aref v k)
                                     (bits-single (ash (logior (aref buf i) (ash (aref buf (+ i 1)) 8)) 16)))))))
-      (:q8_0 (let ((m (load-q8mat g name)))
+      ((:q8_0 :q4_0) (let ((m (load-q8mat g name)))
                (dotimes (i n)
                  (setf (aref v i) (* (aref (q8mat-scales m) (floor i 32))
                                      (i8-ref (q8mat-quants m) i)))))))
@@ -208,8 +208,30 @@
          (n (* rows cols))
          (q (make-i8vec n :static t))
          (d (f32vec (floor n 32) :static t)))
-    (unless (eq (tensor-info-type ti) :q8_0)
-      (error "~A is ~A; only Q8_0 matrices are supported so far" name (tensor-info-type ti)))
+    (unless (member (tensor-info-type ti) '(:q8_0 :q4_0))
+      (error "~A is ~A; only Q8_0 and Q4_0 matrices are supported so far" name (tensor-info-type ti)))
+    (when (eq (tensor-info-type ti) :q4_0)
+      ;; 18-byte blocks: fp16 scale, then 16 bytes, weight j (< 16) the low
+      ;; nibble of byte j and weight j+16 its high nibble, each less 8.  Held
+      ;; as Q8_0 (the same scale, the codes as int8): the integer sums and
+      ;; their scaling are then ggml's vec_dot_q4_0_q8_0 exactly, through the
+      ;; Q8_0 kernels -- at Q8_0's size in memory
+      (call-with-tensor-bytes
+       g ti
+       (lambda (buf start end)
+         (declare (type (simple-array (unsigned-byte 8) (*)) buf) (type fixnum start end)
+                  (optimize speed (safety 0)))
+         (loop for off of-type fixnum from 0 below end by 18
+               for b of-type fixnum from (floor start 18)
+               do (setf (aref d b) (half-to-single (logior (aref buf off) (ash (aref buf (1+ off)) 8))))
+                  (loop for j of-type fixnum from 0 below 16
+                        for x of-type (unsigned-byte 8) = (aref buf (+ off 2 j))
+                        do (setf (aref q (+ (* b 32) j)) (i8-byte (- (logand x 15) 8))
+                                 (aref q (+ (* b 32) j 16)) (i8-byte (- (ash x -4) 8))))))
+       :chunk (* 18 32768))
+      (return-from load-q8mat
+        (%make-q8mat :rows rows :cols cols :quants q :scales d
+                     :scales4 (if (zerop (mod rows 4)) (regroup-scales d rows (floor cols 32)) (f32vec 0)))))
     ;; 34-byte blocks: fp16 scale, then 32 int8.  The chunk size is a whole
     ;; number of blocks so no block straddles two reads.
     (call-with-tensor-bytes

@@ -1,5 +1,5 @@
 ;;;; metal-kquant-test.lisp — the GPU's matrix products for a 4-bit GGUF's
-;;;; mixed formats (Q4_K, Q5_K, Q8_0, and F32 for qwen35's small matrices)
+;;;; mixed formats (Q4_K, Q5_K, Q8_0, Q4_0, Q4_1, and F32 for qwen35's small matrices)
 ;;;; against a CPU dequantization written from ggml's dequantize_row_*.
 ;;;
 ;;;   sbcl --non-interactive --load inspect/metal-kquant-test.lisp
@@ -7,7 +7,8 @@
 ;;; Real tensors from the files' first layers, random X; one token (the
 ;;; matrix-vector kernels, X in floats: ~1e-7) and 5 and 70 (the tiled
 ;;; products, X and the weights in halves: ~3e-4).  Models: unsloth's
-;;; Qwen3.5-4B Q4_K_M (Q5_K) and bartowski's Agents-A1-4B Q4_K_M (F32) in
+;;; Qwen3.5-4B Q4_K_M (Q5_K) and bartowski's Agents-A1-4B Q4_K_M (F32) and
+;;; Q4_0 (Q4_0 and Q4_1) in
 ;;; ~/models, or the paths in $ILLATIO_TEST_KQUANT (colon separated).
 
 (load (merge-pathnames "load.lisp" (or *load-truename* *default-pathname-defaults*)))
@@ -48,6 +49,16 @@
                                                            (ash (aref bytes (+ 2 (* 4 i))) 16) (ash (aref bytes (+ 3 (* 4 i))) 24))))
                                             (if (logbitp 31 u) (- u (ash 1 32)) u)))
                                          'double-float))))
+      ((:q4_0 :q4_1)
+       (let ((bs (if (eq type :q4_0) 18 20)) (qo (if (eq type :q4_0) 2 4)))
+         (dotimes (b (/ ncols 32))
+           (let* ((o (* b bs)) (d (f16->f (aref bytes o) (aref bytes (1+ o))))
+                  (mn (if (eq type :q4_1) (f16->f (aref bytes (+ o 2)) (aref bytes (+ o 3))) 0d0)))
+             (dotimes (j 16)
+               (let ((q (aref bytes (+ o qo j))))
+                 (flet ((w (c) (if (eq type :q4_0) (* d (- c 8)) (+ (* d c) mn))))
+                   (setf (aref out (+ (* b 32) j)) (w (logand q 15))
+                         (aref out (+ (* b 32) j 16)) (w (ash q -4))))))))))
       (:q8_0
        (dotimes (b (/ ncols 32))
          (let* ((o (* b 34)) (d (f16->f (aref bytes o) (aref bytes (1+ o)))))
@@ -67,10 +78,10 @@
        (ok t))
   (with-open-file (f path :element-type '(unsigned-byte 8))
     (dolist (w (let ((seen '()))
-                 (loop for l across (subseq (model-layers m) 0 4)
+                 (loop for l across (model-layers m)
                        do (dolist (w (list (layer-wqkv l) (layer-ssm-out l) (layer-wz l) (layer-walpha l) (layer-wbeta l)
                                            (layer-wq l) (layer-wgate l) (layer-wdown l)))
-                            (when (and w (member (gmat-type w) '(:f32 :q8_0 :q4_k :q5_k))
+                            (when (and w (member (gmat-type w) '(:f32 :q8_0 :q4_0 :q4_1 :q4_k :q5_k))
                                        (not (find (gmat-type w) seen :key #'gmat-type)))
                               (push w seen))))
                  (reverse seen)))
@@ -99,15 +110,39 @@
                     (gmat-name w) (gmat-type w) rows cols n rel))))))
   ok))
 
+(defun check-cpu-q4_0 (path)
+  "The CPU holds Q4_0 as Q8_0: its int8 codes times their block scale must be
+   ggml's dequantized weights exactly (the products are then
+   vec_dot_q4_0_q8_0's)."
+  (let* ((g (read-gguf path))
+         (ti (find :q4_0 (loop for v being the hash-values of (gguf-tensors g) collect v) :key #'tensor-info-type)))
+    (if (null ti)
+        t
+        (let* ((m (load-q8mat g (tensor-info-name ti)))
+               (cols (q8mat-cols m)) (rows (q8mat-rows m)) (bad 0)
+               (bytes (make-array (* 18 (floor cols 32)) :element-type '(unsigned-byte 8))))
+          (with-open-file (f path :element-type '(unsigned-byte 8))
+            (loop for r from 0 below rows by (max 1 (floor rows 64))
+                  do (file-position f (+ (gguf-data-offset g) (tensor-info-offset ti) (* r (length bytes))))
+                     (read-sequence bytes f)
+                     (let ((ref (deq-row :q4_0 bytes cols)))
+                       (dotimes (c cols)
+                         (unless (= (aref ref c) (* (coerce (aref (q8mat-scales m) (+ (* r (floor cols 32)) (floor c 32))) 'double-float)
+                                                    (i8-ref (q8mat-quants m) (+ (* r cols) c))))
+                           (incf bad))))))
+          (format t "~&CPU ~A Q4_0 held as Q8_0: ~:[~D weights differ~;exact~*~]~%" (tensor-info-name ti) (zerop bad) bad)
+          (zerop bad)))))
+
 (let* ((paths (let ((e (uiop:getenv "ILLATIO_TEST_KQUANT")))
                 (if e (uiop:split-string e :separator ":")
                     (mapcar (lambda (f) (namestring (merge-pathnames f (user-homedir-pathname))))
-                            '("models/qwen3.5-4b-q4_k_m.gguf" "models/agents-a1-4b-q4_k_m.gguf")))))
+                            '("models/qwen3.5-4b-q4_k_m.gguf" "models/agents-a1-4b-q4_k_m.gguf" "models/agents-a1-4b-q4_0.gguf")))))
        (ok t) (found nil))
   (dolist (p paths)
     (if (probe-file p)
         (progn (format t "~&~A~%" (file-namestring p)) (setf found t)
-               (unless (check-model p) (setf ok nil)))
+               (unless (check-model p) (setf ok nil))
+               (unless (check-cpu-q4_0 p) (setf ok nil)))
         (format t "~&skip: no model at ~A~%" p)))
   (unless found (uiop:quit 2))
   (format t "~&~:[FAIL~;ok~]~%" ok)

@@ -54,10 +54,10 @@
                  do (dolist (w (list (layer-wqkv l) (layer-wz l) (layer-walpha l) (layer-wbeta l) (layer-ssm-out l)
                                      (layer-wq l) (layer-wk l) (layer-wv l) (layer-wo l)
                                      (layer-wgate l) (layer-wup l) (layer-wdown l)))
-                      (when (and w (not (member (gmat-type w) '(:q8_0 :q4_k :q5_k :q6_k))))
+                      (when (and w (not (member (gmat-type w) '(:q8_0 :q4_0 :q4_1 :q4_k :q5_k :q6_k))))
                         ;; F32 only where the matrix is small: ALPHA and BETA
                         (unless (and (eq (gmat-type w) :f32) (<= (gmat-rows w) 256))
-                          (error "the GPU runs a qwen35 model's Q8_0, Q4_K, Q5_K and Q6_K matrices; ~A is ~A"
+                          (error "the GPU runs a qwen35 model's Q8_0, Q4_0, Q4_1, Q4_K, Q5_K and Q6_K matrices; ~A is ~A"
                                  (gmat-name w) (gmat-type w)))))))
           ((member (model-arch m) +dense-archs+ :test #'equal) (dense-gpu-check m))
           (t (error "the GPU path runs qwen35 and dense models (~{~A~^, ~}); this is ~A"

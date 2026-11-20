@@ -148,6 +148,21 @@ void d4_deq_q4_K(device const dn_block_q4_K * xb, short il, thread half4x4 & reg
     for (int i = 0; i < 16; ++i) reg[i/4][i%4] = dl * (high ? (q[i] >> 4) : (q[i] & 0xF)) - ml;
 }
 
+// Q4_0's weights IL*16 .. IL*16+15 of a block (dense.metal's dn_block_q4_0):
+// the low nibbles for IL 0, the high for IL 1
+void d4_deq_q4_0(device const dn_block_q4_0 * xb, short il, thread half4x4 & reg) {
+    const float d = xb->d;
+    for (int i = 0; i < 16; ++i)
+        reg[i/4][i%4] = d * ((float)(il ? (xb->qs[i] >> 4) : (xb->qs[i] & 0xF)) - 8.f);
+}
+
+// Q4_1's: Q4_0's with a minimum, d * q + m
+void d4_deq_q4_1(device const dn_block_q4_1 * xb, short il, thread half4x4 & reg) {
+    const float d = xb->d, m = xb->m;
+    for (int i = 0; i < 16; ++i)
+        reg[i/4][i%4] = d * (float)(il ? (xb->qs[i] >> 4) : (xb->qs[i] & 0xF)) + m;
+}
+
 // Q5_K's weights IL*16 .. IL*16+15 of a block (dense.metal's dn_block_q5_K):
 // Q4_K's, plus 16 for each whose bit is set in QH (bit 2c for chunk c's low
 // nibbles, 2c+1 for its high ones)
@@ -284,6 +299,8 @@ template [[host_name("d4_mm_q8_0")]]    kernel d4_mm_t d4_mm<d4_block_q8_0, 2, d
 template [[host_name("d4_mm_f16")]]     kernel d4_mm_t d4_mm<half4x4, 1, d4_deq_f16>;
 template [[host_name("d4_mm_q2_k")]]    kernel d4_mm_t d4_mm<d4_block_q2_K, 16, d4_deq_q2_K>;
 template [[host_name("d4_mm_q4_k")]]    kernel d4_mm_t d4_mm<dn_block_q4_K, 16, d4_deq_q4_K>;
+template [[host_name("d4_mm_q4_0")]]    kernel d4_mm_t d4_mm<dn_block_q4_0, 2, d4_deq_q4_0>;
+template [[host_name("d4_mm_q4_1")]]    kernel d4_mm_t d4_mm<dn_block_q4_1, 2, d4_deq_q4_1>;
 template [[host_name("d4_mm_q5_k")]]    kernel d4_mm_t d4_mm<dn_block_q5_K, 16, d4_deq_q5_K>;
 template [[host_name("d4_mm_iq2_xxs")]] kernel d4_mm_t d4_mm<d4_block_iq2_xxs, 16, d4_deq_iq2_xxs>;
 typedef decltype(d4_mm_id<d4_block_q2_K, 16, d4_deq_q2_K>) d4_mm_id_t;

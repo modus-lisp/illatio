@@ -403,6 +403,98 @@ kernel void dn_mv_q5_k(constant dn_mv_args & a [[buffer(0)]], device const char 
     }
 }
 
+// --- Q4_0 --------------------------------------------------------------------------
+//
+// 32 weights a block: a half scale, then 16 bytes, weight j < 16 the low
+// nibble of byte j and weight j+16 its high nibble, each less 8.
+
+typedef struct { half d; uint8_t qs[16]; } dn_block_q4_0;
+
+// Y = W X for one token, W's Q4_0 rows: a simdgroup two rows, lane L blocks
+// L, L+32, ...; a block's 32 floats of X shared by the two rows.
+// grid ceil(rows/4), threads 64.
+kernel void dn_mv_q4_0(constant dn_mv_args & a [[buffer(0)]], device const char * w [[buffer(1)]],
+                       device const float * x [[buffer(2)]], device float * y [[buffer(3)]],
+                       uint tg [[threadgroup_position_in_grid]], ushort sg [[simdgroup_index_in_threadgroup]],
+                       ushort lane [[thread_index_in_simdgroup]]) {
+    const uint r0 = (tg * 2 + sg) * DN_NR;
+    if (r0 >= a.nrows) return;
+    const uint nb = a.ncols / 32;
+    const ulong row_bytes = (ulong)nb * sizeof(dn_block_q4_0);
+    float s[DN_NR];
+    for (short rr = 0; rr < DN_NR; ++rr) s[rr] = 0.f;
+    for (uint b = lane; b < nb; b += 32) {
+        device const float4 * xv = (device const float4 *)(x + b * 32);
+        float4 xl[4], xh[4];
+        for (short i = 0; i < 4; ++i) { xl[i] = xv[i]; xh[i] = xv[i + 4]; }
+        for (short rr = 0; rr < DN_NR; ++rr) {
+            if (r0 + rr >= a.nrows) break;
+            device const dn_block_q4_0 * blk = (device const dn_block_q4_0 *)(w + (r0 + rr) * row_bytes) + b;
+            float acc = 0.f;
+            for (short i = 0; i < 4; ++i) {
+                const uchar4 q = uchar4(blk->qs[4*i], blk->qs[4*i+1], blk->qs[4*i+2], blk->qs[4*i+3]);
+                acc += dot(float4(q & 0xF) - 8.f, xl[i]) + dot(float4(q >> 4) - 8.f, xh[i]);
+            }
+            s[rr] += (float)blk->d * acc;
+        }
+    }
+    for (short rr = 0; rr < DN_NR; ++rr) {
+        const float t = simd_sum(s[rr]);
+        if (lane == 0 && r0 + rr < a.nrows) y[r0 + rr] = t;
+    }
+}
+
+// Q4_1: Q4_0's layout with a minimum: weight = d * q + m (Q4_0 GGUFs mix a
+// few in).  As dn_mv_q4_0.  grid ceil(rows/4), threads 64.
+typedef struct { half d; half m; uint8_t qs[16]; } dn_block_q4_1;
+
+kernel void dn_mv_q4_1(constant dn_mv_args & a [[buffer(0)]], device const char * w [[buffer(1)]],
+                       device const float * x [[buffer(2)]], device float * y [[buffer(3)]],
+                       uint tg [[threadgroup_position_in_grid]], ushort sg [[simdgroup_index_in_threadgroup]],
+                       ushort lane [[thread_index_in_simdgroup]]) {
+    const uint r0 = (tg * 2 + sg) * DN_NR;
+    if (r0 >= a.nrows) return;
+    const uint nb = a.ncols / 32;
+    const ulong row_bytes = (ulong)nb * sizeof(dn_block_q4_1);
+    float s[DN_NR];
+    for (short rr = 0; rr < DN_NR; ++rr) s[rr] = 0.f;
+    for (uint b = lane; b < nb; b += 32) {
+        device const float4 * xv = (device const float4 *)(x + b * 32);
+        float4 xl[4], xh[4];
+        float xs = 0.f;
+        for (short i = 0; i < 4; ++i) {
+            xl[i] = xv[i]; xh[i] = xv[i + 4];
+            xs += xl[i][0] + xl[i][1] + xl[i][2] + xl[i][3] + xh[i][0] + xh[i][1] + xh[i][2] + xh[i][3];
+        }
+        for (short rr = 0; rr < DN_NR; ++rr) {
+            if (r0 + rr >= a.nrows) break;
+            device const dn_block_q4_1 * blk = (device const dn_block_q4_1 *)(w + (r0 + rr) * row_bytes) + b;
+            float acc = 0.f;
+            for (short i = 0; i < 4; ++i) {
+                const uchar4 q = uchar4(blk->qs[4*i], blk->qs[4*i+1], blk->qs[4*i+2], blk->qs[4*i+3]);
+                acc += dot(float4(q & 0xF), xl[i]) + dot(float4(q >> 4), xh[i]);
+            }
+            s[rr] += (float)blk->d * acc + (float)blk->m * xs;
+        }
+    }
+    for (short rr = 0; rr < DN_NR; ++rr) {
+        const float t = simd_sum(s[rr]);
+        if (lane == 0 && r0 + rr < a.nrows) y[r0 + rr] = t;
+    }
+}
+
+struct dn_row40_args { uint cols; uint row_bytes; uint token; };
+
+// OUT = row TOKEN of a Q4_0 matrix, as floats (an embedding): a thread a weight
+kernel void dn_row_q4_0(constant dn_row40_args & a [[buffer(0)]], device const char * w [[buffer(1)]],
+                        device float * out [[buffer(2)]], uint j [[thread_position_in_grid]]) {
+    if (j >= a.cols) return;
+    device const dn_block_q4_0 * blk = (device const dn_block_q4_0 *)(w + (ulong)a.token * a.row_bytes) + j / 32;
+    const uint k = j % 32;
+    const uint8_t q = blk->qs[k % 16];
+    out[j] = (float)blk->d * ((float)(k < 16 ? (q & 0xF) : (q >> 4)) - 8.f);
+}
+
 // --- F32 ---------------------------------------------------------------------------
 //
 // Y = W X for one token, W's rows in floats (some 4-bit GGUFs keep a qwen35

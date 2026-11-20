@@ -30,7 +30,7 @@ comments sit beside the mechanics they explain.
 | Qwen2.5-0.5B-Instruct | `qwen2` | Q8_0 | llama.cpp |
 | Qwen3-4B-Instruct-2507 | `qwen3` (and `llama`) | Q8_0, Q4_K_M | llama.cpp |
 | a 27B Qwen3.5 | `qwen35`: gated delta net and gated attention | Q6_K | llama.cpp, CPU and Metal |
-| Qwen3.5-4B, -2B and their fine-tunes (Agents-A1-4B) | `qwen35`, tool calls in Qwen3-Coder's XML | Q4_K_M on Metal (its Q4_K, Q5_K, Q6_K, Q8_0 and F32 mix) | ggml's dequantization; llama-server's template |
+| Qwen3.5-4B, -2B and their fine-tunes (Agents-A1-4B) | `qwen35`, tool calls in Qwen3-Coder's XML | Q4_K_M (its Q4_K, Q5_K, Q6_K, Q8_0 and F32 mix) and Q4_0 (with some Q4_1) on Metal | ggml's dequantization; llama-server's template |
 | DeepSeek V4 Flash | `deepseek4`: 43 layers, 256 experts, compressed attention | ds4's IQ2_XXS/Q2_K build (86.7 GB) | ds4's CPU reference |
 | DeepSeek V4.1 Flash | `deepseek41`: 40 layers, 384 experts, shared compressed caches, Engram | IQ2_XXS/Q2_K (153 GB of experts) | its CPU reference (from ds4's) |
 | GLM-5.3 Flash | `glm5-next`: 45 layers (KDA and DSA), 288 experts | antirez's Q2 build (96.5 GB) | its CPU reference (from ds4's graph); Z.AI's replies |
@@ -221,7 +221,9 @@ KV cache in halves, a flash attention on the half simdgroup matrices
 
 All three give the CPU path's top token after a 591-token prompt and its
 first 32 greedy tokens.  Q8_0, Q4_K and Q6_K matrices so far (and on the GPU
-Q5_K, and F32 for a `qwen35` model's small matrices, which 4-bit files mix in).
+Q5_K, Q4_0 and Q4_1, and F32 for a `qwen35` model's small matrices, which 4-bit
+files mix in).  On the CPU Q4_0 is held as Q8_0, its codes widened to int8: the
+products are ggml's exactly, through the Q8_0 kernels, at Q8_0's size in memory.
 
 Qwen3-4B in Q4_K_M (2.5 GB):
 
@@ -301,8 +303,8 @@ bin/illatio-server --gpu -m M --port 8081 \
 ```
 
 `--gpu` runs a `qwen35` model on the GPU (Q6_K, or a 4-bit file's mix of
-Q4_K, Q5_K, Q6_K, Q8_0 and F32), and on a Mac a dense one (`qwen2`, `qwen3`,
-`llama`) in Q8_0, Q4_K, Q5_K or Q6_K too; DeepSeek V4 Flash always uses it on a Mac,
+Q4_K, Q5_K, Q6_K, Q8_0, Q4_0, Q4_1 and F32), and on a Mac a dense one (`qwen2`,
+`qwen3`, `llama`) in Q8_0, Q4_0, Q4_1, Q4_K, Q5_K or Q6_K too; DeepSeek V4 Flash always uses it on a Mac,
 and the DeepSeek models always use CUDA where it is.  Raw text ends with llama-simple's speed line, so a quick
 comparison is
 
@@ -457,9 +459,10 @@ sbcl --non-interactive --load inspect/metal-kquant-test.lisp
 sbcl --non-interactive --load inspect/spm-tokenizer-test.lisp
 ```
 
-- **metal-kquant-test**: the GPU's Q4_K, Q5_K, Q8_0 and F32 products on a
-  4-bit file's real tensors against ggml's dequantizers (unsloth's
-  Qwen3.5-4B and bartowski's Agents-A1-4B Q4_K_M, in `~/models`).
+- **metal-kquant-test**: the GPU's Q4_K, Q5_K, Q8_0, Q4_0, Q4_1 and F32
+  products on 4-bit files' real tensors against ggml's dequantizers
+  (unsloth's Qwen3.5-4B Q4_K_M, bartowski's Agents-A1-4B Q4_K_M and Q4_0, in
+  `~/models`), and the CPU's Q4_0-as-Q8_0 against them exactly.
 - **spm-tokenizer-test**: llama-tokenize's ids for SentencePiece texts
   (Nanbeige4.1-3B's vocabulary).
 
