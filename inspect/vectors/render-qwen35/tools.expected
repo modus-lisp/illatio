@@ -1,0 +1,91 @@
+<|im_start|>system
+# Tools
+
+You have access to the following functions:
+
+<tools>
+{"type": "function", "function": {"name": "Read", "description": "Read a file", "parameters": {"type": "object", "properties": {"path": {"type": "string"}, "limit": {"type": "integer"}}, "required": ["path"]}}}
+{"type": "function", "function": {"name": "Edit", "description": "Edit", "parameters": {"type": "object", "properties": {"path": {"type": "string"}, "old": {"type": "string"}, "new": {"type": "string"}, "all": {"type": "boolean"}}}}}
+</tools>
+
+If you choose to call a function ONLY reply in the following format with NO suffix:
+
+<tool_call>
+<function=example_function_name>
+<parameter=example_parameter_1>
+value_1
+</parameter>
+<parameter=example_parameter_2>
+This is the value for the second parameter
+that can span
+multiple lines
+</parameter>
+</function>
+</tool_call>
+
+<IMPORTANT>
+Reminder:
+- Function calls MUST follow the specified format: an inner <function=...></function> block must be nested within <tool_call></tool_call> XML tags
+- Required parameters MUST be specified
+- You may provide optional reasoning for your function call in natural language BEFORE the function call, but NOT after
+- If there is no function call available, answer the question like normal with your current knowledge and do not tell the user about function calls
+</IMPORTANT>
+
+You are operandi.<|im_end|>
+<|im_start|>user
+Fix server.conf please<|im_end|>
+<|im_start|>assistant
+<tool_call>
+<function=Read>
+<parameter=path>
+server.conf
+</parameter>
+<parameter=limit>
+20
+</parameter>
+</function>
+</tool_call><|im_end|>
+<|im_start|>user
+<tool_response>
+port = 8080
+</tool_response><|im_end|>
+<|im_start|>assistant
+I will edit it.
+
+<tool_call>
+<function=Edit>
+<parameter=path>
+server.conf
+</parameter>
+<parameter=old>
+port = 8080
+</parameter>
+<parameter=new>
+port = 9090
+  next
+</parameter>
+<parameter=all>
+True
+</parameter>
+</function>
+</tool_call>
+<tool_call>
+<function=Read>
+<parameter=path>
+x
+</parameter>
+</function>
+</tool_call><|im_end|>
+<|im_start|>user
+<tool_response>
+edited
+</tool_response>
+<tool_response>
+xx
+</tool_response><|im_end|>
+<|im_start|>assistant
+Done.<|im_end|>
+<|im_start|>user
+thanks<|im_end|>
+<|im_start|>assistant
+<think>

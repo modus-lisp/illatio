@@ -1,0 +1,20 @@
+{
+ "messages": [
+  {
+   "role": "system",
+   "content": "You are operandi.\n"
+  },
+  {
+   "role": "user",
+   "content": "  Fix server.conf please "
+  },
+  {
+   "role": "assistant",
+   "content": "Hello."
+  },
+  {
+   "role": "user",
+   "content": "And again?"
+  }
+ ]
+}

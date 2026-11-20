@@ -1,7 +1,7 @@
 # illatio
 
 Language-model inference in **pure Common Lisp**. GGUF weights, quantized
-kernels, a byte-level BPE tokenizer, sampling, chat templates, tool calls
+kernels, byte-level BPE and SentencePiece tokenizers, sampling, chat templates, tool calls
 and an OpenAI-compatible server -- no C or Objective-C of its own and no
 BLAS: it calls only the operating system (a few libc functions and the
 Objective-C runtime, through SBCL's alien interface).  On Apple silicon it
@@ -30,6 +30,7 @@ comments sit beside the mechanics they explain.
 | Qwen2.5-0.5B-Instruct | `qwen2` | Q8_0 | llama.cpp |
 | Qwen3-4B-Instruct-2507 | `qwen3` (and `llama`) | Q8_0, Q4_K_M | llama.cpp |
 | a 27B Qwen3.5 | `qwen35`: gated delta net and gated attention | Q6_K | llama.cpp, CPU and Metal |
+| Qwen3.5-4B, -2B and their fine-tunes (Agents-A1-4B) | `qwen35`, tool calls in Qwen3-Coder's XML | Q4_K_M on Metal (its Q4_K, Q5_K, Q6_K, Q8_0 and F32 mix) | ggml's dequantization; llama-server's template |
 | DeepSeek V4 Flash | `deepseek4`: 43 layers, 256 experts, compressed attention | ds4's IQ2_XXS/Q2_K build (86.7 GB) | ds4's CPU reference |
 | DeepSeek V4.1 Flash | `deepseek41`: 40 layers, 384 experts, shared compressed caches, Engram | IQ2_XXS/Q2_K (153 GB of experts) | its CPU reference (from ds4's) |
 | GLM-5.3 Flash | `glm5-next`: 45 layers (KDA and DSA), 288 experts | antirez's Q2 build (96.5 GB) | its CPU reference (from ds4's graph); Z.AI's replies |
@@ -219,7 +220,8 @@ KV cache in halves, a flash attention on the half simdgroup matrices
 | Qwen2.5-0.5B Q8_0, decode at 4096 tokens of context | 217 | 243 |
 
 All three give the CPU path's top token after a 591-token prompt and its
-first 32 greedy tokens.  Q8_0, Q4_K and Q6_K matrices so far.
+first 32 greedy tokens.  Q8_0, Q4_K and Q6_K matrices so far (and on the GPU
+Q5_K, and F32 for a `qwen35` model's small matrices, which 4-bit files mix in).
 
 Qwen3-4B in Q4_K_M (2.5 GB):
 
@@ -298,8 +300,9 @@ bin/illatio-server --gpu -m M --port 8081 \
   --path llama.cpp/tools/server/public_simplechat --reasoning-format none
 ```
 
-`--gpu` runs a `qwen35` model on the GPU, and on a Mac a dense one (`qwen2`,
-`qwen3`, `llama`) in Q8_0, Q4_K or Q6_K too; DeepSeek V4 Flash always uses it on a Mac,
+`--gpu` runs a `qwen35` model on the GPU (Q6_K, or a 4-bit file's mix of
+Q4_K, Q5_K, Q6_K, Q8_0 and F32), and on a Mac a dense one (`qwen2`, `qwen3`,
+`llama`) in Q8_0, Q4_K, Q5_K or Q6_K too; DeepSeek V4 Flash always uses it on a Mac,
 and the DeepSeek models always use CUDA where it is.  Raw text ends with llama-simple's speed line, so a quick
 comparison is
 
@@ -414,7 +417,8 @@ folds them straight into its stream state.
   CPU path for DeepSeek V4 Flash (`src/ds4f.lisp`), whose GPU paths are
   `src/metal-ds4f*.lisp`.
 - **The tokenizer** is byte-level BPE with each model's pre-tokenizer split
-  matched by hand, with no regex engine (`src/tokenizer.lisp`); the **chat
+  matched by hand, with no regex engine, or for a `llama`-vocabulary model
+  SentencePiece BPE as llama.cpp's llm_tokenizer_spm (`src/tokenizer.lisp`); the **chat
   templates** are written in Lisp per model instead of interpreting Jinja
   (`src/openai.lisp`).
 
@@ -443,7 +447,21 @@ pick another.
   against one token at a time, one thread against many, a reused context
   against a fresh one.
 - **render-test** checks the chat templates against recorded llama-server
-  renderings, and tool-call parsing.
+  renderings, and tool-call parsing (Qwen3.5's XML calls included).
+
+Formats and tokenizers outside the Qwen2.5 default have their own (each
+exits 2 when its model is missing):
+
+```
+sbcl --non-interactive --load inspect/metal-kquant-test.lisp
+sbcl --non-interactive --load inspect/spm-tokenizer-test.lisp
+```
+
+- **metal-kquant-test**: the GPU's Q4_K, Q5_K, Q8_0 and F32 products on a
+  4-bit file's real tensors against ggml's dequantizers (unsloth's
+  Qwen3.5-4B and bartowski's Agents-A1-4B Q4_K_M, in `~/models`).
+- **spm-tokenizer-test**: llama-tokenize's ids for SentencePiece texts
+  (Nanbeige4.1-3B's vocabulary).
 
 DeepSeek V4 Flash has its own, against ds4 (they need the GGUF,
 `$ILLATIO_DS4F`):

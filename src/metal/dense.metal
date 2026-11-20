@@ -358,6 +358,69 @@ kernel void dn_row_q4_k(constant dn_rowk_args & a [[buffer(0)]], device const ch
     out[j] = (float)blk->d * sm[0] * (float)(pos >= 32 ? (q >> 4) : (q & 0xF)) - (float)blk->dmin * sm[1];
 }
 
+// --- Q5_K --------------------------------------------------------------------------
+//
+// Q4_K's block plus a fifth bit a weight: QH[l]'s bit 2c is the high bit of
+// chunk c's low nibble at l, bit 2c+1 of its high nibble (ggml's
+// dequantize_row_q5_K).  176 bytes, 256 weights.
+
+typedef struct { half d; half dmin; uint8_t scales[12]; uint8_t qh[32]; uint8_t qs[128]; } dn_block_q5_K;
+
+// Y = W X for one token, W's Q5_K rows: a simdgroup two rows, lane L the
+// weights 8L .. 8L+7 of every block (one sub-block's scale, one nibble, one
+// QH bit), X's 8 floats shared by the two rows.  grid ceil(rows/4), threads 64.
+kernel void dn_mv_q5_k(constant dn_mv_args & a [[buffer(0)]], device const char * w [[buffer(1)]],
+                       device const float * x [[buffer(2)]], device float * y [[buffer(3)]],
+                       uint tg [[threadgroup_position_in_grid]], ushort sg [[simdgroup_index_in_threadgroup]],
+                       ushort lane [[thread_index_in_simdgroup]]) {
+    const uint r0 = (tg * 2 + sg) * DN_NR;
+    if (r0 >= a.nrows) return;
+    const uint nb = a.ncols / 256;
+    const ulong row_bytes = (ulong)nb * sizeof(dn_block_q5_K);
+    const uint k0 = lane * 8, c = k0 / 64, pos = k0 % 64, l = pos % 32;
+    const bool high = pos >= 32;
+    const uint shift = 2 * c + (high ? 1 : 0);
+    float s[DN_NR];
+    for (short rr = 0; rr < DN_NR; ++rr) s[rr] = 0.f;
+    for (uint b = 0; b < nb; ++b) {
+        device const float4 * xv = (device const float4 *)(x + b * 256 + k0);
+        const float4 x0 = xv[0], x1 = xv[1];
+        const float xs = x0[0] + x0[1] + x0[2] + x0[3] + x1[0] + x1[1] + x1[2] + x1[3];
+        for (short rr = 0; rr < DN_NR; ++rr) {
+            if (r0 + rr >= a.nrows) break;
+            device const dn_block_q5_K * blk = (device const dn_block_q5_K *)(w + (r0 + rr) * row_bytes) + b;
+            const uchar2 sm = dn_q4k_scale(k0 / 32, blk->scales);
+            const uchar4 qa = *(device const uchar4 *)(blk->qs + c * 32 + l), qb = *(device const uchar4 *)(blk->qs + c * 32 + l + 4);
+            const uchar4 ha = *(device const uchar4 *)(blk->qh + l),          hb = *(device const uchar4 *)(blk->qh + l + 4);
+            const float4 wa = float4(high ? (qa >> 4) : (qa & 0xF)) + 16.f * float4((ha >> shift) & 1);
+            const float4 wb = float4(high ? (qb >> 4) : (qb & 0xF)) + 16.f * float4((hb >> shift) & 1);
+            s[rr] += (float)blk->d * sm[0] * (dot(wa, x0) + dot(wb, x1)) - (float)blk->dmin * sm[1] * xs;
+        }
+    }
+    for (short rr = 0; rr < DN_NR; ++rr) {
+        const float t = simd_sum(s[rr]);
+        if (lane == 0 && r0 + rr < a.nrows) y[r0 + rr] = t;
+    }
+}
+
+// --- F32 ---------------------------------------------------------------------------
+//
+// Y = W X for one token, W's rows in floats (some 4-bit GGUFs keep a qwen35
+// model's small SSM_ALPHA and SSM_BETA so): a simdgroup a row.
+// grid ceil(rows/2), threads 64.
+kernel void dn_mv_f32(constant dn_mv_args & a [[buffer(0)]], device const char * w [[buffer(1)]],
+                      device const float * x [[buffer(2)]], device float * y [[buffer(3)]],
+                      uint tg [[threadgroup_position_in_grid]], ushort sg [[simdgroup_index_in_threadgroup]],
+                      ushort lane [[thread_index_in_simdgroup]]) {
+    const uint r = tg * 2 + sg;
+    if (r >= a.nrows) return;
+    device const float * wr = (device const float *)w + (ulong)r * a.ncols;
+    float s = 0.f;
+    for (uint i = lane; i < a.ncols; i += 32) s += wr[i] * x[i];
+    s = simd_sum(s);
+    if (lane == 0) y[r] = s;
+}
+
 // --- decode attention, split over the keys -------------------------------------
 //
 // One token's attention as flash decoding: a threadgroup per KV head and

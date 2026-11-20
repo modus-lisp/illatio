@@ -18,12 +18,16 @@
   (pre "default")
   (bos nil) (eos nil) (eot nil)
   (add-bos nil)
-  (cache (make-hash-table :test 'equal)))   ; word -> ids
+  (cache (make-hash-table :test 'equal))    ; word -> ids
+  (kind :bpe)                               ; :bpe (gpt2) or :spm (llama's SentencePiece)
+  (scores nil)                              ; :spm: id -> score, the higher merged first
+  (add-space-prefix t))                     ; :spm: a text fragment after a special starts with a space
 
 ;;; gguf token types
 (defconstant +tok-normal+ 1)
 (defconstant +tok-control+ 3)
 (defconstant +tok-user-defined+ 4)
+(defconstant +tok-byte+ 6)
 
 ;;; --- GPT-2's byte alphabet --------------------------------------------------
 ;;; Printable bytes stand for themselves; the other 68 are moved to U+0100 and
@@ -62,9 +66,11 @@
                          :eos (meta g "tokenizer.ggml.eos_token_id")
                          :eot (meta g "tokenizer.ggml.eot_token_id")
                          :add-bos (meta g "tokenizer.ggml.add_bos_token"))))
-    (unless (equal (meta g "tokenizer.ggml.model") "gpt2")
-      (error "tokenizer ~S is not supported (only gpt2 byte-level BPE)"
-             (meta g "tokenizer.ggml.model")))
+    (cond ((equal (meta g "tokenizer.ggml.model") "gpt2"))
+          ((equal (meta g "tokenizer.ggml.model") "llama")
+           (return-from make-vocab-from-gguf (finish-spm-vocab v g)))
+          (t (error "tokenizer ~S is not supported (gpt2 byte-level BPE and llama SentencePiece are)"
+                    (meta g "tokenizer.ggml.model"))))
     ;; DeepSeek's markers (<｜User｜>, <think>, ...) are typed normal in
     ;; some conversions (V4.1's): they are specials all the same
     ;; and so is a "normal" piece with a character no byte spells (V4.1's
@@ -86,6 +92,105 @@
                         collect (cons p id))
                 #'> :key (lambda (e) (length (car e)))))
     v))
+
+;;; --- llama's SentencePiece BPE (tokenizer.ggml.model = llama) ------------------
+;;; As llama.cpp's llm_tokenizer_spm: no pre-tokenizer; a fragment's spaces
+;;; become U+2581 (and, after a special or at the start, one is put in front);
+;;; its characters are merged pairwise, the pair whose merged piece scores
+;;; highest first (leftmost on ties), as long as the merged piece is a token;
+;;; a character that is no token is spelt as its UTF-8 bytes' <0xXX> tokens.
+
+(defun finish-spm-vocab (v g)
+  (let ((pieces (vocab-pieces v)) (types (vocab-types v)))
+    (setf (vocab-kind v) :spm
+          (vocab-scores v) (coerce (meta g "tokenizer.ggml.scores") 'simple-vector)
+          (vocab-add-space-prefix v) (let ((a (multiple-value-list (meta g "tokenizer.ggml.add_space_prefix" t))))
+                                       (first a)))
+    (loop for p across pieces for id from 0
+          do (setf (gethash p (vocab-ids v)) id))
+    (setf (vocab-specials v)
+          (sort (loop for p across pieces for ty across types for id from 0
+                      when (member ty (list +tok-control+ +tok-user-defined+))
+                        collect (cons p id))
+                #'> :key (lambda (e) (length (car e)))))
+    v))
+
+(defun spm-escape (text) (substitute (code-char #x2581) #\Space text))
+
+(defun spm-byte-ids (vocab string)
+  (loop for b across (sb-ext:string-to-octets string :external-format :utf-8)
+        collect (or (gethash (format nil "<0x~2,'0X>" b) (vocab-ids vocab))
+                    (error "no byte token for ~2,'0X" b))))
+
+(defun spm-fragment (vocab text)
+  "Token ids for one escaped fragment TEXT."
+  (let* ((n (length text))
+         (ids (vocab-ids vocab)) (scores (vocab-scores vocab))
+         (len (make-array n :element-type 'fixnum :initial-element 1))
+         (prev (make-array n :element-type 'fixnum))
+         (next (make-array n :element-type 'fixnum))
+         ;; a max-heap of #(score left right size): higher score, then smaller left, first
+         (heap (make-array 64 :adjustable t :fill-pointer 0)))
+    (when (zerop n) (return-from spm-fragment nil))
+    (dotimes (i n) (setf (aref prev i) (1- i) (aref next i) (if (= i (1- n)) -1 (1+ i))))
+    (labels ((better (a b) (or (> (svref a 0) (svref b 0))
+                               (and (= (svref a 0) (svref b 0)) (< (svref a 1) (svref b 1)))))
+             (push-heap (x)
+               (vector-push-extend x heap)
+               (loop with i = (1- (fill-pointer heap))
+                     while (plusp i)
+                     do (let ((p (floor (1- i) 2)))
+                          (if (better (aref heap i) (aref heap p))
+                              (progn (rotatef (aref heap i) (aref heap p)) (setf i p))
+                              (return)))))
+             (pop-heap ()
+               (let ((top (aref heap 0)) (last (vector-pop heap)))
+                 (when (plusp (fill-pointer heap))
+                   (setf (aref heap 0) last)
+                   (loop with i = 0 with m = (fill-pointer heap)
+                         do (let* ((l (+ 1 (* 2 i))) (r (+ 2 (* 2 i))) (best i))
+                              (when (and (< l m) (better (aref heap l) (aref heap best))) (setf best l))
+                              (when (and (< r m) (better (aref heap r) (aref heap best))) (setf best r))
+                              (if (= best i) (return) (progn (rotatef (aref heap i) (aref heap best)) (setf i best))))))
+                 top))
+             (try (l r)
+               (when (and (>= l 0) (>= r 0))
+                 (let ((id (gethash (subseq text l (+ r (aref len r))) ids)))
+                   (when id (push-heap (vector (svref scores id) l r (+ (aref len l) (aref len r)))))))))
+      (loop for i from 1 below n do (try (1- i) i))
+      (loop while (plusp (fill-pointer heap))
+            do (let* ((b (pop-heap)) (l (svref b 1)) (r (svref b 2)))
+                 (unless (or (zerop (aref len l)) (zerop (aref len r))
+                             (/= (+ (aref len l) (aref len r)) (svref b 3)))
+                   (incf (aref len l) (aref len r))
+                   (setf (aref len r) 0
+                         (aref next l) (aref next r))
+                   (when (>= (aref next r) 0) (setf (aref prev (aref next r)) l))
+                   (try (aref prev l) l)
+                   (try l (aref next l)))))
+      (loop for i = 0 then (aref next i)
+            while (>= i 0)
+            for piece = (subseq text i (+ i (aref len i)))
+            for id = (gethash piece ids)
+            if id collect id
+            else append (spm-byte-ids vocab piece)))))
+
+(defun spm-tokenize (vocab text add-bos)
+  (let ((out '()) (prev-special t))
+    (when (and add-bos (vocab-bos vocab)
+               ;; a chat template that writes the BOS itself (Nanbeige's BOS is
+               ;; <|im_start|>) does not get a second one
+               (not (eql 0 (search (svref (vocab-pieces vocab) (vocab-bos vocab)) text))))
+      (push (vocab-bos vocab) out))
+    (dolist (f (split-specials vocab text) (nreverse out))
+      (if (integerp f)
+          (progn (push f out) (setf prev-special t))
+          (progn
+            (dolist (id (spm-fragment vocab (spm-escape (if (and prev-special (vocab-add-space-prefix vocab))
+                                                            (concatenate 'string " " f)
+                                                            f))))
+              (push id out))
+            (setf prev-special nil))))))
 
 ;;; --- stage 1: specials ------------------------------------------------------
 ;;; Fragments are strings (still to be split) or ids (done).  Each special in
@@ -309,6 +414,8 @@
                                                   (error "no token for byte ~S" ch))))))))
 
 (defun tokenize-with (vocab text &key (add-bos (vocab-add-bos vocab)))
+  (when (eq (vocab-kind vocab) :spm)
+    (return-from tokenize-with (spm-tokenize vocab text add-bos)))
   (let* ((joyai (equal (vocab-pre vocab) "joyai-llm"))
          (digits (if joyai 3 (pre-tokenizer-digits (vocab-pre vocab))))
          (marks (equal (vocab-pre vocab) "qwen35")))
@@ -323,6 +430,14 @@
 (defun token-bytes (vocab id)
   "The bytes token ID stands for.  A control token stands for its own name."
   (let ((piece (svref (vocab-pieces vocab) id)))
+    (when (eq (vocab-kind vocab) :spm)
+      (return-from token-bytes
+        (cond ((= (svref (vocab-types vocab) id) +tok-byte+)
+               (make-array 1 :element-type '(unsigned-byte 8)
+                             :initial-element (parse-integer piece :start 3 :end 5 :radix 16)))
+              ((= (svref (vocab-types vocab) id) +tok-normal+)
+               (sb-ext:string-to-octets (substitute #\Space (code-char #x2581) piece) :external-format :utf-8))
+              (t (sb-ext:string-to-octets piece :external-format :utf-8)))))
     (if (= (svref (vocab-types vocab) id) +tok-normal+)
         (spelling-bytes piece)
         (sb-ext:string-to-octets piece :external-format :utf-8))))

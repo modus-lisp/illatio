@@ -45,7 +45,20 @@
            (assert (= (model-ssm-k-dim m) 128) () "q35_delta is written for 128-wide K heads")
            (assert (zerop (mod (model-ssm-v-dim m) 32)) () "q35_delta takes values 32 at a time")
            (assert (= (model-head-dim m) 256) () "attend_fa is written for 256-wide heads")
-           (assert (<= (floor (model-n-head m) (model-n-kv-head m)) 8) () "attend_split takes at most 8 query heads a KV head"))
+           (assert (<= (floor (model-n-head m) (model-n-kv-head m)) 8) () "attend_split takes at most 8 query heads a KV head")
+           ;; checked here, not when a command buffer is half encoded: an
+           ;; error there leaves an encoder open, and Metal aborts the process
+           (unless (eq (gmat-type (model-token-embd m)) :q6_k)
+             (error "the GPU takes a qwen35 model's embeddings in Q6_K; they are ~A" (gmat-type (model-token-embd m))))
+           (loop for l across (model-layers m)
+                 do (dolist (w (list (layer-wqkv l) (layer-wz l) (layer-walpha l) (layer-wbeta l) (layer-ssm-out l)
+                                     (layer-wq l) (layer-wk l) (layer-wv l) (layer-wo l)
+                                     (layer-wgate l) (layer-wup l) (layer-wdown l)))
+                      (when (and w (not (member (gmat-type w) '(:q8_0 :q4_k :q5_k :q6_k))))
+                        ;; F32 only where the matrix is small: ALPHA and BETA
+                        (unless (and (eq (gmat-type w) :f32) (<= (gmat-rows w) 256))
+                          (error "the GPU runs a qwen35 model's Q8_0, Q4_K, Q5_K and Q6_K matrices; ~A is ~A"
+                                 (gmat-name w) (gmat-type w)))))))
           ((member (model-arch m) +dense-archs+ :test #'equal) (dense-gpu-check m))
           (t (error "the GPU path runs qwen35 and dense models (~{~A~^, ~}); this is ~A"
                     +dense-archs+ (model-arch m))))
@@ -127,9 +140,10 @@
 (defun mat (gm e w x y n)
   "Y = W X for N tokens (token t's X at t*cols, its Y at t*rows): a matrix-
    vector product for one, the tiled matrix product for more.  W a GMAT,
-   Q6_K so far."
+   Q6_K by this file's kernels; Q8_0, Q4_K and Q5_K by the dense models'
+   (MAT-Q8), as a 4-bit GGUF mixes them."
   (unless (eq (gmat-type w) :q6_k)
-    (error "the GPU multiplies Q6_K so far; ~A is ~A" (gmat-name w) (gmat-type w)))
+    (return-from mat (mat-q8 gm e w x y n)))
   (let ((wb (cons (gmodel-file gm) (gmat-offset w))) (gpu (gmodel-gpu gm)))
     (if (= n 1)
         (dispatch gpu e "mv_q6k" (list (gmat-cols w) (gmat-rows w) (gmat-row-bytes w) 0 0)

@@ -1,0 +1,118 @@
+{
+ "messages": [
+  {
+   "role": "system",
+   "content": "You are operandi.\n"
+  },
+  {
+   "role": "user",
+   "content": "  Fix server.conf please "
+  },
+  {
+   "role": "assistant",
+   "content": "",
+   "tool_calls": [
+    {
+     "id": "a",
+     "type": "function",
+     "function": {
+      "name": "Read",
+      "arguments": "{\"path\":\"server.conf\",\"limit\":20}"
+     }
+    }
+   ]
+  },
+  {
+   "role": "tool",
+   "tool_call_id": "a",
+   "content": "port = 8080\n"
+  },
+  {
+   "role": "assistant",
+   "content": "I will edit it.",
+   "tool_calls": [
+    {
+     "id": "b",
+     "type": "function",
+     "function": {
+      "name": "Edit",
+      "arguments": "{\"path\":\"server.conf\",\"old\":\"port = 8080\",\"new\":\"port = 9090\\n  next\",\"all\":true}"
+     }
+    },
+    {
+     "id": "c",
+     "type": "function",
+     "function": {
+      "name": "Read",
+      "arguments": "{\"path\":\"x\"}"
+     }
+    }
+   ]
+  },
+  {
+   "role": "tool",
+   "tool_call_id": "b",
+   "content": "edited"
+  },
+  {
+   "role": "tool",
+   "tool_call_id": "c",
+   "content": "xx"
+  },
+  {
+   "role": "assistant",
+   "content": "Done."
+  },
+  {
+   "role": "user",
+   "content": "thanks"
+  }
+ ],
+ "tools": [
+  {
+   "type": "function",
+   "function": {
+    "name": "Read",
+    "description": "Read a file",
+    "parameters": {
+     "type": "object",
+     "properties": {
+      "path": {
+       "type": "string"
+      },
+      "limit": {
+       "type": "integer"
+      }
+     },
+     "required": [
+      "path"
+     ]
+    }
+   }
+  },
+  {
+   "type": "function",
+   "function": {
+    "name": "Edit",
+    "description": "Edit",
+    "parameters": {
+     "type": "object",
+     "properties": {
+      "path": {
+       "type": "string"
+      },
+      "old": {
+       "type": "string"
+      },
+      "new": {
+       "type": "string"
+      },
+      "all": {
+       "type": "boolean"
+      }
+     }
+    }
+   }
+  }
+ ]
+}

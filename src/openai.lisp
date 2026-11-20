@@ -233,7 +233,8 @@
           (values reasoning (strip-newlines (subseq content (+ last-close 8)) :right nil))))))
 
 (defun render-qwen3-chat (messages tools
-                          &key (add-generation-prompt
+                          &key close-think
+                               (add-generation-prompt
                                 (let ((l (and (plusp (length messages))
                                               (elt messages (1- (length messages))))))
                                   (not (and l (equal (jget l "role") "assistant"))))))
@@ -306,7 +307,208 @@
                     (unless (and rest (equal (jget (first rest) "role") "tool"))
                       (emit "<|im_end|>" (string #\Newline))))))
         (when add-generation-prompt
-          (emit "<|im_start|>assistant" (string #\Newline)))))))
+          (emit "<|im_start|>assistant" (string #\Newline))
+          ;; Qwen3's hybrid models: enable_thinking false writes the
+          ;; reasoning block closed and empty
+          (when close-think (emit (format nil "<think>~%~%</think>~%~%"))))))))
+
+;;; --- qwen3.5's template ------------------------------------------------------------
+;;; ChatML, but a tool call is Qwen3-Coder's XML, not JSON:
+;;;   <tool_call>\n<function=NAME>\n<parameter=KEY>\nVALUE\n</parameter>\n</function>\n</tool_call>
+;;; The tool list comes before the client's system text; every message's
+;;; content is trimmed; an assistant turn after the last user query always
+;;; carries a <think> block, empty when it had no reasoning; and the
+;;; generation prompt opens <think> when thinking, else writes it closed and
+;;; empty.  Every qwen35-arch fine-tune (Agents-A1, OmniCoder) has it.
+;;; Qwen's own template thinks unless enable_thinking is false and unsloth's
+;;; only when it is true; as in llama-server, which always defines it (true
+;;; unless the request says false), the two agree.
+
+(defun qwen-xml-template-p (template)
+  (and (search "<|im_start|>" template) (search "<function=" template) t))
+
+(defun py-trim (s) (string-trim '(#\Space #\Tab #\Newline #\Return #\Page #\Vt) s))
+
+(defun qwen-xml-param-string (v)
+  "An argument as the template writes it: a string as it is, an object or
+   array as JSON, anything else as Python's str() would."
+  (cond ((stringp v) v)
+        ((or (hash-table-p v) (vectorp v)) (pyjson v))
+        ((eq v t) "True")
+        ((null v) "False")
+        ((eq v 'null) "None")
+        (t (json-simple:stringify v))))
+
+(defun render-qwen35-chat (messages tools &key thinking
+                                           (add-generation-prompt
+                                            (let ((l (and (plusp (length messages))
+                                                          (elt messages (1- (length messages))))))
+                                              (not (and l (equal (jget l "role") "assistant"))))))
+  "MESSAGES and TOOLS rendered as Qwen3.5's chat template renders them."
+  (let* ((msgs (coerce messages 'list))
+         (n (length msgs))
+         (nl (string #\Newline))
+         (last-query
+           (or (loop for i from (1- n) downto 0
+                     for m = (nth i msgs)
+                     for c = (py-trim (content-string (jget m "content")))
+                     when (and (equal (jget m "role") "user")
+                               (not (and (eql 0 (search "<tool_response>" c))
+                                         (let ((e (search "</tool_response>" c :from-end t)))
+                                           (and e (= (+ e 16) (length c)))))))
+                       return i)
+               (1- n))))
+    (with-output-to-string (s)
+      (flet ((emit (&rest strings) (dolist (x strings) (write-string x s))))
+        (let ((sys (and msgs (equal (jget (first msgs) "role") "system")
+                        (py-trim (content-string (jget (first msgs) "content"))))))
+          (if (and tools (plusp (length tools)))
+              (progn
+                (emit "<|im_start|>system" nl "# Tools" nl nl "You have access to the following functions:" nl nl "<tools>")
+                (loop for tool across tools do (emit nl (pyjson tool)))
+                (emit nl "</tools>")
+                (emit (format nil "~%~%If you choose to call a function ONLY reply in the following format with NO suffix:~%~%<tool_call>~%<function=example_function_name>~%<parameter=example_parameter_1>~%value_1~%</parameter>~%<parameter=example_parameter_2>~%This is the value for the second parameter~%that can span~%multiple lines~%</parameter>~%</function>~%</tool_call>~%~%<IMPORTANT>~%Reminder:~%- Function calls MUST follow the specified format: an inner <function=...></function> block must be nested within <tool_call></tool_call> XML tags~%- Required parameters MUST be specified~%- You may provide optional reasoning for your function call in natural language BEFORE the function call, but NOT after~%- If there is no function call available, answer the question like normal with your current knowledge and do not tell the user about function calls~%</IMPORTANT>"))
+                (when (and sys (plusp (length sys))) (emit nl nl sys))
+                (emit "<|im_end|>" nl))
+              (when sys (emit "<|im_start|>system" nl sys "<|im_end|>" nl))))
+        (loop for (m . rest) on msgs
+              for prev = nil then role
+              for role = (jget m "role")
+              for i from 0
+              for content = (py-trim (content-string (jget m "content")))
+              for calls = (let ((c (jget m "tool_calls"))) (and (vectorp c) (plusp (length c)) c))
+              do (cond
+                   ((equal role "system"))
+                   ((equal role "user")
+                    (emit "<|im_start|>user" nl content "<|im_end|>" nl))
+                   ((equal role "assistant")
+                    (let ((reasoning ""))
+                      (let ((rc (jget m "reasoning_content")))
+                        (if (stringp rc)
+                            (setf reasoning rc)
+                            (let ((close (search "</think>" content)))
+                              (when close
+                                (let* ((before (string-right-trim '(#\Newline) (subseq content 0 close)))
+                                       (open (search "<think>" before :from-end t)))
+                                  (setf reasoning (string-left-trim '(#\Newline) (if open (subseq before (+ open 7)) before))
+                                        content (string-left-trim '(#\Newline)
+                                                                  (subseq content (+ (search "</think>" content :from-end t) 8)))))))))
+                      (setf reasoning (py-trim reasoning))
+                      (if (> i last-query)
+                          (emit "<|im_start|>assistant" nl "<think>" nl reasoning nl "</think>" nl nl content)
+                          (emit "<|im_start|>assistant" nl content))
+                      (when calls
+                        (loop for call across calls for first = t then nil
+                              for args = (tool-call-arguments call)
+                              do (emit (cond ((not first) nl)
+                                             ((plusp (length (py-trim content))) (format nil "~%~%"))
+                                             (t ""))
+                                       "<tool_call>" nl "<function="
+                                       (or (jget call "function" "name") (jget call "name") "") ">" nl)
+                                 (when (hash-table-p args)
+                                   (maphash (lambda (k v)
+                                              (emit "<parameter=" k ">" nl (qwen-xml-param-string v) nl "</parameter>" nl))
+                                            args))
+                                 (emit "</function>" nl "</tool_call>")))
+                      (emit "<|im_end|>" nl)))
+                   ((equal role "tool")
+                    (when (and prev (not (equal prev "tool"))) (emit "<|im_start|>user"))
+                    (emit nl "<tool_response>" nl content nl "</tool_response>")
+                    (when (or (null rest) (not (equal (jget (first rest) "role") "tool")))
+                      (emit "<|im_end|>" nl)))))
+        (when add-generation-prompt
+          (emit "<|im_start|>assistant" nl)
+          (emit (if thinking (format nil "<think>~%") (format nil "<think>~%~%</think>~%~%"))))))))
+
+(defun qwen-xml-param-types (tools)
+  "FUNCTION-NAME -> (PARAM -> JSON schema type) from the request's tools."
+  (let ((h (make-hash-table :test 'equal)))
+    (when (vectorp tools)
+      (loop for tool across tools
+            for name = (jget tool "function" "name")
+            for props = (jget tool "function" "parameters" "properties")
+            when (and name (hash-table-p props))
+              do (let ((p (make-hash-table :test 'equal)))
+                   (maphash (lambda (k v) (setf (gethash k p) (jget v "type"))) props)
+                   (setf (gethash name h) p))))
+    h))
+
+(defun qwen-xml-parse-call (body types)
+  "One <tool_call> block's BODY as a call object, or NIL.  A <function=..>
+   block; or, as a small model sometimes writes it, Hermes JSON."
+  (let ((f (search "<function=" body)))
+    (if (null f)
+        (let ((obj (ignore-errors (json-simple:parse (py-trim body)))))
+          (and (hash-table-p obj) (stringp (jget obj "name"))
+               (let ((a (gethash "arguments" obj)))
+                 (cons (jget obj "name") (if (stringp a) a (json-simple:stringify (or a (make-hash-table :test 'equal))))))))
+        (let* ((gt (position #\> body :start f))
+               (name (and gt (py-trim (subseq body (+ f 10) gt))))
+               (ptypes (and name (gethash name types)))
+               (args (make-hash-table :test 'equal))
+               (pos gt))
+          (when (and name (plusp (length name)))
+            (loop for p = (search "<parameter=" body :start2 pos)
+                  while p
+                  do (let* ((pgt (position #\> body :start p))
+                            (key (and pgt (py-trim (subseq body (+ p 11) pgt)))))
+                       (unless key (return))
+                       (let* ((vstart (1+ pgt))
+                              (vend (or (search "</parameter>" body :start2 vstart)
+                                        (search "<parameter=" body :start2 vstart)
+                                        (search "</function>" body :start2 vstart)
+                                        (length body)))
+                              (raw (subseq body vstart vend))
+                              ;; the format puts the value between newlines
+                              (raw (if (and (plusp (length raw)) (char= (char raw 0) #\Newline)) (subseq raw 1) raw))
+                              (raw (if (and (plusp (length raw)) (char= (char raw (1- (length raw))) #\Newline))
+                                       (subseq raw 0 (1- (length raw))) raw))
+                              (type (and ptypes (gethash key ptypes))))
+                         (setf (gethash key args)
+                               (if (member type '("integer" "number" "boolean" "object" "array") :test #'equal)
+                                   (multiple-value-bind (v ok) (ignore-errors (values (json-simple:parse (py-trim raw)) t))
+                                     (if ok v raw))
+                                   raw))
+                         (setf pos vend))))
+            (cons name (json-simple:stringify args)))))))
+
+(defun qwen35-parse-reply (text thinking tools)
+  "(values content tool-calls reasoning) from a Qwen3.5 reply: the reasoning
+   before </think> (when THINKING), then content, then <tool_call> blocks."
+  (let* ((close (search "</think>" text))
+         (reasoning (cond (close (subseq text 0 close)) (thinking text) (t nil)))
+         (rest (cond (close (subseq text (+ close 8))) (thinking "") (t text)))
+         (start (search "<tool_call>" rest))
+         (types (qwen-xml-param-types tools))
+         (content (make-string-output-stream))
+         (calls '()))
+    (write-string rest content :end (or start (length rest)))
+    (loop with pos = start
+          while pos
+          do (let* ((s (+ pos 11))
+                    (e (search "</tool_call>" rest :start2 s))
+                    (next (search "<tool_call>" rest :start2 s))
+                    (end (or e next (length rest)))
+                    (call (qwen-xml-parse-call (subseq rest s end) types)))
+               (if call
+                   (push (hobj "id" (fresh-id "call_" 8) "type" "function"
+                               "function" (hobj "name" (car call) "arguments" (cdr call)))
+                         calls)
+                   ;; nothing parsed: leave it where the client can see it
+                   (write-string rest content :start pos :end (if e (+ e 12) end)))
+               (setf pos (search "<tool_call>" rest :start2 (if e (+ e 12) end)))))
+    (values (py-trim (get-output-stream-string content))
+            (nreverse calls)
+            (and reasoning (py-trim reasoning)))))
+
+(defun model-qwen-xml-p (model)
+  (qwen-xml-template-p (meta (model-gguf model) "tokenizer.chat_template" "")))
+
+(defun model-thinking (model req)
+  "Whether MODEL thinks for REQ.  As llama-server: on unless the request
+   turns it off, whatever the template does with enable_thinking undefined."
+  (declare (ignore model))
+  (request-thinking req))
 
 (defun render-chat (model messages &optional tools &key (thinking t))
   (let ((template (meta (model-gguf model) "tokenizer.chat_template" "")))
@@ -315,9 +517,11 @@
                (render-ds41f-chat messages tools :thinking thinking)
                (render-ds4f-chat messages tools :thinking thinking)))
           ((equal (model-arch model) "glm5-next") (render-glm53-chat messages tools :thinking thinking))
+          ((qwen-xml-template-p template) (render-qwen35-chat messages tools :thinking thinking))
           ((and (search "<|im_start|>" template) (search "<tool_call>" template)
                 (search "</think>" template))
-           (render-qwen3-chat messages tools))
+           (render-qwen3-chat messages tools
+                              :close-think (and (not thinking) (search "enable_thinking is false" template) t)))
           ((and (search "<|im_start|>" template) (search "<tool_call>" template))
            (render-qwen-chat messages tools))
           ;; No template in the file (some finetunes ship without one): a
@@ -448,7 +652,8 @@
   (sb-thread:with-mutex ((engine-lock engine))
     (let* ((*steering* (request-steering req))
            (m (engine-model engine))
-           (thinking (request-thinking req))
+           (thinking (model-thinking m req))
+           (qxml (model-qwen-xml-p m))
            (ds4f (member (model-arch m) '("deepseek4" "deepseek41") :test #'equal))
            (glm (equal (model-arch m) "glm5-next"))
            (images (make-array 0 :adjustable t :fill-pointer 0))
@@ -473,7 +678,16 @@
           (multiple-value-bind (content calls reasoning)
               (cond (ds4f (ds4f-parse-reply text thinking (equal (model-arch m) "deepseek41")))
                     (glm (glm53-parse-reply text thinking))
-                    (t (parse-tool-calls text)))
+                    (qxml (qwen35-parse-reply text thinking (jget req "tools")))
+                    ;; a model that opens its reply with <think> (Qwen3's
+                    ;; thinking models, Nanbeige): the reasoning is not
+                    ;; content, and a call drafted inside it is not a call
+                    (t (let* ((tx (string-left-trim '(#\Space #\Tab #\Newline #\Return) text))
+                              (close (and (eql 0 (search "<think>" tx)) (search "</think>" tx))))
+                         (if close
+                             (multiple-value-bind (c k) (parse-tool-calls (subseq tx (+ close 8)))
+                               (values c k (py-trim (subseq tx 7 close))))
+                             (parse-tool-calls text)))))
             (flet ((ms (a b) (/ (* 1000d0 (- b a)) internal-time-units-per-second)))
               (hobj "id" (fresh-id "chatcmpl-")
                     "object" "chat.completion"
@@ -566,8 +780,9 @@
                                 :on-text (cond ((member (model-arch (engine-model engine)) '("deepseek4" "deepseek41") :test #'equal)
                                                 (make-ds4f-stream-filter emit emit-reasoning (request-thinking req)
                                                                          :call-tag (format nil "<~A" (dsml "tool_calls" (equal (model-arch (engine-model engine)) "deepseek41")))))
-                                               ((equal (model-arch (engine-model engine)) "glm5-next")
-                                                (make-ds4f-stream-filter emit emit-reasoning (request-thinking req)
+                                               ((or (equal (model-arch (engine-model engine)) "glm5-next")
+                                                    (model-qwen-xml-p (engine-model engine)))
+                                                (make-ds4f-stream-filter emit emit-reasoning (model-thinking (engine-model engine) req)
                                                                          :call-tag "<tool_call>"))
                                                ((jget req "tools") (make-tool-call-filter emit))
                                                (t emit))))

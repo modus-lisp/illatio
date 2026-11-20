@@ -32,11 +32,11 @@
                      (loop for l across (model-layers m)
                            append (list (layer-wq l) (layer-wk l) (layer-wv l) (layer-wo l)
                                         (layer-wgate l) (layer-wup l) (layer-wdown l)))))
-      (unless (member (gmat-type w) '(:q8_0 :q4_k :q6_k))
-        (error "the GPU runs dense models' Q8_0, Q4_K and Q6_K matrices; ~A is ~A" (gmat-name w) (gmat-type w))))
+      (unless (member (gmat-type w) '(:q8_0 :q4_k :q5_k :q6_k))
+        (error "the GPU runs dense models' Q8_0, Q4_K, Q5_K and Q6_K matrices; ~A is ~A" (gmat-name w) (gmat-type w))))
     (let ((out (model-output m)))
-      (unless (member (gmat-type out) '(:q8_0 :q4_k :q6_k))
-        (error "the GPU runs dense models' Q8_0, Q4_K and Q6_K matrices; the output is ~A" (gmat-type out))))))
+      (unless (member (gmat-type out) '(:q8_0 :q4_k :q5_k :q6_k))
+        (error "the GPU runs dense models' Q8_0, Q4_K, Q5_K and Q6_K matrices; the output is ~A" (gmat-type out))))))
 
 ;;; --- per-context state ------------------------------------------------------------
 
@@ -122,7 +122,7 @@
 
 (defun mat-q8 (gm e w x y n)
   "Y = W X for N tokens (token t's X at t*cols, its Y at t*rows), W a GMAT
-   in Q8_0, Q4_K or Q6_K."
+   in Q8_0, Q4_K, Q5_K or Q6_K (or F32, a token at a time)."
   (let ((wb (cons (gmodel-file gm) (gmat-offset w))) (gpu (gmodel-gpu gm))
         (rows (gmat-rows w)) (cols (gmat-cols w)) (rbytes (gmat-row-bytes w)))
     (ecase (gmat-type w)
@@ -135,6 +135,16 @@
        (if (= n 1)
            (dispatch gpu e "dn_mv_q4_k" (list cols rows) (list wb x y) (ceiling rows 4) 64)
            (dispatch gpu e "d4_mm_q4_k" (list cols rows n rbytes cols rows) (list wb x y)
+                     (list (ceiling n 64) (ceiling rows 64) 1) 128 :shared 16384)))
+      ;; small matrices only: a token at a time
+      (:f32
+       (dotimes (tk n)
+         (dispatch gpu e "dn_mv_f32" (list cols rows)
+                   (list wb (cons x (* 4 tk cols)) (cons y (* 4 tk rows))) (ceiling rows 2) 64)))
+      (:q5_k
+       (if (= n 1)
+           (dispatch gpu e "dn_mv_q5_k" (list cols rows) (list wb x y) (ceiling rows 4) 64)
+           (dispatch gpu e "d4_mm_q5_k" (list cols rows n rbytes cols rows) (list wb x y)
                      (list (ceiling n 64) (ceiling rows 64) 1) 128 :shared 16384)))
       (:q6_k
        (if (= n 1)
