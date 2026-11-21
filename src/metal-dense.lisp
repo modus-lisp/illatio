@@ -125,7 +125,7 @@
 
 (defun mat-q8 (gm e w x y n)
   "Y = W X for N tokens (token t's X at t*cols, its Y at t*rows), W a GMAT
-   in Q8_0, Q4_0, Q4_1, Q4_K, Q5_K or Q6_K (or F32, a token at a time)."
+   in Q8_0, Q4_0, Q4_1, Q4_K, Q5_K, Q6_K or F32."
   (let ((wb (cons (gmodel-file gm) (gmat-offset w))) (gpu (gmodel-gpu gm))
         (rows (gmat-rows w)) (cols (gmat-cols w)) (rbytes (gmat-row-bytes w)))
     (ecase (gmat-type w)
@@ -149,11 +149,14 @@
            (dispatch gpu e "dn_mv_q4_1" (list cols rows) (list wb x y) (ceiling rows 4) 64)
            (dispatch gpu e "d4_mm_q4_1" (list cols rows n rbytes cols rows) (list wb x y)
                      (list (ceiling n 64) (ceiling rows 64) 1) 128 :shared 16384)))
-      ;; small matrices only: a token at a time
+      ;; small matrices only (qwen35's ssm_alpha and ssm_beta, in some files)
       (:f32
-       (dotimes (tk n)
-         (dispatch gpu e "dn_mv_f32" (list cols rows)
-                   (list wb (cons x (* 4 tk cols)) (cons y (* 4 tk rows))) (ceiling rows 2) 64)))
+       (if (or (= n 1) (/= 0 (mod cols 4)))
+           (dotimes (tk n)
+             (dispatch gpu e "dn_mv_f32" (list cols rows)
+                       (list wb (cons x (* 4 tk cols)) (cons y (* 4 tk rows))) (ceiling rows 2) 64))
+           (dispatch gpu e "q35_mv_f32_n" (list cols rows n) (list wb x y)
+                     (list (ceiling rows 4) (ceiling n 8)) 128)))
       (:q5_k
        (if (= n 1)
            (dispatch gpu e "dn_mv_q5_k" (list cols rows) (list wb x y) (ceiling rows 4) 64)

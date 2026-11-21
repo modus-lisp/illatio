@@ -22,7 +22,9 @@
   ;; qwen35 (qwen35.lisp): a layer is :FULL (gated attention) or :LINEAR
   ;; (gated delta net), and its FFN is normed by post_attention_norm
   (kind :full)
-  wqkv wz walpha wbeta ssm-a ssm-dt conv1d ssm-norm ssm-out)
+  wqkv wz walpha wbeta ssm-a ssm-dt conv1d ssm-norm ssm-out
+  ;; qwen35moe's FFN: router, routed experts, the shared expert and its gate
+  router gexps uexps dexps shgate shup shdown shinp)
 
 (defstruct (model (:constructor %make-model))
   gguf vocab arch name
@@ -45,6 +47,8 @@
   ;; heads x their dim, V heads x their dim
   (ssm-conv 0 :type fixnum) (ssm-k-heads 0 :type fixnum) (ssm-k-dim 0 :type fixnum)
   (ssm-v-heads 0 :type fixnum) (ssm-v-dim 0 :type fixnum)
+  ;; qwen35moe: experts in all, chosen a token (FFN is then an expert's width)
+  (n-expert 0 :type fixnum) (n-expert-used 0 :type fixnum)
   token-embd output-norm output
   (layers #() :type simple-vector)
   pool
@@ -75,8 +79,10 @@
     ;; qwen3vl: Qwen3-VL's text model is qwen3's.  Its M-RoPE turns a token's
     ;; frequencies by three positions, which for text are one and the same:
     ;; NEOX RoPE.  (Pictures, which would need the others, are not read.)
-    (unless (member arch '("qwen2" "qwen3" "qwen3vl" "qwen35" "llama") :test #'equal)
-      (error "architecture ~S is not supported (qwen2, qwen3, qwen3vl's text, qwen35 and llama are)" arch))
+    (unless (member arch '("qwen2" "qwen3" "qwen3vl" "qwen35" "qwen35moe" "llama") :test #'equal)
+      (error "architecture ~S is not supported (qwen2, qwen3, qwen3vl's text, qwen35, qwen35moe and llama are)" arch))
+    (when (and (equal arch "qwen35moe") (not *matrices-in-file*))
+      (error "~A: Qwen3.5 MoE (qwen35moe) runs on the GPU only so far (--gpu)" (file-namestring path)))
     (flet ((q8 (name) (load-qmat g name))
            (f32 (name) (load-f32 g name))
            (opt (name f) (and (gguf-tensor g name nil) (funcall f name))))
@@ -88,14 +94,16 @@
        ;; wide on a 2560 embedding), else the embedding split evenly
        :head-dim (or (arch-key g arch "attention.key_length") (floor d n-head))
        :q-dim (* n-head (or (arch-key g arch "attention.key_length") (floor d n-head)))
-       :ffn (arch-key g arch "feed_forward_length")
+       :ffn (or (arch-key g arch "feed_forward_length") (arch-key g arch "expert_feed_forward_length"))
+       :n-expert (or (arch-key g arch "expert_count") 0)
+       :n-expert-used (or (arch-key g arch "expert_used_count") 0)
        :n-vocab (length (vocab-pieces vocab))
        :context-length (arch-key g arch "context_length")
        :eps (coerce (arch-key g arch "attention.layer_norm_rms_epsilon") 'single-float)
        :rope-base (coerce (or (arch-key g arch "rope.freq_base") 10000) 'single-float)
        ;; llama.cpp's rope type per architecture: qwen2 rotates (i, i+d/2)
        ;; pairs (NEOX), llama rotates adjacent (2i, 2i+1) pairs.
-       :rope-neox (member arch '("qwen2" "qwen3" "qwen3vl" "qwen35") :test #'equal)
+       :rope-neox (member arch '("qwen2" "qwen3" "qwen3vl" "qwen35" "qwen35moe") :test #'equal)
        :rope-dims (or (arch-key g arch "rope.dimension_count")
                       (arch-key g arch "attention.key_length") (floor d n-head))
        :ssm-conv (or (arch-key g arch "ssm.conv_kernel") 0)
@@ -132,9 +140,19 @@
                                  :k-norm (opt (n "attn_k_norm.weight") #'f32)
                                  :ffn-norm (or (opt (n "ffn_norm.weight") #'f32)
                                                (f32 (n "post_attention_norm.weight")))
-                                 :wgate (q8 (n "ffn_gate.weight"))
-                                 :wup (q8 (n "ffn_up.weight"))
-                                 :wdown (q8 (n "ffn_down.weight")))))
+                                 :wgate (opt (n "ffn_gate.weight") #'q8)
+                                 :wup (opt (n "ffn_up.weight") #'q8)
+                                 :wdown (opt (n "ffn_down.weight") #'q8)
+                                 ;; qwen35moe: the router, the routed experts (one matrix
+                                 ;; each, the experts' rows one after another), the shared one
+                                 :router (opt (n "ffn_gate_inp.weight") #'q8)
+                                 :gexps (opt (n "ffn_gate_exps.weight") #'q8)
+                                 :uexps (opt (n "ffn_up_exps.weight") #'q8)
+                                 :dexps (opt (n "ffn_down_exps.weight") #'q8)
+                                 :shgate (opt (n "ffn_gate_shexp.weight") #'q8)
+                                 :shup (opt (n "ffn_up_shexp.weight") #'q8)
+                                 :shdown (opt (n "ffn_down_shexp.weight") #'q8)
+                                 :shinp (opt (n "ffn_gate_inp_shexp.weight") #'f32))))
                 'simple-vector)
        :pool (make-pool threads)))))
 

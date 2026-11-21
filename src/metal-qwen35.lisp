@@ -42,7 +42,7 @@
   (when (inkling2-path-p path)
     (return-from load-model-gpu (load-inkling2-model path (default-thread-count) :gpu t)))
   (let ((m (let ((*matrices-in-file* t)) (load-model path :threads 1))))
-    (cond ((equal (model-arch m) "qwen35")
+    (cond ((member (model-arch m) '("qwen35" "qwen35moe") :test #'equal)
            ;; the kernels' fixed shapes (src/metal/qwen35.metal)
            (assert (= (model-ssm-k-dim m) 128) () "q35_delta is written for 128-wide K heads")
            (assert (zerop (mod (model-ssm-v-dim m) 32)) () "q35_delta takes values 32 at a time")
@@ -50,8 +50,15 @@
            (assert (<= (floor (model-n-head m) (model-n-kv-head m)) 8) () "attend_split takes at most 8 query heads a KV head")
            ;; checked here, not when a command buffer is half encoded: an
            ;; error there leaves an encoder open, and Metal aborts the process
-           (unless (eq (gmat-type (model-token-embd m)) :q6_k)
-             (error "the GPU takes a qwen35 model's embeddings in Q6_K; they are ~A" (gmat-type (model-token-embd m))))
+           (unless (member (gmat-type (model-token-embd m)) '(:q6_k :q8_0))
+             (error "the GPU takes a qwen35 model's embeddings in Q6_K or Q8_0; they are ~A" (gmat-type (model-token-embd m))))
+           ;; qwen35moe: the routed experts' formats have expert kernels (qwen35moe.metal)
+           (loop for l across (model-layers m)
+                 when (layer-router l)
+                   do (loop for (w ok) in (list (list (layer-gexps l) '(:q4_k :q5_k :q6_k)) (list (layer-uexps l) '(:q4_k :q5_k :q6_k))
+                                                (list (layer-dexps l) '(:q4_k :q5_k :q6_k)) (list (layer-router l) '(:f32)))
+                            unless (member (gmat-type w) ok)
+                              do (error "the GPU runs qwen35moe's ~A in ~{~A~^, ~}; it is ~A" (gmat-name w) ok (gmat-type w))))
            (loop for l across (model-layers m)
                  do (dolist (w (list (layer-wqkv l) (layer-wz l) (layer-walpha l) (layer-wbeta l) (layer-ssm-out l)
                                      (layer-wq l) (layer-wk l) (layer-wv l) (layer-wo l)
@@ -82,11 +89,14 @@
 
 ;;; --- per-context state on the GPU ------------------------------------------------
 
+(defvar *q35-debug-layers* nil "Debugging: run only this many layers.")
+
 (defstruct (gctx (:constructor %make-gctx))
   x h qkv z alpha beta c o qg q gate k v att fa fb logits rope
   part ml                               ; decode's attention, split: chunks' outputs, their maxima and sums
   capture                               ; steering's capture: a row of D a layer and kind
-  kc vc conv ssm)                       ; per layer (NIL where the kind has none)
+  kc vc conv ssm                        ; per layer (NIL where the kind has none)
+  rl ids wts eg eu ye sh shg shu sg counts bases pos tok xg)    ; qwen35moe's FFN: router logits, the chosen experts, their outputs
 
 (defun gpu-zero (b)
   (sb-alien:alien-funcall
@@ -126,6 +136,11 @@
                             :part (fb (* (model-n-head m) (ceiling n-ctx *split-chunk*) (model-head-dim m)))
                             :ml (fb (* (model-n-head m) (ceiling n-ctx *split-chunk*) 2))
                             :capture (fb (* 2 (model-n-layer m) d))
+                            :rl (fb (* n (max 1 (model-n-expert m)))) :ids (fb (* n 8)) :wts (fb (* n 8))
+                            :eg (fb (* n 8 f)) :eu (fb (* n 8 f)) :ye (fb (* n 8 d))
+                            :sh (fb (* n d)) :shg (fb (* n f)) :shu (fb (* n f)) :sg (fb n)
+                            :counts (fb (max 1 (model-n-expert m))) :bases (fb (max 1 (model-n-expert m)))
+                            :pos (fb (* n 8)) :tok (fb (* n 8)) :xg (fb (* n 8 d))
                             ;; 32 positions of zeros past the end: ATTEND_FA reads keys 32 at a time
                             :kc (per-layer :full (* (+ n-ctx 32) kvd)) :vc (per-layer :full (* (+ n-ctx 32) kvd))
                             :conv (per-layer :linear (* ch (1- (model-ssm-conv m))))
@@ -202,10 +217,10 @@
     (with-gpu-work (e gpu)
       (let ((emb (model-token-embd m)))
         (loop for tok in tokens for tk from 0
-              do (dispatch gpu e "row_q6k" (list (gmat-cols emb) (gmat-row-bytes emb) tok)
+              do (dispatch gpu e (ecase (gmat-type emb) (:q6_k "row_q6k") (:q8_0 "dn_row_q8")) (list (gmat-cols emb) (gmat-row-bytes emb) tok)
                            (list (cons (gmodel-file gm) (gmat-offset emb)) (cons x (* 4 tk d)))
                            (ceiling d 256) 256)))
-      (loop for li below (model-n-layer m)
+      (loop for li below (or *q35-debug-layers* (model-n-layer m))
             for l = (svref (model-layers m) li)
             do (dispatch gpu e "rmsnorm" (list d eps 0) (list x (gm-layer gm li "attn_norm.weight") h) n 1024)
                (if (eq (layer-kind l) :linear)
@@ -266,10 +281,13 @@
                (dispatch gpu e "add" (list (* n d)) (list x h) (ceiling (* n d) 256) 256)
                (dispatch gpu e "rmsnorm" (list d eps 0)
                          (list x (gm-layer gm li "post_attention_norm.weight") h) n 1024)
-               (mat gm e (layer-wgate l) h (gctx-fa st) n)
-               (mat gm e (layer-wup l) h (gctx-fb st) n)
-               (dispatch gpu e "swiglu" (list (* n f)) (list (gctx-fa st) (gctx-fb st)) (ceiling (* n f) 256) 256)
-               (mat gm e (layer-wdown l) (gctx-fa st) h n)
+               (if (layer-router l)
+                   (q35-moe gm e st m l li h n)
+                   (progn
+                     (mat gm e (layer-wgate l) h (gctx-fa st) n)
+                     (mat gm e (layer-wup l) h (gctx-fb st) n)
+                     (dispatch gpu e "swiglu" (list (* n f)) (list (gctx-fa st) (gctx-fb st)) (ceiling (* n f) 256) 256)
+                     (mat gm e (layer-wdown l) (gctx-fa st) h n)))
                (when (steer-wants-p li :ffn) (q35-steer gpu e st h li :ffn n d))
                (dispatch gpu e "add" (list (* n d)) (list x h) (ceiling (* n d) 256) 256))
       (when logits
@@ -296,3 +314,90 @@
               (list y (if (zerop scale) y (cons (gpu-steer-dirs gpu) (* 4 li d)))
                     (cons (gctx-capture st) (* 4 d (+ (* 2 li) (if (eq kind :attn) 0 1)))))
               n 256)))
+
+;;; --- qwen35moe's FFN (kernels: qwen35moe.metal) -------------------------------------
+;;; llama.cpp's graph for it (src/models/qwen35moe.cpp): the router's softmax
+;;; over 256 experts, the 8 largest renormalized; each a SwiGLU
+;;; (silu(gate) up, then down); plus the shared expert's SwiGLU times
+;;; sigmoid(its gate . x).  A token's 8 experts are 8 pairs t*8+k.
+
+(defvar *q35-group-min* 16
+  "Passes of at least this many tokens run the routed experts as matrix
+   products grouped by expert (q35_group, q35_mm_id_*); shorter ones a
+   pair at a time (q35_xmv_*).")
+
+(defun q35-expert-offsets (gm w n-expert)
+  "Expert z's offset in W's tensor, for each z: a GPU buffer of u64s (made once)."
+  (let ((key (list :q35-offs (gmat-name w))))
+    (or (gethash key (gmodel-offsets gm))
+        (setf (gethash key (gmodel-offsets gm))
+              (let* ((b (gpu-buffer (gmodel-gpu gm) (* 8 n-expert)))
+                     (stride (* (floor (gmat-rows w) n-expert) (gmat-row-bytes w))))
+                (dotimes (z n-expert b)
+                  (setf (sb-sys:sap-ref-64 (gbuf-sap b) (* 8 z)) (* z stride))))))))
+
+(defun q35-xmv (gm e st w x x-pair x-stride y npairs n-expert)
+  "Y's pair rows = the chosen experts' W (one tensor, the experts' matrices
+   in order) times X's row for each pair (its token's, or with X-PAIR its own)."
+  (let* ((gpu (gmodel-gpu gm)) (wb (cons (gmodel-file gm) (gmat-offset w)))
+         (rows (floor (gmat-rows w) n-expert)) (cols (gmat-cols w)) (xp (if x-pair 1 0))
+         (rb (gmat-row-bytes w)))
+    (multiple-value-bind (kernel args)
+        (ecase (gmat-type w)
+          (:q4_k (values "q35_xmv_q4_k" (list cols rows x-stride rows xp)))
+          (:q5_k (values "q35_xmv_q5_k" (list cols rows x-stride rows xp)))
+          (:q6_k (values "q35_xmv_q6k" (list cols rows rb x-stride rows xp))))
+      (dispatch gpu e kernel args (list wb x y (gctx-ids st)) (list (ceiling rows 4) npairs) 64))))
+
+(defun q35-mm-id (gm e st w x y n n-expert)
+  "Y's grouped rows = each expert's W times its grouped rows of X (each
+   expert at most N rows: a token picks an expert once)."
+  (let* ((rows (floor (gmat-rows w) n-expert)) (cols (gmat-cols w)))
+    (dispatch (gmodel-gpu gm) e
+              (format nil (if *q35-tile-32* "q35_mm_id32_~A" "q35_mm_id_~A")
+                      (ecase (gmat-type w) (:q4_k "q4_k") (:q5_k "q5_k") (:q6_k "q6_k")))
+              (list cols rows (gmat-row-bytes w) cols rows 0)
+              (list (cons (gmodel-file gm) (gmat-offset w)) (q35-expert-offsets gm w n-expert)
+                    (gctx-counts st) (gctx-bases st) x y)
+              (list (ceiling n (if *q35-tile-32* 32 64)) (ceiling rows 64) n-expert) 128
+              :shared (if *q35-tile-32* 8192 16384))))
+
+(defvar *q35-tile-32* t
+  "Whether the grouped experts run in 32-pair tiles (else d4_mm_id's 64).")
+
+(defun q35-moe (gm e st m l li h n)
+  "H (N rows, normed) through layer L's routed and shared experts, into H."
+  (let* ((gpu (gmodel-gpu gm)) (d (model-d m)) (f (model-ffn m)) (ne (model-n-expert m))
+         (np (* 8 n)) (grouped (>= n *q35-group-min*)))
+    ;; the router
+    (dispatch gpu e "q35_mv_f32_n" (list d ne n) (list (cons (gmodel-file gm) (gmat-offset (layer-router l))) h (gctx-rl st))
+              (list (ceiling ne 4) (ceiling n 8)) 128)
+    (dispatch gpu e "q35_route" (list ne) (list (gctx-rl st) (gctx-ids st) (gctx-wts st)) n 32)
+    (when grouped
+      (dispatch gpu e "q35_group" (list np ne)
+                (list (gctx-ids st) (gctx-counts st) (gctx-bases st) (gctx-pos st) (gctx-tok st)) 1 (* 32 (ceiling ne 32)))
+      (dispatch gpu e "d4_gather_rows" (list d np) (list h (gctx-tok st) (gctx-xg st)) (ceiling (* np d) 256) 256))
+    ;; the routed experts and the shared one, side by side
+    (together (e)
+      (cond (grouped
+             (q35-mm-id gm e st (layer-gexps l) (gctx-xg st) (gctx-eg st) n ne)
+             (q35-mm-id gm e st (layer-uexps l) (gctx-xg st) (gctx-eu st) n ne))
+            (t
+             (q35-xmv gm e st (layer-gexps l) h nil d (gctx-eg st) np ne)
+             (q35-xmv gm e st (layer-uexps l) h nil d (gctx-eu st) np ne)))
+      (mat gm e (layer-shgate l) h (gctx-shg st) n)
+      (mat gm e (layer-shup l) h (gctx-shu st) n)
+      (dispatch gpu e "q35_dot" (list d) (list (gm-layer gm li "ffn_gate_inp_shexp.weight") h (gctx-sg st)) n 256))
+    (together (e)
+      (dispatch gpu e "swiglu" (list (* np f)) (list (gctx-eg st) (gctx-eu st)) (ceiling (* np f) 256) 256)
+      (dispatch gpu e "swiglu" (list (* n f)) (list (gctx-shg st) (gctx-shu st)) (ceiling (* n f) 256) 256))
+    (together (e)
+      (if grouped
+          (q35-mm-id gm e st (layer-dexps l) (gctx-eg st) (gctx-ye st) n ne)
+          (q35-xmv gm e st (layer-dexps l) (gctx-eg st) t f (gctx-ye st) np ne))
+      (mat gm e (layer-shdown l) (gctx-shg st) (gctx-sh st) n))
+    (if grouped
+        (dispatch gpu e "q35_moe_combine_g" (list d n) (list (gctx-ye st) (gctx-wts st) (gctx-sh st) (gctx-sg st) h (gctx-pos st))
+                  (list (ceiling d 256) n) 256)
+        (dispatch gpu e "q35_moe_combine" (list d n) (list (gctx-ye st) (gctx-wts st) (gctx-sh st) (gctx-sg st) h)
+                  (list (ceiling d 256) n) 256))))

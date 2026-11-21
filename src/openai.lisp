@@ -706,7 +706,7 @@
           ;; Qwen model gets Qwen3's ChatML, which is what llama-server falls
           ;; back to (ChatML) with Qwen3's <think> handling of the history
           ((and (string= template "")
-                (member (model-arch model) '("qwen2" "qwen3" "qwen35") :test #'equal))
+                (member (model-arch model) '("qwen2" "qwen3" "qwen35" "qwen35moe") :test #'equal))
            (unless (getf (model-notes model) :template-warned)
              (setf (getf (model-notes model) :template-warned) t)
              (format *error-output* "~&illatio: ~A has no chat template; using Qwen3's ChatML~%"
