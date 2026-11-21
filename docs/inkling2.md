@@ -1,4 +1,7 @@
-# Inkling 2 Mini, from its documentation
+# Inkling 2 Mini, from its documentation (and then its reference)
+
+The log. For what the from-scratch port reached, where it stalled and why,
+see docs/inkling2-from-scratch.md.
 
 Inkling 2 Mini (Thinking Machines, 2026-11-20, Apache 2.0) is ported here
 from what was published, with no reference implementation read: not
@@ -233,3 +236,65 @@ Swept against these numbers (GPU knobs, *INK2-VARIANT*):
 
 The remaining candidates are the long-range ones: the relative bias's
 reading, the log scaling, the global layers.
+
+## Then the reference (Transformers 5.24's modeling_inkling2_loop.py)
+
+The black-box search stalled about 19% above llama.cpp's perplexity. Asked
+whether to keep going, the user allowed a reference. Hugging Face's
+modeling code (Apache 2.0) settled every open reading. What the
+documentation-only port had wrong:
+
+| reading | documentation-only | the reference |
+|---|---|---|
+| short convs (K/V, the sublayers' outputs) | x + conv(x) | (x + conv(x)) / sqrt(5) for the static ones, / 3 for the dynamic ones: never in any doc |
+| the dynamic convs' taps | static_w[k] oldest first | tap k = the token k back (static_w[0] the current one), static + per-head part |
+| K | RMS-normed | cut to L2 norm 22.6 (no scale) |
+| Q and r | clipped, then scaled | scaled, then clipped; in the global layers then times 1 + 0.1 log(max((pos+1)/8192, 1)) |
+| the experts' SwiGLU | silu(4 tanh(g/4)) 25 tanh(u/25) | 4 tanh(g/4) sigmoid(g) 25 tanh(u/25): the sigmoid sees the raw gate |
+| a block's first attention read | the empty running sum a source | the just-completed block is the "partial" source (no empty one) |
+
+Everything else the documentation, the shapes and the perplexity sweeps
+had found stands, and the reference confirms it:
+
+- the depth-wise reads and the cross-loop gates (Goodfire's equations);
+- the message queries' rows;
+- the interleaved w13 rows (Transformers de-interleaves them on load);
+- the sigmoid router with its bias for choosing only;
+- the sinks and the gate;
+- the relative bias (zero beyond its extent);
+- the embedding norm.
+
+The fitted logit scale (0.14) and the 1 + 0.1 ln n guess were compensating
+for the clip order and the unscaled conv residuals. Both are gone.
+
+**After the fixes**, against llama.cpp (llama-perplexity's protocol, the
+same 9586 tokens):
+
+| chunk | llama.cpp | illatio |
+|---|---|---|
+| 32 | 20.01 | 19.99 |
+| 128 | 9.17 | 9.17 |
+| 512 (all 18 chunks) | 6.2859 ± 0.236 | 6.2974 |
+
+**The answer to "how hard without a reference".** The published equations
+(Goodfire's above all), the config names and the tensor shapes got the
+architecture, the tokenizer, the chat format and every structural choice
+right. About six numeric details were never published: a conv residual's
+scale, a tap order, a clip order, an activation's form, K's norm. They
+were left at about 19% worse perplexity. Black-box sweeps found two of
+them; a fitted constant hid two more. The reference resolved the rest in
+one read.
+
+### Projections in Q4_0, for speed (*INK2-QUANT*, *INK2-HEAD-QUANT*)
+
+| projections / head | PPL (c=512, 4 chunks) | pp512 | tg128 | pp512 @ 4096 | tg128 @ 4096 |
+|---|---|---|---|---|---|
+| Q8_0 / Q8_0 (default) | 5.94 | 158.5 | 27.1 | 113.9 | 21.1 |
+| Q4_0 / Q8_0 | 6.03 | 157.9 | 29.2 | 109.6 | 23.1 |
+| Q4_0 / Q4_0 | 6.05 | 160.2 | 32.2 | 92.3 | 22.4 |
+
+These were measured back to back, warm: a cool run of the default config
+gave tg128 31.5. Little is gained, because decode is not bound by the
+projections' bytes: the matrix-vector kernels (Q8_0 33%, NVFP4 31% of GPU
+time) reach about 100 GB/s of the M4 Pro's 273. Those kernels are the
+lever for speed.

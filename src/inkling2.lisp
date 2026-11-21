@@ -307,11 +307,18 @@
 
 (defun ink-sigmoid (x) (/ 1f0 (+ 1f0 (exp (- x)))))
 
-(defun ink-l2clip! (v o n thr scale so)
-  "V[o..o+n) scaled to norm at most THR, then times SCALE[so..]."
+(defun ink-l2clip! (v o n thr &optional scale (so 0) (log 1f0))
+  "V[o..o+n) times SCALE[so..] (when SCALE), cut to L2 norm THR if longer,
+   then times LOG (the global layers' log scale)."
+  (when scale (dotimes (i n) (setf (aref v (+ o i)) (* (aref v (+ o i)) (aref scale (+ so i))))))
   (let* ((nn (sqrt (loop for i below n sum (* (aref v (+ o i)) (aref v (+ o i))))))
-         (k (if (> nn thr) (/ thr nn) 1f0)))
-    (dotimes (i n v) (setf (aref v (+ o i)) (* (aref v (+ o i)) k (aref scale (+ so i)))))))
+         (k (* log (min 1f0 (/ thr (+ nn 1f-6))))))
+    (dotimes (i n v) (setf (aref v (+ o i)) (* (aref v (+ o i)) k)))))
+
+(defun ink-log-scale (pos)
+  "The global layers' query and relative-state scale at POS: 1 + 0.1
+   log(max((pos+1)/8192, 1))."
+  (+ 1f0 (* 0.1f0 (log (max (/ (1+ pos) 8192f0) 1f0)))))
 
 ;;; --- per-context state -------------------------------------------------------------
 ;;; One application per (layer, pass): 6 + 12x3 + 6 = 48.  Each keeps its K
@@ -349,18 +356,23 @@
   (cond ((< l 6) l) ((< l 18) (+ 6 (* 12 (1- pass)) (- l 6))) (t (+ 6 (* 12 (ink2-passes m)) (- l 18)))))
 
 (defun ink-conv-res! (hist w x n &key dyn)
-  "x + the causal depthwise conv of X (width 4, taps oldest first) over
-   HIST (the last 3 inputs) and X; HIST shifts.  W: N x 4 taps, or with DYN
-   (global K/V) (static 4xN . per-head part (8x4)), the taps static + dyn."
+  "The short conv of X over HIST (the last 3 inputs, oldest first) and X,
+   residual and rescaled; HIST shifts.  Static (W N x 4, oldest first, as
+   PyTorch's causal depthwise conv): (x + conv) / sqrt(5).  With DYN (global
+   K/V: W is (static 4 x N . proj), DYN the token's per-head part 8 x 4): tap
+   k weights the token k back, static[k] + dyn; (x + conv) / 3."
   (let ((y (f32vec n)))
     (dotimes (c n)
-      (flet ((tap (k) (if dyn
-                          (+ (aref (car w) (+ (* k n) c)) (aref dyn (+ (* 4 (floor c +ink-hd+)) k)))
-                          (aref w (+ (* c 4) k)))))
+      (let ((xs (vector (aref hist c) (aref hist (+ n c)) (aref hist (+ (* 2 n) c)) (aref x c))))
         (setf (aref y c)
-              (+ (aref x c)
-                 (* (tap 0) (aref hist c)) (* (tap 1) (aref hist (+ n c))) (* (tap 2) (aref hist (+ (* 2 n) c)))
-                 (* (tap 3) (aref x c))))))
+              (if dyn
+                  (/ (+ (aref x c)
+                        (loop for lag below 4
+                              sum (* (+ (aref (car w) (+ (* lag n) c)) (aref dyn (+ (* 4 (floor c +ink-hd+)) lag)))
+                                     (svref xs (- 3 lag)))))
+                     3f0)
+                  (/ (+ (aref x c) (loop for k below 4 sum (* (aref w (+ (* c 4) k)) (svref xs k))))
+                     (sqrt 5f0))))))
     (replace hist hist :start1 0 :start2 n)
     (replace hist x :start1 (* 2 n))
     y))
@@ -406,13 +418,16 @@
          (cap (ink2-app-cap app)) (slot (mod pos cap))
          (kc (ink2-app-k app)) (vc (ink2-app-v app))
          (o (f32vec 3072)))
-    ;; K and V each normed per head (V without a gain; K the same)
+    ;; K cut to the clip threshold per head, V RMS-normed per head (no gain)
     (dotimes (h +ink-kv-heads+)
-      (ink-rms k nil 1f-6 (* h 128) 128 kc (+ (* slot 1024) (* h 128)))
+      (ink-l2clip! k (* h 128) 128 (ink2-qk-clip m))
+      (replace kc k :start1 (+ (* slot 1024) (* h 128)) :start2 (* h 128) :end2 (* (1+ h) 128))
       (ink-rms v nil 1f-6 (* h 128) 128 vc (+ (* slot 1024) (* h 128))))
-    (dotimes (h +ink-heads+)
-      (ink-l2clip! q (* h 128) 128 (ink2-qk-clip m) (ink2-layer-q-clip ly) (* h 128))
-      (ink-l2clip! r (* h 16) 16 (ink2-rel-clip m) (ink2-layer-rel-clip ly) (* h 16)))
+    ;; Q and r scaled, then clipped (and in a global layer log-scaled)
+    (let ((ls (if local 1f0 (ink-log-scale pos))))
+      (dotimes (h +ink-heads+)
+        (ink-l2clip! q (* h 128) 128 (ink2-qk-clip m) (ink2-layer-q-clip ly) (* h 128) ls)
+        (ink-l2clip! r (* h 16) 16 (ink2-rel-clip m) (ink2-layer-rel-clip ly) (* h 16) ls)))
     (let* ((first (if local (max 0 (- pos (1- +ink-window+))) 0))
            (n (1+ (- pos first)))
            (p (ink2-layer-rel-p ly))
@@ -445,7 +460,7 @@
          (order (sort (loop for e below 128 collect e) #'>
                       :key (lambda (e) (+ (nth e sc) (aref (ink2-layer-router-bias ly) e)))))
          (sel (subseq order 0 8))
-         (tot (reduce #'+ sel :key (lambda (e) (nth e sc))))
+         (tot (+ 1f-20 (reduce #'+ sel :key (lambda (e) (nth e sc)))))
          (out (f32vec +ink-d+))
          (bytes (stfile-bytes (ink2-st m)))
          (h (f32vec (* 2 +ink-ffn+))) (a (f32vec +ink-ffn+)) (y (f32vec +ink-d+)))
@@ -453,11 +468,11 @@
       (let ((w (* (/ (nth e sc) tot) (ink2-route-scale m))))
         (parallel-for (rr (* 2 +ink-ffn+) pool)
           (setf (aref h rr) (ink2-expert-row (ink2-layer-w13 ly) bytes e rr x)))
-        ;; gate on the even rows, up on the odd; both softcapped
+        ;; gate on the even rows, up on the odd: 4 tanh(g/4) sigmoid(g) 25 tanh(u/25)
+        ;; (the sigmoid sees the raw gate; the softcaps bound its linear factor and up)
         (dotimes (i +ink-ffn+)
-          (let* ((g (* 4f0 (tanh (/ (aref h (* 2 i)) 4f0))))
-                 (u (* 25f0 (tanh (/ (aref h (1+ (* 2 i))) 25f0)))))
-            (setf (aref a i) (* (/ g (+ 1f0 (exp (- g)))) u))))
+          (let ((g (aref h (* 2 i))) (u (aref h (1+ (* 2 i)))))
+            (setf (aref a i) (* 4f0 (tanh (/ g 4f0)) (/ 1f0 (+ 1f0 (exp (- g)))) 25f0 (tanh (/ u 25f0))))))
         (parallel-for (rr +ink-d+ pool)
           (setf (aref y rr) (ink2-expert-row (ink2-layer-w2 ly) bytes e rr a)))
         (dotimes (i +ink-d+) (incf (aref out i) (* w (aref y i))))))))

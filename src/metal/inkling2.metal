@@ -121,35 +121,6 @@ static float ink_tg_max(float v, threadgroup float * red, ushort tid, ushort nth
     return t;
 }
 
-struct ink_depth_args { uint d; uint n; uint s[8]; float eps; };
-
-// x = sum_j softmax_j(q . vhat_j / sqrt d) vhat_j, vhat = v / RMS(v), over
-// the N stack slots S (Goodfire's depth-wise read).  One threadgroup of 1024.
-kernel void ink_depth(constant ink_depth_args & a [[buffer(0)]], device const float * stack [[buffer(1)]],
-                      device const float * q [[buffer(2)]], device float * out [[buffer(3)]],
-                      threadgroup float * red [[threadgroup(0)]],
-                      ushort tid [[thread_index_in_threadgroup]]) {
-    float inv[8], lg[8];
-    for (uint j = 0; j < a.n; ++j) {
-        device const float * v = stack + a.s[j] * a.d;
-        float ss = 0.f, qd = 0.f;
-        for (uint i = tid; i < a.d; i += 1024) { const float x = v[i]; ss += x * x; qd += q[i] * x; }
-        ss = ink_tg_sum(ss, red, tid, 1024);
-        qd = ink_tg_sum(qd, red, tid, 1024);
-        inv[j] = 1.f / sqrt(ss / a.d + a.eps);
-        lg[j] = qd * inv[j] / sqrt(float(a.d));
-    }
-    float m = lg[0];
-    for (uint j = 1; j < a.n; ++j) m = max(m, lg[j]);
-    float z = 0.f;
-    for (uint j = 0; j < a.n; ++j) { lg[j] = exp(lg[j] - m); z += lg[j]; }
-    for (uint i = tid; i < a.d; i += 1024) {
-        float x = 0.f;
-        for (uint j = 0; j < a.n; ++j) x += lg[j] / z * inv[j] * stack[a.s[j] * a.d + i];
-        out[i] = x;
-    }
-}
-
 struct ink_rms_args { uint n; uint gain; float eps; };
 
 // OUT = X / RMS(X), times GAIN (BF16) when a.gain.  One threadgroup of 1024
@@ -178,96 +149,29 @@ kernel void ink_mix(constant ink_n_args & a [[buffer(0)]], device const float * 
     out[i] = (1.f - precise::tanh(fz[i])) * x[i] + precise::tanh(gz[i]) * m[i];
 }
 
-struct ink_conv_args { uint n; uint dyn; };
+struct ink_clip_args { uint hd; float thr; uint pos; uint log_scale; float alpha; float floor_n; };
 
-// Y = X + the causal depthwise conv (width 4, taps oldest first) of the last
-// three inputs (HIST) and X, then HIST shifts.  Taps: N x 4 BF16 (static),
-// or with DYN static 4 x N (BF16) plus a per-head part DV (8 heads x 4).
-kernel void ink_conv(constant ink_conv_args & a [[buffer(0)]], device float * hist [[buffer(1)]],
-                     device const float * x [[buffer(2)]], device const ushort * w [[buffer(3)]],
-                     device const float * dv [[buffer(4)]], device float * y [[buffer(5)]],
-                     uint c [[thread_position_in_grid]]) {
-    if (c >= a.n) return;
-    float t[4];
-    for (short k = 0; k < 4; ++k)
-        t[k] = a.dyn ? ink_bf(w[k * a.n + c]) + dv[(c / 128) * 4 + k] : ink_bf(w[c * 4 + k]);
-    const float x0 = hist[c], x1 = hist[a.n + c], x2 = hist[2 * a.n + c], x3 = x[c];
-    y[c] = x3 + t[0] * x0 + t[1] * x1 + t[2] * x2 + t[3] * x3;
-    hist[c] = x1; hist[a.n + c] = x2; hist[2 * a.n + c] = x3;
-}
-
-struct ink_clip_args { uint hd; float thr; uint heads; uint mode; };
-
-// Each head of V (HD wide) scaled to L2 norm at most THR, then times SCALE
-// (BF16, heads x HD).  One threadgroup a head, threads HD.
+// Each head of V (HD wide, 24 heads a token, tokens from POS) times SCALE
+// (BF16, 24 x HD), then cut to L2 norm THR if longer; with LOG_SCALE (the
+// global layers) times 1 + alpha log(max((pos+1)/floor, 1)).  One
+// threadgroup a (token, head), threads HD.
 kernel void ink_clip(constant ink_clip_args & a [[buffer(0)]], device float * v [[buffer(1)]],
                      device const ushort * scale [[buffer(2)]], threadgroup float * red [[threadgroup(0)]],
                      uint h [[threadgroup_position_in_grid]], ushort tid [[thread_index_in_threadgroup]],
                      ushort nt [[threads_per_threadgroup]]) {
     const uint i = h * a.hd + tid;
-    const float x = v[i];
+    const float x = v[i] * ink_bf(scale[(h % 24) * a.hd + tid]);
     const float n = sqrt(ink_tg_sum(x * x, red, tid, nt));
-    // mode 0: clipped to THR, then scaled; 1: RMS-normed, then scaled; 2: only scaled
-    const float sc = ink_bf(scale[(h % a.heads) * a.hd + tid]);
-    if (a.mode == 3) {                              // scaled, then clipped
-        const float n2 = sqrt(ink_tg_sum(x * sc * x * sc, red, tid, nt));
-        v[i] = x * sc * (n2 > a.thr ? a.thr / n2 : 1.f);
-        return;
-    }
-    const float k = a.mode == 0 ? (n > a.thr ? a.thr / n : 1.f) : a.mode == 1 ? sqrt(float(a.hd)) / max(n, 1e-12f) : 1.f;
-    v[i] = x * k * sc;
+    float k = min(1.f, a.thr / (n + 1e-6f));
+    if (a.log_scale) k *= 1.f + a.alpha * log(max(float(a.pos + h / 24 + 1) / a.floor_n, 1.f));
+    v[i] = x * k;
 }
 
-struct ink_attn_args { uint pos; uint first; uint cap; float scale; uint extent; uint ctx; };
-
-// One token's attention, a threadgroup a query head (24): logits over the
-// cached positions FIRST..POS (a ring of CAP slots) plus the relative bias
-// r_h . P[:, pos - j] within EXTENT, and a zero-value sink with logit
-// SINK[h]; softmax; the weighted V.  SCRATCH: 24 x CTX floats.
-kernel void ink_attend(constant ink_attn_args & a [[buffer(0)]], device const float * q [[buffer(1)]],
-                       device const float * r [[buffer(2)]], device const float * sink [[buffer(3)]],
-                       device const float * kc [[buffer(4)]], device const float * vc [[buffer(5)]],
-                       device const ushort * P [[buffer(6)]], device float * lg [[buffer(7)]],
-                       device float * out [[buffer(8)]], threadgroup float * red [[threadgroup(0)]],
-                       uint h [[threadgroup_position_in_grid]], ushort tid [[thread_index_in_threadgroup]]) {
-    const uint g = h / 3, n = a.pos - a.first + 1;
-    device float * l = lg + h * a.ctx;
-    device const float4 * q4 = (device const float4 *)(q + h * 128);
-    float rr[16];
-    for (short i = 0; i < 16; ++i) rr[i] = r[h * 16 + i];
-    float mx = sink[h];
-    for (uint jj = tid; jj < n; jj += 256) {
-        const uint j = a.first + jj, slot = j % a.cap, dist = a.pos - j;
-        device const float4 * k4 = (device const float4 *)(kc + slot * 1024 + g * 128);
-        float d = 0.f;
-        for (short i = 0; i < 32; ++i) d += dot(q4[i], k4[i]);
-        float b = 0.f;
-        if (dist < a.extent) for (short i = 0; i < 16; ++i) b += rr[i] * ink_bf(P[i * a.extent + dist]);
-        const float x = d * a.scale + b;
-        l[jj] = x; mx = max(mx, x);
-    }
-    mx = ink_tg_max(mx, red, tid, 256);
-    float z = 0.f;
-    for (uint jj = tid; jj < n; jj += 256) { const float e = exp(l[jj] - mx); l[jj] = e; z += e; }
-    z = ink_tg_sum(z, red, tid, 256) + exp(sink[h] - mx);
-    threadgroup_barrier(mem_flags::mem_device);
-    // the weighted V: thread = (dim, half of the positions)
-    const uint dim = tid % 128, half_ = tid / 128;
-    float acc = 0.f;
-    for (uint jj = half_; jj < n; jj += 2) acc += l[jj] * vc[((a.first + jj) % a.cap) * 1024 + g * 128 + dim];
-    red[32 + tid] = acc;
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    if (tid < 128) out[h * 128 + dim] = (red[32 + tid] + red[32 + 128 + tid]) / z;
-}
-
-struct ink_gate_args { uint n; uint mode; };
-
-// O *= sigmoid(G) (mode 1: 2 sigmoid(G); 2: G sigmoid(G))
-kernel void ink_gate(constant ink_gate_args & a [[buffer(0)]], device float * o [[buffer(1)]],
+// O *= sigmoid(G)
+kernel void ink_gate(constant ink_n_args & a [[buffer(0)]], device float * o [[buffer(1)]],
                      device const float * g [[buffer(2)]], uint i [[thread_position_in_grid]]) {
     if (i >= a.n) return;
-    const float s = 1.f / (1.f + exp(-g[i]));
-    o[i] = o[i] * (a.mode == 0 ? s : a.mode == 1 ? 2.f * s : g[i] * s);
+    o[i] = o[i] / (1.f + exp(-g[i]));
 }
 
 // Y += X
@@ -275,59 +179,6 @@ kernel void ink_add(constant ink_n_args & a [[buffer(0)]], device float * y [[bu
                     device const float * x [[buffer(2)]], uint i [[thread_position_in_grid]]) {
     if (i >= a.n) return;
     y[i] += x[i];
-}
-
-struct ink_route_args { float scale; };
-
-// The router's choice: sigmoid scores, the 8 best by score + bias, their
-// scores normalized to sum 1 and times SCALE.  One threadgroup of 128.
-kernel void ink_route(constant ink_route_args & a [[buffer(0)]], device const float * logits [[buffer(1)]],
-                      device const float * bias [[buffer(2)]], device uint * ids [[buffer(3)]],
-                      device float * wts [[buffer(4)]], threadgroup float * red [[threadgroup(0)]],
-                      ushort tid [[thread_index_in_threadgroup]]) {
-    threadgroup float key[128];
-    threadgroup float scv[128];
-    const float s = 1.f / (1.f + exp(-logits[tid]));
-    scv[tid] = s; key[tid] = s + bias[tid];
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    if (tid == 0) {
-        float tot = 0.f; uint pick[8];
-        for (short k = 0; k < 8; ++k) {
-            uint best = 0; float bv = -INFINITY;
-            for (uint e = 0; e < 128; ++e) if (key[e] > bv) { bv = key[e]; best = e; }
-            pick[k] = best; key[best] = -INFINITY; tot += scv[best];
-        }
-        for (short k = 0; k < 8; ++k) { ids[k] = pick[k]; wts[k] = scv[pick[k]] / tot * a.scale; }
-    }
-}
-
-// The experts' activation: A[k][i] = silu(4 tanh(g/4)) * 25 tanh(u/25),
-// g = H[k][2i], u = H[k][2i+1].  grid 8 x FFN.
-kernel void ink_act(constant ink_n_args & a [[buffer(0)]], device const float * h [[buffer(1)]],
-                    device float * out [[buffer(2)]], uint i [[thread_position_in_grid]]) {
-    if (i >= 8 * a.n) return;
-    const uint k = i / a.n, j = i % a.n;
-    const float g = 4.f * precise::tanh(h[k * 2 * a.n + 2 * j] / 4.f);
-    const float u = 25.f * precise::tanh(h[k * 2 * a.n + 2 * j + 1] / 25.f);
-    out[i] = g / (1.f + exp(-g)) * u;
-}
-
-// OUT = sum_k W[k] Y[k]
-kernel void ink_combine(constant ink_n_args & a [[buffer(0)]], device const float * y [[buffer(1)]],
-                        device const float * w [[buffer(2)]], device float * out [[buffer(3)]],
-                        uint i [[thread_position_in_grid]]) {
-    if (i >= a.n) return;
-    float s = 0.f;
-    for (short k = 0; k < 8; ++k) s += w[k] * y[k * a.n + i];
-    out[i] = s;
-}
-
-struct ink_embed_args { uint d; uint token; };
-
-kernel void ink_embed(constant ink_embed_args & a [[buffer(0)]], device const ushort * e [[buffer(1)]],
-                      device float * out [[buffer(2)]], uint i [[thread_position_in_grid]]) {
-    if (i >= a.d) return;
-    out[i] = ink_bf(e[(ulong)a.token * a.d + i]);
 }
 
 struct ink_cap_args { uint n; float cap; };
@@ -356,7 +207,7 @@ kernel void ink_zero(constant ink_n_args & a [[buffer(0)]], device float * y [[b
 // The same steps for N tokens at once: a token's vectors are N apart (or a
 // slot's N x D block in the stack), weights read once per chunk where it pays.
 
-struct ink_depthn_args { uint d; uint n; uint s[8]; float eps; uint ntok; float temp; };
+struct ink_depthn_args { uint d; uint n; uint s[8]; float eps; uint ntok; };
 
 // INK_DEPTH for token TG of N: slot k's row t at (k * ntok + t) * d.
 kernel void ink_depth_n(constant ink_depthn_args & a [[buffer(0)]], device const float * stack [[buffer(1)]],
@@ -371,7 +222,7 @@ kernel void ink_depth_n(constant ink_depthn_args & a [[buffer(0)]], device const
         ss = ink_tg_sum(ss, red, tid, 1024);
         qd = ink_tg_sum(qd, red, tid, 1024);
         inv[j] = 1.f / sqrt(ss / a.d + a.eps);
-        lg[j] = qd * inv[j] * a.temp;
+        lg[j] = qd * inv[j] / sqrt(float(a.d));
     }
     float m = lg[0];
     for (uint j = 1; j < a.n; ++j) m = max(m, lg[j]);
@@ -408,31 +259,33 @@ kernel void ink_mv_bf16_n(constant ink_mvn_args & a [[buffer(0)]], device const 
     }
 }
 
-struct ink_convn_args { uint n; uint dyn; uint ntok; uint plain; };
+struct ink_convn_args { uint n; uint dyn; uint ntok; };
 
-// INK_CONV for N tokens: token t's window is the chunk's own earlier rows,
-// then HIST's.  HIST is left alone (INK_HIST_N moves it on after).
+// The short conv of N tokens' rows, residual and rescaled.  Static (local
+// K/V, the sublayers' outputs): PyTorch's causal depthwise conv, taps W
+// (N x 4 BF16) oldest first; y = (x + conv) / sqrt(5).  DYN (global K/V):
+// tap k weights the token k back, static_w[k] (4 x N BF16) plus the
+// token's per-head part DV (8 heads x 4); y = (x + conv) / 3.  A token's
+// window is the chunk's own earlier rows, then HIST's (INK_HIST_N moves
+// HIST on after).
 kernel void ink_conv_n(constant ink_convn_args & a [[buffer(0)]], device const float * hist [[buffer(1)]],
                        device const float * x [[buffer(2)]], device const ushort * w [[buffer(3)]],
                        device const float * dv [[buffer(4)]], device float * y [[buffer(5)]],
                        uint2 gid [[thread_position_in_grid]]) {
     const uint c = gid.x, t = gid.y;
     if (c >= a.n || t >= a.ntok) return;
-    float xs[4];
+    float xs[4];                                         // oldest first; xs[3] the token itself
     for (int k = 0; k < 4; ++k) {
-        const int src = int(t) - 3 + k;                  // the chunk row, or HIST's (3 + src)
+        const int src = int(t) - 3 + k;
         xs[k] = src >= 0 ? x[(ulong)src * a.n + c] : hist[(3 + src) * a.n + c];
     }
-    float s = a.plain ? 0.f : xs[3];
-    for (short k = 0; k < 4; ++k) {
-        const float sw = a.dyn ? ink_bf(w[k * a.n + c]) : 0.f;
-        const float dw = a.dyn == 0 ? 0.f : a.dyn >= 5 ? dv[(ulong)t * 32 + k * 8 + c / 128] : dv[(ulong)t * 32 + (c / 128) * 4 + k];
-        // dyn 1: static + per-token; 2: per-token only; 3: static only; 4: static x (1 + per-token)
-        const float tap = a.dyn == 0 ? ink_bf(w[c * 4 + k]) : (a.dyn == 1 || a.dyn == 5) ? sw + dw : a.dyn == 2 ? dw : a.dyn == 3 ? sw
-                        : a.dyn == 6 ? sw * (1.f + dw) : a.dyn == 7 ? sw * dw : sw * (1.f + dw);
-        s += tap * xs[k];
-    }
-    y[(ulong)t * a.n + c] = s;
+    float s = 0.f;
+    if (a.dyn)
+        for (short lag = 0; lag < 4; ++lag)
+            s += (ink_bf(w[lag * a.n + c]) + dv[(ulong)t * 32 + (c / 128) * 4 + lag]) * xs[3 - lag];
+    else
+        for (short k = 0; k < 4; ++k) s += ink_bf(w[c * 4 + k]) * xs[k];
+    y[(ulong)t * a.n + c] = (xs[3] + s) * (a.dyn ? 1.f / 3.f : rsqrt(5.f));
 }
 
 // HIST becomes the last three inputs, the chunk's (and before it HIST's own).
@@ -448,23 +301,21 @@ kernel void ink_hist_n(constant ink_convn_args & a [[buffer(0)]], device float *
     hist[c] = nh[0]; hist[a.n + c] = nh[1]; hist[2 * a.n + c] = nh[2];
 }
 
-struct ink_kvn_args { uint pos; uint cap; float eps; uint mode; float thr; };
+struct ink_kvn_args { uint pos; uint cap; float eps; uint key; float thr; };
 
-// Each token's K (or V), normed per head (no gain), into its cache slot
-// (pos + t) % cap.  grid (8 heads, N), threads 128.
+// Each token's K (cut to L2 norm THR per head) or V (RMS-normed per head, no
+// gain) into its cache slot (pos + t) % cap.  grid (8 heads, N), threads 128.
 kernel void ink_kv_n(constant ink_kvn_args & a [[buffer(0)]], device const float * x [[buffer(1)]],
                      device float * cache [[buffer(2)]], threadgroup float * red [[threadgroup(0)]],
                      uint2 tg [[threadgroup_position_in_grid]], ushort tid [[thread_index_in_threadgroup]]) {
     const uint h = tg.x, t = tg.y;
     const float v = x[(ulong)t * 1024 + h * 128 + tid];
     const float ss = ink_tg_sum(v * v, red, tid, 128);
-    // mode 0: RMS-normed; 1: L2-clipped to THR; 2: as it is
-    const float k = a.mode == 0 ? 1.f / sqrt(ss / 128.f + a.eps)
-                  : a.mode == 1 ? (sqrt(ss) > a.thr ? a.thr / sqrt(ss) : 1.f) : 1.f;
+    const float k = a.key ? min(1.f, a.thr / (sqrt(ss) + 1e-6f)) : rsqrt(ss / 128.f + a.eps);
     cache[(ulong)((a.pos + t) % a.cap) * 1024 + h * 128 + tid] = v * k;
 }
 
-struct ink_attnn_args { uint pos; uint cap; float scale; uint extent; uint window; float rel_scale; uint gqa_mod; uint sink; };
+struct ink_attnn_args { uint pos; uint cap; float scale; uint extent; uint window; };
 
 // Attention for the chunk's queries, a threadgroup a (head, token): the
 // cached positions it may see, taken 256 at a time with a running max and
@@ -478,14 +329,14 @@ kernel void ink_attend_n(constant ink_attnn_args & a [[buffer(0)]], device const
                          uint2 tg [[threadgroup_position_in_grid]], ushort tid [[thread_index_in_threadgroup]]) {
     threadgroup float tile[256];
     threadgroup float acc2[256];
-    const uint h = tg.x, t = tg.y, g = a.gqa_mod ? h % 8 : h / 3;
+    const uint h = tg.x, t = tg.y, g = h / 3;
     const uint pos = a.pos + t;
     const uint first = a.window ? (pos + 1 > a.window ? pos + 1 - a.window : 0) : 0;
     device const float4 * q4 = (device const float4 *)(q + ((ulong)t * 24 + h) * 128);
     float rr[16];
     for (short i = 0; i < 16; ++i) rr[i] = r[((ulong)t * 24 + h) * 16 + i];
     const float s0 = sink[(ulong)t * 24 + h];
-    float m = a.sink ? s0 : -INFINITY, z = a.sink ? 1.f : 0.f, acc = 0.f;   // the sink: logit s0, value 0
+    float m = s0, z = 1.f, acc = 0.f;            // the sink: logit s0, value 0
     const uint dim = tid % 128, half_ = tid / 128;
     for (uint j0 = first; j0 <= pos; j0 += 256) {
         const uint j = j0 + tid;
@@ -497,7 +348,7 @@ kernel void ink_attend_n(constant ink_attnn_args & a [[buffer(0)]], device const
             for (short i = 0; i < 32; ++i) d += dot(q4[i], k4[i]);
             float b = 0.f;
             if (dist < a.extent) for (short i = 0; i < 16; ++i) b += rr[i] * ink_bf(P[i * a.extent + dist]);
-            l = d * a.scale + b * a.rel_scale;
+            l = d * a.scale + b;
         }
         const float tm = ink_tg_max(l, red, tid, 256);
         const float mn = max(m, tm);
@@ -518,7 +369,7 @@ kernel void ink_attend_n(constant ink_attnn_args & a [[buffer(0)]], device const
     if (tid < 128) out[((ulong)t * 24 + h) * 128 + dim] = (acc2[tid] + acc2[tid + 128]) / z;
 }
 
-struct ink_routen_args { float scale; uint bias_w; };
+struct ink_routen_args { float scale; };
 
 // INK_ROUTE for token TG: its 8 experts and weights at TG*8.
 kernel void ink_route_n(constant ink_routen_args & a [[buffer(0)]], device const float * logits [[buffer(1)]],
@@ -537,8 +388,7 @@ kernel void ink_route_n(constant ink_routen_args & a [[buffer(0)]], device const
             for (uint e = 0; e < 128; ++e) if (key[e] > bv) { bv = key[e]; best = e; }
             pick[k] = best; key[best] = -INFINITY; tot += scv[best];
         }
-        if (a.bias_w) { tot = 0.f; for (short k = 0; k < 8; ++k) tot += scv[pick[k]] + bias[pick[k]]; }
-        for (short k = 0; k < 8; ++k) { ids[t * 8 + k] = pick[k]; wts[t * 8 + k] = (scv[pick[k]] + (a.bias_w ? bias[pick[k]] : 0.f)) / tot * a.scale; }
+        for (short k = 0; k < 8; ++k) { ids[t * 8 + k] = pick[k]; wts[t * 8 + k] = scv[pick[k]] / (tot + 1e-20f) * a.scale; }
     }
 }
 
@@ -650,20 +500,18 @@ kernel void ink_xmm_mxfp8(constant ink_xmm_args & a [[buffer(0)]], device const 
     for (uint k = 0; k < np; ++k) y[(ulong)pr[k] * a.nrows + r] = s[k];
 }
 
-struct ink_actn_args { uint ffn; uint npairs; uint mode; uint halves; };
+struct ink_actn_args { uint ffn; uint npairs; };
 
-// INK_ACT over NPAIRS pairs: A[p][i] from H[p][2i], H[p][2i+1].
+// The experts' softcapped SwiGLU over NPAIRS pairs: the sigmoid sees the raw
+// gate, the softcaps bound the gate's linear factor and up:
+// A[p][i] = 4 tanh(g/4) sigmoid(g) 25 tanh(u/25), g = H[p][2i], u = H[p][2i+1]
+// (the checkpoint's w13 rows interleaved: gate, up, gate, up, ...).
 kernel void ink_act_n(constant ink_actn_args & a [[buffer(0)]], device const float * h [[buffer(1)]],
                       device float * out [[buffer(2)]], uint i [[thread_position_in_grid]]) {
     if (i >= a.npairs * a.ffn) return;
     const uint p = i / a.ffn, j = i % a.ffn;
-    const float g0 = a.halves ? h[(ulong)p * 2 * a.ffn + j] : h[(ulong)p * 2 * a.ffn + 2 * j];
-    const float u0 = a.halves ? h[(ulong)p * 2 * a.ffn + a.ffn + j] : h[(ulong)p * 2 * a.ffn + 2 * j + 1];
-    // mode 0: silu(4 tanh(g/4)) 25 tanh(u/25); 1: silu(g) u; 2: silu(g) 25 tanh(u/25); 3: 4 tanh(silu(g)/4) 25 tanh(u/25)
-    const float g = (a.mode == 0) ? 4.f * precise::tanh(g0 / 4.f) : g0;
-    const float u = (a.mode == 1) ? u0 : 25.f * precise::tanh(u0 / 25.f);
-    const float sg = g / (1.f + exp(-g));
-    out[i] = (a.mode == 3 ? 4.f * precise::tanh(sg / 4.f) : sg) * u;
+    const float g = h[(ulong)p * 2 * a.ffn + 2 * j], u = h[(ulong)p * 2 * a.ffn + 2 * j + 1];
+    out[i] = 4.f * precise::tanh(g / 4.f) / (1.f + exp(-g)) * 25.f * precise::tanh(u / 25.f);
 }
 
 struct ink_combn_args { uint d; uint ntok; };
