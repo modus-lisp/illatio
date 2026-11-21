@@ -57,6 +57,8 @@
 
 (defun load-model (path &key (threads (default-thread-count)))
   "Read the GGUF model at PATH: weights, tokenizer, and a pool of THREADS."
+  (when (funcall 'inkling2-path-p path)        ; Inkling 2 ships as safetensors, not GGUF
+    (return-from load-model (funcall 'load-inkling2-model path threads)))
   (let ((arch (meta (read-gguf path) "general.architecture")))
     (cond ((equal arch "deepseek4") (load-ds4f-model path threads))
           ((equal arch "deepseek41") (load-ds41f-model path threads))
@@ -395,7 +397,9 @@
 
 (defun forward-1 (ctx token logits)
   (when (model-impl (context-model ctx))
-    (return-from forward-1 (ds4f-context-forward ctx token logits)))
+    (return-from forward-1 (if (ink2-p (model-impl (context-model ctx)))
+                               (ink2-context-forward ctx token logits)
+                               (ds4f-context-forward ctx token logits))))
   #+(and sbcl darwin)
   (when (model-gpu (context-model ctx))
     (return-from forward-1 (gpu-forward ctx token logits)))
@@ -485,6 +489,7 @@
   (remf (context-plist ctx) :q35)
   ;; a DeepSeek context's caches (and their copies on the device)
   (when (getf (context-plist ctx) :ds4f) (funcall 'ds4f-context-reset ctx))
+  (when (getf (context-plist ctx) :ink2) (funcall 'ink2-context-reset ctx))
   ctx)
 
 (defun greedy (model prompt n &key (ctx nil ctx-p))

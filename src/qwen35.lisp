@@ -68,7 +68,9 @@
 (defun reset-recurrent! (ctx)
   "Zero every linear layer's state: the context starts over."
   (when (model-impl (context-model ctx))
-    (return-from reset-recurrent! (ds4f-context-reset ctx)))
+    (return-from reset-recurrent! (if (ink2-p (model-impl (context-model ctx)))
+                                      (ink2-context-reset ctx)
+                                      (ds4f-context-reset ctx))))
   #+(and sbcl linux)
   (when (model-cuda (context-model ctx))
     (return-from reset-recurrent! (progn (reset-cuda-state ctx) ctx)))

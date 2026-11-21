@@ -322,6 +322,81 @@
                  (setf pos end))))
     (nreverse words)))
 
+;;; Inkling 2 Mini's tokenizer.json splits with o200k's pattern:
+;;;   [^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]*[\p{Ll}\p{Lm}\p{Lo}\p{M}]+(?i:'s|'t|'re|'ve|'m|'ll|'d)?
+;;;  |[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]+[\p{Ll}\p{Lm}\p{Lo}\p{M}]*(?i:'s|'t|'re|'ve|'m|'ll|'d)?
+;;;  |\p{N}{1,3} | ?[^\s\p{L}\p{N}]+[\r\n/]* |\s*[\r\n]+ |\s+(?!\S) |\s+
+;;; leftmost-first, the quantifiers greedy with backtracking (a word's head
+;;; class and tail class overlap in Lm, Lo and the marks).
+
+(defun o200k-upperp (c)
+  (and c (let ((cp (char-code c)))
+           (if (< cp 128) (char<= #\A c #\Z) (or (in-ranges-p cp +upper-ranges+) (markp c))))))
+(defun o200k-lowerp (c)
+  (and c (let ((cp (char-code c)))
+           (if (< cp 128) (char<= #\a c #\z) (or (in-ranges-p cp +lower-ranges+) (markp c))))))
+
+(defun split-words-o200k (text)
+  (let ((n (length text)) (pos 0) (words '()))
+    (labels ((at (i) (and (< i n) (char text i)))
+             (run (i pred) (loop while (funcall pred (at i)) do (incf i)) i)
+             (contraction (i)
+               ;; (?i:'s|'t|'re|'ve|'m|'ll|'d)? after a word
+               (if (eql (at i) #\')
+                   (let ((a (and (at (1+ i)) (char-downcase (at (1+ i)))))
+                         (b (and (at (+ i 2)) (char-downcase (at (+ i 2))))))
+                     (cond ((member a '(#\s #\t #\m #\d)) (+ i 2))
+                           ((or (and (eql a #\r) (eql b #\e)) (and (eql a #\v) (eql b #\e)) (and (eql a #\l) (eql b #\l)))
+                            (+ i 3))
+                           (t i)))
+                   i))
+             (head-tail (s)
+               ;; U*L+ at S: the U run, given back from its end until L+ can start
+               (let ((j (run s #'o200k-upperp)))
+                 (if (o200k-lowerp (at j))
+                     (run j #'o200k-lowerp)
+                     (loop for k from (1- j) downto s
+                           when (o200k-lowerp (at k)) return (run k #'o200k-lowerp)))))
+             (head-only (s)
+               ;; U+L* at S
+               (let ((j (run s #'o200k-upperp)))
+                 (and (> j s) (run j #'o200k-lowerp))))
+             (prefixp (c) (and c (not (newlinep c)) (not (letterp c)) (not (numberp* c))))
+             (word (pos f)
+               ;; [^\r\n\p{L}\p{N}]? then F, the optional character tried first
+               (let ((e (or (and (prefixp (at pos)) (funcall f (1+ pos))) (funcall f pos))))
+                 (and e (contraction e)))))
+      (loop while (< pos n)
+            do (let* ((c (at pos))
+                      (end
+                        (or (word pos #'head-tail)
+                            (word pos #'head-only)
+                            ;; \p{N}{1,3}
+                            (and (numberp* c)
+                                 (let ((i pos) (lim (min n (+ pos 3))))
+                                   (loop while (and (< i lim) (numberp* (at i))) do (incf i))
+                                   i))
+                            ;; ' ?[^\s\p{L}\p{N}]+[\r\n/]*'
+                            (flet ((other (x) (and x (not (spacep x)) (not (letterp x)) (not (numberp* x)))))
+                              (let ((s (if (and (char= c #\Space) (other (at (1+ pos)))) (1+ pos) pos)))
+                                (when (other (at s))
+                                  (let ((i (run s #'other)))
+                                    (loop while (member (at i) '(#\Return #\Newline #\/)) do (incf i))
+                                    i))))
+                            (when (spacep c)
+                              (let ((r (run pos #'spacep)))
+                                (or (loop with last = nil
+                                          for i from pos below r
+                                          when (newlinep (at i)) do (setf last i)
+                                          finally (return (and last (1+ last))))
+                                    (cond ((= r n) r)
+                                          ((> (- r pos) 1) (1- r)))
+                                    r)))
+                            (1+ pos))))
+                 (push (subseq text pos end) words)
+                 (setf pos end))))
+    (nreverse words)))
+
 ;;; DeepSeek V4 Flash declares tokenizer.ggml.pre = "joyai-llm".  This is
 ;;; ds4.c's split for it (bpe_tokenize_text), rule for rule: the JoyAI
 ;;; pattern
@@ -382,13 +457,17 @@
 
 (defun pre-tokenizer-digits (pre)
   (cond ((member pre '("qwen2" "qwen35" "deepseek-r1-qwen") :test #'equal) 1)
-        ((member pre '("llama3" "llama-bpe" "smaug-bpe" "glm4") :test #'equal) 3)
+        ((member pre '("llama3" "llama-bpe" "smaug-bpe" "glm4" "o200k") :test #'equal) 3)
         (t (error "pre-tokenizer ~S is not supported yet" pre))))
 
 ;;; --- stage 3: merges --------------------------------------------------------
 
 (defun bpe-word (vocab word)
   "Token ids for one pre-tokenized WORD."
+  ;; o200k's BPE (tokenizer.json's ignore_merges): a word that is a token is that token
+  (when (equal (vocab-pre vocab) "o200k")
+    (let ((id (gethash (bytes-spelling word) (vocab-ids vocab))))
+      (when id (return-from bpe-word (list id)))))
   (or (gethash word (vocab-cache vocab))
       (setf (gethash word (vocab-cache vocab))
             (let ((syms (map 'list #'string (bytes-spelling word)))
@@ -422,7 +501,9 @@
     (append (and add-bos (vocab-bos vocab) (list (vocab-bos vocab)))
             (loop for f in (split-specials vocab text)
                   if (integerp f) collect f
-                  else append (loop for w in (if joyai (split-words-joyai f) (split-words f :digits digits :marks marks))
+                  else append (loop for w in (cond (joyai (split-words-joyai f))
+                                                   ((equal (vocab-pre vocab) "o200k") (split-words-o200k f))
+                                                   (t (split-words f :digits digits :marks marks)))
                                     append (bpe-word vocab w))))))
 
 ;;; --- decoding ---------------------------------------------------------------

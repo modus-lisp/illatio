@@ -290,7 +290,9 @@
   "Feed TOKENS; only the last one's logits are computed.  More than one goes
    through FORWARD-BATCH, a chunk at a time."
   (when (model-impl (context-model ctx))
-    (return-from eval-tokens (ds4f-context-eval ctx tokens)))
+    (return-from eval-tokens (if (ink2-p (model-impl (context-model ctx)))
+                                 (ink2-context-eval ctx tokens)
+                                 (ds4f-context-eval ctx tokens))))
   #+(and sbcl darwin)
   (when (model-gpu (context-model ctx))
     (return-from eval-tokens (gpu-eval ctx tokens)))

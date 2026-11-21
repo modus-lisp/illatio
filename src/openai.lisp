@@ -502,7 +502,7 @@
             (and reasoning (py-trim reasoning)))))
 
 (defun model-qwen-xml-p (model)
-  (qwen-xml-template-p (meta (model-gguf model) "tokenizer.chat_template" "")))
+  (and (model-gguf model) (qwen-xml-template-p (meta (model-gguf model) "tokenizer.chat_template" ""))))
 
 (defun model-thinking (model req)
   "Whether MODEL thinks for REQ.  As llama-server: on unless the request
@@ -510,7 +510,185 @@
   (declare (ignore model))
   (request-thinking req))
 
-(defun render-chat (model messages &optional tools &key (thinking t))
+;;; --- Inkling 2's template --------------------------------------------------------
+;;; Messages are <|message_ROLE|>[NAME]<|content_KIND|>BODY<|end_message|>.
+;;; The tool list is one system message, "tool_declare", in compact JSON
+;;; with sorted keys; a "Thinking effort level" system message comes before
+;;; the first non-system message.  An assistant turn is its reasoning
+;;; (<|content_thinking|>), its text, and each tool call as
+;;; <|message_model|>NAME<|content_invoke_tool_json|>{"name":..,"args":{..}},
+;;; then <|content_model_end_sampling|>.  A tool result is
+;;; <|message_tool|>NAME<|content_text|>.  There is no generation prompt:
+;;; the model writes <|message_model|> itself.
+
+(defun ink-json (x &key sort (s nil))
+  "X as Python's json.dumps(ensure_ascii=False, separators=(',', ':'),
+   sort_keys=SORT)."
+  (if (null s)
+      (with-output-to-string (o) (ink-json x :sort sort :s o))
+      (cond ((hash-table-p x)
+             (write-char #\{ s)
+             (let ((keys (loop for k being the hash-keys of x collect k)))
+               (when sort (setf keys (sort keys #'string<)))
+               (loop for k in keys for first = t then nil
+                     do (unless first (write-char #\, s))
+                        (ink-json k :s s) (write-char #\: s) (ink-json (gethash k x) :sort sort :s s)))
+             (write-char #\} s))
+            ((stringp x)
+             (write-char #\" s)
+             (loop for c across x
+                   do (case c
+                        (#\" (write-string "\\\"" s)) (#\\ (write-string "\\\\" s))
+                        (#\Newline (write-string "\\n" s)) (#\Return (write-string "\\r" s))
+                        (#\Tab (write-string "\\t" s))
+                        (t (cond ((= (char-code c) 8) (write-string "\\b" s))
+                                 ((= (char-code c) 12) (write-string "\\f" s))
+                                 ((< (char-code c) 32) (format s "\\u~4,'0x" (char-code c)))
+                                 (t (write-char c s))))))
+             (write-char #\" s))
+            ((and (vectorp x) (not (stringp x)))
+             (write-char #\[ s)
+             (loop for v across x for i from 0 do (when (plusp i) (write-char #\, s)) (ink-json v :sort sort :s s))
+             (write-char #\] s))
+            ((listp x) (ink-json (coerce x 'vector) :sort sort :s s))
+            ((eq x t) (write-string "true" s))
+            ((eq x 'null) (write-string "null" s))
+            (t (write-string (json-simple:stringify x) s)))))
+
+(defun ink-effort-string (req)
+  "The thinking effort the request asks for, as the template prints it:
+   reasoning_effort (a level or a number), else 0 when thinking is off,
+   else 0.9."
+  (let* ((map '(("none" . 0.0d0) ("minimal" . 0.1d0) ("low" . 0.2d0) ("medium" . 0.7d0)
+                ("high" . 0.9d0) ("xhigh" . 0.99d0) ("max" . 0.99d0)))
+         (e (or (jget req "reasoning_effort") (jget req "chat_template_kwargs" "reasoning_effort")))
+         (num (cond ((stringp e) (or (cdr (assoc (string-trim " " e) map :test #'string=))
+                                     (error "unknown reasoning_effort ~S" e)))
+                    ((realp e) (coerce e 'double-float))
+                    ((not (request-thinking req)) 0d0)
+                    (t 0.9d0))))
+    (if (zerop num) "0" (let ((*read-default-float-format* 'double-float)) (princ-to-string num)))))
+
+(defun render-inkling-chat (messages tools req)
+  (let ((msgs (coerce messages 'list)))
+    (with-output-to-string (o)
+      (flet ((emit (&rest xs) (dolist (x xs) (write-string x o))))
+        (when (and tools (plusp (length tools)))
+          (emit "<|message_system|>tool_declare<|content_xml|>"
+                (ink-json (map 'vector
+                               (lambda (tool)
+                                 (let ((fn (or (jget tool "function") tool)))
+                                   (hobj "description" (or (jget fn "description") "")
+                                         "name" (jget fn "name")
+                                         "parameters" (or (jget fn "parameters") (make-hash-table :test 'equal))
+                                         "type" (or (jget tool "type") "function"))))
+                               tools)
+                          :sort t)
+                "<|end_message|>"))
+        (let ((effort-done nil)
+              (effort (format nil "<|message_system|><|content_text|>Thinking effort level: ~A<|end_message|>"
+                              (ink-effort-string req))))
+          (dolist (m msgs)
+            (let* ((role (jget m "role"))
+                   (rtok (cond ((equal role "user") "<|message_user|>") ((equal role "assistant") "<|message_model|>")
+                               ((equal role "system") "<|message_system|>") ((equal role "tool") "<|message_tool|>")
+                               (t (error "unknown role ~S" role))))
+                   (calls (let ((c (jget m "tool_calls"))) (and (vectorp c) (plusp (length c)) c)))
+                   (reasoning (message-reasoning m))
+                   (content (jget m "content")))
+              (unless (or effort-done (equal role "system")) (emit effort) (setf effort-done t))
+              ;; a tool result is headed by its call's name
+              (when (equal role "tool")
+                (let ((name (or (jget m "name")
+                                (let ((id (jget m "tool_call_id")))
+                                  (loop for prev in msgs
+                                        thereis (and (equal (jget prev "role") "assistant")
+                                                     (vectorp (jget prev "tool_calls"))
+                                                     (loop for tc across (jget prev "tool_calls")
+                                                           when (equal (jget tc "id") id) return (jget tc "function" "name"))))))))
+                  (when name (setf rtok (concatenate 'string rtok name)))))
+              (when (and (equal role "assistant") reasoning)
+                (emit rtok "<|content_thinking|>" reasoning "<|end_message|>"))
+              (cond ((stringp content)
+                     (when (or (plusp (length content)) (not (and (equal role "assistant") (or calls reasoning))))
+                       (emit rtok "<|content_text|>" content "<|end_message|>")))
+                    ((vectorp content)
+                     (loop for part across content
+                           do (cond ((stringp part) (emit rtok "<|content_text|>" part "<|end_message|>"))
+                                    ((member (jget part "type") '(nil "text" "input_text") :test #'equal)
+                                     (emit rtok "<|content_text|>" (or (jget part "text") "") "<|end_message|>"))
+                                    (t (error "Inkling 2 here takes text parts only"))))))
+              (when (and (equal role "assistant") calls)
+                (loop for tc across calls
+                      do (let* ((name (jget tc "function" "name"))
+                                (args (let ((a (tool-call-arguments tc))) (if (hash-table-p a) a (make-hash-table :test 'equal))))
+                                (keys (sort (loop for k being the hash-keys of args collect k) #'string<)))
+                           (emit "<|message_model|>" name "<|content_invoke_tool_json|>"
+                                 "{\"name\":" (ink-json name) ",\"args\":{")
+                           (loop for k in keys for first = t then nil
+                                 do (unless first (emit ","))
+                                    (emit (ink-json k) ":" (ink-json (gethash k args))))
+                           (emit "}}<|end_message|>"))))
+              (when (equal role "assistant") (emit "<|content_model_end_sampling|>"))))
+          (unless effort-done (emit effort)))))))
+
+(defun inkling-parse-reply (text)
+  "(values content tool-calls reasoning) from an Inkling 2 reply: its
+   <|message_model|> segments' text, invoke_tool_json and thinking bodies."
+  (let ((content (make-string-output-stream)) (reasoning (make-string-output-stream)) (calls '()) (pos 0))
+    (loop
+      (let* ((k (search "<|content_" text :start2 pos)))
+        (unless k (return))
+        (let* ((kind-end (search "|>" text :start2 k))
+               (kind (subseq text (+ k 10) kind-end))
+               (body-start (+ kind-end 2))
+               (end (or (search "<|end_message|>" text :start2 body-start)
+                        (search "<|message_" text :start2 body-start)
+                        (search "<|content_model_end_sampling|>" text :start2 body-start)
+                        (length text)))
+               (body (subseq text body-start end)))
+          (cond ((string= kind "text") (write-string body content))
+                ((string= kind "thinking") (write-string body reasoning))
+                ((string= kind "invoke_tool_json")
+                 (let ((obj (ignore-errors (json-simple:parse body))))
+                   (if (and (hash-table-p obj) (stringp (jget obj "name")))
+                       (push (hobj "id" (fresh-id "call_" 8) "type" "function"
+                                   "function" (hobj "name" (jget obj "name")
+                                                    "arguments" (json-simple:stringify
+                                                                 (or (gethash "args" obj) (make-hash-table :test 'equal)))))
+                             calls)
+                       (write-string body content)))))
+          (setf pos end))))
+    (values (py-trim (get-output-stream-string content)) (nreverse calls)
+            (let ((r (py-trim (get-output-stream-string reasoning)))) (and (plusp (length r)) r)))))
+
+(defun make-inkling-stream-filter (emit-content emit-reasoning)
+  "Text to EMIT-CONTENT from <|content_text|> bodies and to EMIT-REASONING
+   from <|content_thinking|> ones; markers and tool-call JSON held back."
+  (let ((pending "") (state nil))
+    (lambda (piece)
+      (setf pending (concatenate 'string pending piece))
+      (loop
+        (let ((open (search "<|" pending)))
+          (when (and open (plusp open))
+            (case state (:text (funcall emit-content (subseq pending 0 open)))
+                        (:thinking (funcall emit-reasoning (subseq pending 0 open))))
+            (setf pending (subseq pending open) open 0))
+          (cond ((null open)
+                 (case state (:text (funcall emit-content pending)) (:thinking (funcall emit-reasoning pending)))
+                 (setf pending "") (return))
+                (t (let ((close (search "|>" pending)))
+                     (unless close (return))   ; a marker not yet whole
+                     (let ((marker (subseq pending 0 (+ close 2))))
+                       (setf state (cond ((string= marker "<|content_text|>") :text)
+                                         ((string= marker "<|content_thinking|>") :thinking)
+                                         (t nil))
+                             pending (subseq pending (+ close 2))))))))))))
+
+(defun render-chat (model messages &optional tools &key (thinking t) req)
+  (when (equal (model-arch model) "inkling2")
+    (return-from render-chat
+      (render-inkling-chat messages tools (or req (hobj "chat_template_kwargs" (hobj "enable_thinking" thinking))))))
   (let ((template (meta (model-gguf model) "tokenizer.chat_template" "")))
     (cond ((member (model-arch model) '("deepseek4" "deepseek41") :test #'equal)
            (if (equal (model-arch model) "deepseek41")
@@ -658,7 +836,7 @@
            (glm (equal (model-arch m) "glm5-next"))
            (images (make-array 0 :adjustable t :fill-pointer 0))
            (prompt (let ((*image-parts* images))
-                     (render-chat m (jget req "messages") (jget req "tools") :thinking thinking)))
+                     (render-chat m (jget req "messages") (jget req "tools") :thinking thinking :req req)))
            (ids (prompt-ids m prompt images))
            (asked (let ((n (or (jget req "max_completion_tokens") (jget req "max_tokens") (engine-max-tokens engine))))
                     (and (integerp n) (plusp n) n)))
@@ -679,6 +857,7 @@
               (cond (ds4f (ds4f-parse-reply text thinking (equal (model-arch m) "deepseek41")))
                     (glm (glm53-parse-reply text thinking))
                     (qxml (qwen35-parse-reply text thinking (jget req "tools")))
+                    ((equal (model-arch m) "inkling2") (inkling-parse-reply text))
                     ;; a model that opens its reply with <think> (Qwen3's
                     ;; thinking models, Nanbeige): the reasoning is not
                     ;; content, and a call drafted inside it is not a call
@@ -780,6 +959,8 @@
                                 :on-text (cond ((member (model-arch (engine-model engine)) '("deepseek4" "deepseek41") :test #'equal)
                                                 (make-ds4f-stream-filter emit emit-reasoning (request-thinking req)
                                                                          :call-tag (format nil "<~A" (dsml "tool_calls" (equal (model-arch (engine-model engine)) "deepseek41")))))
+                                               ((equal (model-arch (engine-model engine)) "inkling2")
+                                                (make-inkling-stream-filter emit emit-reasoning))
                                                ((or (equal (model-arch (engine-model engine)) "glm5-next")
                                                     (model-qwen-xml-p (engine-model engine)))
                                                 (make-ds4f-stream-filter emit emit-reasoning (model-thinking (engine-model engine) req)

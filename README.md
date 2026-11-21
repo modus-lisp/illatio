@@ -31,6 +31,7 @@ comments sit beside the mechanics they explain.
 | Qwen3-4B-Instruct-2507 | `qwen3` (and `llama`) | Q8_0, Q4_K_M | llama.cpp |
 | a 27B Qwen3.5 | `qwen35`: gated delta net and gated attention | Q6_K | llama.cpp, CPU and Metal |
 | Qwen3.5-4B, -2B and their fine-tunes (Agents-A1-4B) | `qwen35`, tool calls in Qwen3-Coder's XML | Q4_K_M (its Q4_K, Q5_K, Q6_K, Q8_0 and F32 mix) and Q4_0 (with some Q4_1) on Metal | ggml's dequantization; llama-server's template |
+| Inkling 2 Mini (**work in progress**) | `inkling2_loop`: 24 layers, the middle 12 run 3 times, attention residuals, 128 experts | the official checkpoint as it ships (safetensors; NVFP4/MXFP8 experts), CPU and Metal | its documentation only (docs/inkling2.md); perplexity still above llama.cpp's |
 | DeepSeek V4 Flash | `deepseek4`: 43 layers, 256 experts, compressed attention | ds4's IQ2_XXS/Q2_K build (86.7 GB) | ds4's CPU reference |
 | DeepSeek V4.1 Flash | `deepseek41`: 40 layers, 384 experts, shared compressed caches, Engram | IQ2_XXS/Q2_K (153 GB of experts) | its CPU reference (from ds4's) |
 | GLM-5.3 Flash | `glm5-next`: 45 layers (KDA and DSA), 288 experts | antirez's Q2 build (96.5 GB) | its CPU reference (from ds4's graph); Z.AI's replies |

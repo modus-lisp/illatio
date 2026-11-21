@@ -39,6 +39,8 @@
    vectors read as usual, its matrices left in the file (GMATs).  A qwen35
    model, or a dense one (metal-dense.lisp).  GPU: an opened GPU whose
    library holds these kernels (and a caller's), or NIL for a new one."
+  (when (inkling2-path-p path)
+    (return-from load-model-gpu (load-inkling2-model path (default-thread-count) :gpu t)))
   (let ((m (let ((*matrices-in-file* t)) (load-model path :threads 1))))
     (cond ((equal (model-arch m) "qwen35")
            ;; the kernels' fixed shapes (src/metal/qwen35.metal)

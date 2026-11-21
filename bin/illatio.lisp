@@ -221,7 +221,10 @@ flags:
               (model-name m) (illatio::model-n-layer m)
               (getf opts :gpu) (illatio::pool-size (illatio::model-pool m))
               #+(and sbcl darwin) (and (getf opts :gpu)
-                                       (illatio::gpu-name (illatio::gmodel-gpu (illatio::model-gpu m))))
+                                       (illatio::gpu-name
+                                        (if (illatio::model-gpu m)
+                                            (illatio::gmodel-gpu (illatio::model-gpu m))
+                                            (illatio::ink2-gpu-gpu (illatio::ink2-metal (illatio::model-impl m))))))
               #+(and sbcl linux) (and (getf opts :gpu)
                                       (if (illatio::model-cuda m)
                                           (illatio::cudev-name (illatio::cmodel-dev (illatio::model-cuda m)))

@@ -39,6 +39,8 @@
      (:file "ds4f")        ; DeepSeek V4 Flash (deepseek4), ported from ds4.c
      (:file "ds41f")       ; DeepSeek V4.1 Flash (deepseek41): V4's pieces, ds4's V4.1 graph
      (:file "glm53")       ; GLM-5.3 Flash (glm5-next): V4's HC and experts, KDA and DSA layers
+     (:file "inkling2")    ; Inkling 2 Mini: looped, attention residuals, NVFP4/MXFP8 experts, from its docs
+     (:file "metal-inkling2" :if-feature (:and :sbcl :darwin)) ; it on the GPU (kernels: src/metal/inkling2.metal)
      (:file "ds4f-kv")      ; its state saved: a long prompt prefilled once
      (:file "ds4f-hotlist") ; its most used experts (ds4's profile)
      (:file "ds41f-hotlist") ; V4.1's (illatio's own profile)
