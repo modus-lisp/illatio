@@ -108,6 +108,11 @@
 
 (defparameter *ink2-chunk* 256 "Tokens a prefill chunk takes at most.")
 
+(defparameter *ink2-rewind-slack* 4096
+  "Positions a local layer's ring keeps beyond its window and a chunk, so a
+   context can go back that far (to a prompt's end, past the reply the
+   model wrote) and still find the keys its window needs.")
+
 (defstruct (ink2gs (:constructor %make-ink2gs))
   nmax stack
   xq xk xv xm nq nk nv nm
@@ -136,7 +141,9 @@
               (loop for (l . nil) in (ink2-app-order m)
                     ;; a local layer's ring: its window and a chunk's worth more, so a
                     ;; chunk's later tokens don't overwrite what its earlier ones still see
-                    collect (let ((cap (if (ink2-layer-local (aref (ink2-layers m) l)) (min n-ctx (+ +ink-window+ nm)) n-ctx)))
+                    collect (let ((cap (if (ink2-layer-local (aref (ink2-layers m) l))
+                                           (min n-ctx (+ +ink-window+ nm *ink2-rewind-slack*))
+                                           n-ctx)))
                               (list (buf (* cap 1024)) (buf (* cap 1024)) (buf (* 3 1024)) (buf (* 3 1024))
                                     (buf (* 3 d)) (buf (* 3 d)) cap)))
               'vector)))))
@@ -327,3 +334,31 @@
              (ink2-gpu-chunk! c (subseq tokens 0 k))
              (setf tokens (nthcdr k tokens))))
   (ink2ctx-logits c))
+
+;;; --- going back ----------------------------------------------------------------------
+;;; A context's state is its K/V caches, by position, and each short conv's
+;;; last three inputs.  The caches need nothing to go back (later positions
+;;; are written over); the conv histories are saved at each prompt's end (a
+;;; few MB) and restored, so a request whose prompt leaves the last reply
+;;; out, or writes it otherwise, goes back to the last prompt's end instead
+;;; of starting over.
+
+(defun ink2-gpu-snapshot (c)
+  "The conv histories of C now, as one vector."
+  (let* ((s (ink2ctx-gpu c)) (apps (ink2gs-apps s))
+         (sizes (loop for a across apps append (list (* 3 1024) (* 3 1024) (* 3 +ink-d+) (* 3 +ink-d+))))
+         (v (f32vec (reduce #'+ sizes))) (o 0))
+    (loop for a across apps
+          do (loop for b in (list (third a) (fourth a) (fifth a) (sixth a))
+                   for n in (list (* 3 1024) (* 3 1024) (* 3 +ink-d+) (* 3 +ink-d+))
+                   do (replace v (gbuf-floats b n) :start1 o) (incf o n)))
+    v))
+
+(defun ink2-gpu-restore (c snap pos)
+  "C at POS, its conv histories SNAP (INK2-GPU-SNAPSHOT's at POS)."
+  (let ((o 0))
+    (loop for a across (ink2gs-apps (ink2ctx-gpu c))
+          do (loop for b in (list (third a) (fourth a) (fifth a) (sixth a))
+                   for n in (list (* 3 1024) (* 3 1024) (* 3 +ink-d+) (* 3 +ink-d+))
+                   do (gbuf-set-floats b (subseq snap o (+ o n))) (incf o n))))
+  (setf (ink2ctx-pos c) pos))

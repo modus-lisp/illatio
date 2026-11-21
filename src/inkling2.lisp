@@ -604,13 +604,31 @@
     (setf (context-pos ctx) (ink2ctx-pos c))
     ctx))
 
+(defmethod impl-rewinds-p ((impl ink2)) (and (ink2-metal impl) t))
+
 (defun ink2-context-eval (ctx tokens)
+  "TOKENS at CTX's position.  On the GPU CTX may have gone back
+   (SYNC-PROMPT's common prefix): the state is restored from the last
+   prompt end at or before it (or from the start), the tokens between fed
+   again, and a snapshot kept at the new end."
   (if (and tokens (ink2-metal (model-impl (context-model ctx))))
-      (let ((c (ink2-context ctx)))
-        (assert (= (ink2ctx-pos c) (context-pos ctx)) () "Inkling 2's state does not rewind")
+      (let* ((c (ink2-context ctx)) (want (context-pos ctx)))
+        (when (/= (ink2ctx-pos c) want)
+          ;; a snapshot past WANT saw tokens this prompt no longer has
+          (setf (getf (context-plist ctx) :ink2-snaps)
+                (remove-if (lambda (e) (> (car e) want)) (getf (context-plist ctx) :ink2-snaps)))
+          (let ((snap (find-if (lambda (e) (<= (car e) want)) (getf (context-plist ctx) :ink2-snaps))))
+            (if (and snap (ink2ctx-gpu c))
+                (funcall 'ink2-gpu-restore c (cdr snap) (car snap))
+                (progn (ink2-context-reset ctx) (setf c (ink2-context ctx))))
+            (setf tokens (append (subseq (context-tokens ctx) (ink2ctx-pos c) want) tokens))))
         (sb-int:with-float-traps-masked (:overflow :inexact :invalid :divide-by-zero)
           (funcall 'ink2-gpu-eval! c tokens))
-        (setf (context-pos ctx) (ink2ctx-pos c)))
+        (setf (context-pos ctx) (ink2ctx-pos c))
+        ;; this prompt's end, to come back to (the newest first; a few kept)
+        (let ((snaps (remove (ink2ctx-pos c) (getf (context-plist ctx) :ink2-snaps) :key #'car :test #'<=)))
+          (setf (getf (context-plist ctx) :ink2-snaps)
+                (subseq (cons (cons (ink2ctx-pos c) (funcall 'ink2-gpu-snapshot c)) snaps) 0 (min 8 (1+ (length snaps)))))))
       (dolist (tk tokens) (ink2-context-forward ctx tk t)))
   (context-logits ctx))
 
@@ -620,5 +638,6 @@
     (when c (loop for a across (ink2ctx-apps c)
                   do (free-static-vector (ink2-app-k a)) (free-static-vector (ink2-app-v a)))))
   (remf (context-plist ctx) :ink2)
+  (remf (context-plist ctx) :ink2-snaps)
   (setf (context-pos ctx) 0)
   ctx)

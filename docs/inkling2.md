@@ -298,3 +298,26 @@ gave tg128 31.5. Little is gained, because decode is not bound by the
 projections' bytes: the matrix-vector kernels (Q8_0 33%, NVFP4 31% of GPU
 time) reach about 100 GB/s of the M4 Pro's 273. Those kernels are the
 lever for speed.
+
+## Driving operandi (evals/suite.lisp, 18 tasks, core tools, in this image on Metal)
+
+**18/18 in 16 minutes** (Q8_0 projections). Against the small models on the
+same suite, with the same harness fixes: Agents-A1-4B 16, Qwen3.5-4B 15,
+Qwen3-4B-2507 12. It passes every task, including count-word, which every
+small model failed. Where they did arithmetic in their heads it computes
+(awk on the CSV), and its tool calls come out in its own invoke_tool_json
+format, parsed back into OpenAI calls.
+
+**Going back.** Each request re-renders the conversation, and the rendering
+of the last reply need not be the tokens the model wrote (its reasoning
+trimmed, the JSON's BPE split another way). A model with conv state cannot
+simply move back, so without help every turn prefilled the whole prompt
+again. Now the GPU path snapshots the conv histories (3.8 MB) at each
+prompt's end. A request that diverges goes back to the last snapshot at or
+before the common prefix, re-feeds the tokens in between, and carries on.
+The K/V caches need nothing: a local layer's ring keeps 4096 positions
+beyond its window and a chunk (*INK2-REWIND-SLACK*), so the window it goes
+back to is still there.
+
+The result is exact: bit-identical logits to a fresh context fed the same
+tokens. The smoke pair ran in 87 s, from 194.
