@@ -82,7 +82,7 @@
 (defsystem "illatio/server"
   :description "The OpenAI-compatible HTTP server: /v1/chat/completions
                 (blocking and streamed), /v1/models, /health."
-  :depends-on ("illatio/openai" "cl-transport")
+  :depends-on ("illatio/openai" "cl-transport/http-server")
   :components ((:module "src" :components ((:file "server")))))
 
 (defsystem "illatio/cli"

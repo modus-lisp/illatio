@@ -504,7 +504,8 @@ Common Lisp).  The Metal paths need macOS on Apple silicon; DeepSeek V4 Flash
 wants a 48 GB machine and a fast SSD there.  The CUDA paths need an NVIDIA
 driver (kernels compiled by NVRTC at load; the passes' products sm_80 or
 newer) and host memory for the experts (78 GB for V4, 153 GB for V4.1, 92 GB for GLM-5.3).  The core system has no dependencies;
-the OpenAI layer and the server use `json-simple` and `cl-transport`, from
+the OpenAI layer and the server use `json-simple` and `cl-transport` (its
+`http-server`), from
 modus-lisp.
 
 ## Next
